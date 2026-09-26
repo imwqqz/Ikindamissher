@@ -18,8 +18,29 @@ DEFAULT_CKPT = Path(__file__).parent / "data" / "her_model.pt"
 DEFAULT_DESC = Path(__file__).parent / "data" / "input" / "description.txt"
 DEFAULT_BPE = Path(__file__).parent / "data" / "input" / "bpe.json"
 
-USER_SPEAKER = "wqqz"   # canonical name for the user in turns/prompts
-HER_SPEAKER = ""    # canonical name for the persona in turns
+# Canonical turn labels, resolved at run time from the config or --*-speaker
+# flags. Deliberately a dict rather than module constants: as default
+# argument values they were frozen at import time, so a later
+# configure_speakers() call left every default still reading the import-time
+# value and silently ignoring the configured name. The persona name is also
+# private, so a literal here would land in git history.
+_SPEAKERS = {"user": "", "her": ""}
+
+
+def speaker_names():
+    """Return the canonical (user, persona) labels for turns and prompts."""
+    return _SPEAKERS["user"], _SPEAKERS["her"]
+
+
+def configure_speakers(user: Optional[str] = None, her: Optional[str] = None):
+    # Stored lowercased because parse_wa lowercases every label it emits, so
+    # prompts, regexes and persona lines all have to agree with the corpus.
+    if user:
+        _SPEAKERS["user"] = user.strip().lower()
+    if her:
+        _SPEAKERS["her"] = her.strip().lower()
+    return speaker_names()
+
 
 # GPT-2 style pretokenizer (T5, section 2.1 https://arxiv.org/abs/2005.14165)
 BPE_PAT = re.compile(
@@ -223,8 +244,10 @@ WA_LINE = re.compile(
 WA_NAME_BOOTSTRAP = re.compile(r"^[^:\n]+: ")
 
 
-def parse_wa(text: str, speakers=(USER_SPEAKER, HER_SPEAKER), aliases=None):
+def parse_wa(text: str, speakers=None, aliases=None):
     # Normalize the exporter's speaker names to canonical turns. (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    if speakers is None:
+        speakers = speaker_names()
     speakers = tuple(s.lower() for s in speakers)
     aliases = {k.lower(): v.lower() for k, v in (aliases or {}).items()}
     lines = []
@@ -244,8 +267,11 @@ def parse_wa(text: str, speakers=(USER_SPEAKER, HER_SPEAKER), aliases=None):
     return "\n".join(lines) + "\n"
 
 
-def detect_user(text: str, label: str = HER_SPEAKER):
+def detect_user(text: str, label: str = None):
     # Pick the most frequent non-her speaker so any WhatsApp contact works. (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    user_name, her_name = speaker_names()
+    if label is None:
+        label = her_name
     counts = Counter()
     for line in text.splitlines():
         match = WA_LINE.match(line)
@@ -253,37 +279,58 @@ def detect_user(text: str, label: str = HER_SPEAKER):
             name = match.group(1).strip().lower()
             if name and name != label.lower():
                 counts[name] += 1
-    return counts.most_common(1)[0][0] if counts else USER_SPEAKER
+    return counts.most_common(1)[0][0] if counts else user_name
 
 
-def persona_lines(text: str):
+def persona_lines(text: str, label: str = None, alias: str = None):
     # Turn the persona description into `name: line` statements, treating the persona as one more text-to-text turn (T5, section 2.1 https://arxiv.org/abs/2005.14165).
+    # label must be the canonical speaker: hardcoding "her" here would give the
+    # persona block a different label from its chat turns, so the model would
+    # learn two names for the same person. alias is the name the file may
+    # already use, rewritten to the canonical one.
+    user_name, her_name = speaker_names()
+    label = her_name if label is None else label
+    # parse_wa lowercases every label it emits, so the persona block has to be
+    # lowercased too: otherwise the same person appears as both "alice" and
+    # "Alice" and the tokenizer assigns them different leading tokens
+    canonical = label.lower()
+    # each known name maps to its own canonical spelling, so a line about the
+    # user is not relabelled as the persona
+    rename = {canonical: canonical, user_name: user_name}
+    if alias and alias.lower() not in rename:
+        rename[alias.lower()] = canonical
     lines = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        if WA_NAME_BOOTSTRAP.match(line):
+        m = WA_NAME_BOOTSTRAP.match(line)
+        if m:
+            name = m.group(0)[:-2].strip().lower()
+            if name in rename:
+                line = f"{rename[name]}: {line[m.end():]}"
             lines.append(line)
-        elif len(line) <= 400:
-            lines.append("her: " + line)
+            continue
+        if len(line) <= 400:
+            lines.append(f"{canonical}: {line}")
         else:
             for chunk in re.split(r"(?<=[.!?])\s+", line):
                 if chunk.strip():
-                    lines.append("her: " + chunk.strip())
+                    lines.append(f"{canonical}: {chunk.strip()}")
     return lines
 
 def _split_turns(conv: str, val_fraction: float):
     # Contiguous tail split on a turn boundary. A random window split would leak:
     # sliding windows overlap by block-1 tokens, so a random split puts almost
     # every validation token into training too.
+    user_name, _ = speaker_names()
     lines = conv.splitlines()
     if len(lines) < 8 or val_fraction <= 0:
         return conv, ""
     n_val = max(2, int(len(lines) * val_fraction))
     cut = len(lines) - n_val
     # start validation on a user turn so user->her pairs stay intact
-    while cut < len(lines) and not lines[cut].startswith(f"{USER_SPEAKER}:"):
+    while cut < len(lines) and not lines[cut].startswith(f"{user_name}:"):
         cut += 1
     if cut >= len(lines) - 2:
         return conv, ""
@@ -291,26 +338,39 @@ def _split_turns(conv: str, val_fraction: float):
 
 
 # (T5, section 2.1 https://arxiv.org/abs/2005.14165).
-def build_corpus(data_path: Path, desc_path: Path, label: str = HER_SPEAKER,
+def build_corpus(data_path: Path, desc_path: Path, label: str = None,
                  user: Optional[str] = None, val_fraction: float = 0.0):
     # Returns the corpus string, or (train, val) when val_fraction > 0.
+    user_name, her_name = speaker_names()
+    if label is None:
+        label = her_name
+    if not user_name or not her_name:
+        missing = "user" if not user_name else "persona"
+        raise SystemExit(
+            f"no {missing} name is configured, so turns would have no label.\n"
+            'Pass both explicitly, e.g. --user-speaker "<name>" '
+            '--her-speaker "<name>", or set user_speaker and her_speaker in '
+            "the config file.\nThey are absent from the source on purpose: a "
+            "literal would end up in git history.")
     raw = data_path.read_text(encoding="utf-8")
     if user is None:
         user = detect_user(raw, label)
     aliases = {}
-    if user.lower() != USER_SPEAKER:
-        aliases[user.lower()] = USER_SPEAKER
-    if label.lower() != HER_SPEAKER:
-        aliases[label.lower()] = HER_SPEAKER
-    corpus = parse_wa(raw, speakers=(USER_SPEAKER, HER_SPEAKER), aliases=aliases or None)
-    corpus = corpus.replace(f"\n{label}: ", f"\n{HER_SPEAKER}: ")
+    if user.lower() != user_name:
+        aliases[user.lower()] = user_name
+    if label.lower() != her_name:
+        aliases[label.lower()] = her_name
+    corpus = parse_wa(raw, aliases=aliases or None)
+    # lowercase, to match what parse_wa emits for every other turn
+    corpus = corpus.replace(f"\n{label.lower()}: ", f"\n{her_name}: ")
 
     train, val = _split_turns(corpus, val_fraction)
     # the persona block goes to train only: it is appended at the end of the
     # corpus, so a naive tail split would hold the whole persona out of training
     desc = ""
     if desc_path.exists():
-        desc = "\n".join(persona_lines(desc_path.read_text(encoding="utf-8")))
+        desc = "\n".join(persona_lines(desc_path.read_text(encoding="utf-8"),
+                                       alias=label))
     if desc:
         train = train.rstrip("\n") + "\n\n" + desc + "\n"
     return (train, val) if val else train
@@ -579,14 +639,17 @@ class GPT(nn.Module):
         # the model could not condition on the question (Attention Is All You Need, section 5 https://arxiv.org/abs/1706.03762)
         self.reset_cache()
         device = idx.device
-        self(idx, use_cache=True)
+        # The prefill already produced the logits for the position after the
+        # prompt, so read them here. Feeding idx[:, -1:] again would push the
+        # last prompt token through the model twice and shift every subsequent
+        # rotary position by one.
+        logits = self(idx, use_cache=True)[0, -1] / max(temperature, 1e-8)
         gen = []
         # Rotary positions are only allocated for max_len, so sampling past it
         # fed out-of-range positions into RoPE and crashed on a shape mismatch.
         # A prompt sized at max_len left the caller no room to answer at all.
         budget = max(0, self.max_len - idx.shape[1])
         for _ in range(min(max_new, budget)):
-            logits = self(idx[:, -1:], use_cache=True)[0, -1] / max(temperature, 1e-8)
             if repeat_penalty != 1.0 and gen:
                 # Penalize already-generated tokens (presence penalty) (The Curious Case of Neural Text Degeneration, section 5 https://arxiv.org/abs/1904.09751)
                 for token_id in set(gen):
@@ -600,6 +663,9 @@ class GPT(nn.Module):
                 break
             gen.append(next_token)
             idx = torch.cat([idx, torch.tensor([[next_token]], device=device)], dim=1)
+            # advance the cache with the token just sampled; the prefill covered
+            # the prompt, so from here on only the new token needs a forward
+            logits = self(idx[:, -1:], use_cache=True)[0, -1] / max(temperature, 1e-8)
         self.reset_cache()
         return gen
 
@@ -758,21 +824,39 @@ class ValWindows:
     # right for training but makes a validation number meaningless.
     # Yields exactly `block` tokens, same as BatchSampler: the model allocates
     # rotary positions for max_len == block, so block+1 overflows RoPE.
-    def __init__(self, ids, block, device):
-        self.ids = torch.tensor(ids, dtype=torch.long, device=device)
+    def __init__(self, ids, block, device, batch_size=8):
+        # detach().clone() rather than torch.tensor(): ids is already a tensor
+        # and torch.tensor() re-wraps it through __array__, which warns
+        self.ids = torch.as_tensor(ids, dtype=torch.long).detach().clone().to(device)
         self.block = block
         self.device = device
+        self.batch_size = max(1, int(batch_size))
+        self.num_windows = max(0, self.ids.numel() // self.block)
 
     def __len__(self):
-        return max(0, self.ids.numel() // self.block)
+        return (self.num_windows + self.batch_size - 1) // self.batch_size
 
-    def __iter__(self):
+    def _windows(self):
         n = self.ids.numel()
         for start in range(0, n - self.block + 1, self.block):
             chunk = self.ids[start:start + self.block]
             if chunk.numel() < 2:
                 break
-            yield chunk.unsqueeze(0)
+            yield chunk
+
+    def __iter__(self):
+        # Group windows into batches. Iterating them one at a time interleaved
+        # (1, block) forward passes with (batch, block) training steps, which
+        # forced the caching allocator to carve a new segment every validation
+        # and cost one device sync per window.
+        pending = []
+        for chunk in self._windows():
+            pending.append(chunk)
+            if len(pending) == self.batch_size:
+                yield torch.stack(pending)
+                pending = []
+        if pending:
+            yield torch.stack(pending)
 
 
 class Trainer:
@@ -786,6 +870,11 @@ class Trainer:
         self.rank = rank
         self.world = world
         self.epochs = args.epochs
+        # The goal stays fixed across resumes. args.epochs is only what is left
+        # to run this time, so writing it back as the target would shrink the
+        # goal on every resume (20 -> 18 -> 16 ...).
+        _stored_target = (state or {}).get("epochs_target")
+        self.epochs_target = int(_stored_target) if _stored_target else int(args.epochs)
         self.label_smoothing = args.label_smoothing
         self.log_every = args.log_every
         self.log_best = args.log_best
@@ -796,6 +885,12 @@ class Trainer:
         self.sample_every_epoch = 4
         self.val_every = max(1, args.val_every)
         self.patience = max(0, args.patience)
+        self.spike_factor = max(0.0, args.spike_factor)
+        self.spike_patience = max(1, args.spike_patience)
+        self.spike_count = 0
+        self.diverged = False
+        # Running best of the finite losses, the reference the spike test uses.
+        self.best_finite = float("inf")
         self.val_windows = (ValWindows(val_ids, args.block, device)
                             if val_ids and len(val_ids) > args.block + 1 else None)
         self.since_best = 0
@@ -827,6 +922,9 @@ class Trainer:
         self.best = _opt_float(state.get("best"), float("inf"))
         self.best_step = int(state.get("best_step") or 0)
         self.best_val = _opt_float(state.get("best_val"), float("inf"))
+        # Tracked so the summary can show best vs last. For a memorization run
+        # the two drifting apart is the expected signal, not a fault.
+        self.last_val = float("nan")
         # Adam's first/second moments are not derivable from the weights, so
         # dropping them made every resume restart the moment estimates from
         # zero and spike the loss. The LR schedule needs no state: it is a pure
@@ -893,14 +991,17 @@ class Trainer:
         model.eval()
         total, count = 0.0, 0
         with torch.no_grad():
-            for chunk in self.val_windows:
-                batch = chunk.to(self.device)
+            for batch in self.val_windows:
+                batch = batch.to(self.device, non_blocking=True)
                 with torch.autocast("cuda", dtype=self.precision,
                                     enabled=self.precision is not None
                                     and self.device.type == "cuda"):
                     loss = self._forward_loss(batch, batch)
-                total += loss.item()
-                count += 1
+                # weight by batch size so a trailing partial batch is not
+                # counted as heavily as a full one
+                n = batch.shape[0]
+                total += loss.item() * n
+                count += n
         model.train()
         return total / count if count else None
 
@@ -929,6 +1030,7 @@ class Trainer:
         val = self.evaluate()
         if val is None:
             return False
+        self.last_val = val
         if val < self.best_val - 1e-4:
             self.best_val = val
             self.best_step = steps
@@ -965,6 +1067,21 @@ class Trainer:
                             for row in inputs]
                     inputs, targets = collate_span(rows, self.tokenizer)
                 loss = self._train_step(inputs, targets)
+                self.last_train_loss = loss.item() * self.grad_accum
+                # Runaway guard. clip_grad_norm_ bounds gradient size but cannot
+                # un-NaN the weights, and a memorization run with the val-plateau
+                # stop disabled has no other brake: a NaN would otherwise
+                # propagate for hours and --keep-last would save an all-NaN
+                # checkpoint over the good one. Non-finite aborts immediately.
+                if math.isfinite(self.last_train_loss):
+                    self.best_finite = min(self.best_finite, self.last_train_loss)
+                if self._diverged(self.last_train_loss, steps, epoch):
+                    self.diverged = True
+                    print(f"\nDIVERGED at step {steps:,} epoch {epoch}: train "
+                          f"loss {self.last_train_loss}. Aborting without "
+                          f"saving so the retained checkpoint stays usable.",
+                          flush=True)
+                    return self.last_train_loss, steps
                 total += loss.item()
                 batches += 1
                 accum += 1
@@ -975,7 +1092,6 @@ class Trainer:
                     self.optimizer.zero_grad()
                     opt_steps += 1
                     stepped = True
-                self.last_train_loss = loss.item() * self.grad_accum
                 if self.log_every and steps % self.log_every == 0:
                     self._log_step(steps, epoch, loss.item())
                 # --val-every counts optimizer steps, but `steps` (and the
@@ -983,7 +1099,10 @@ class Trainer:
                 # former and report the latter so the units never mix.
                 if stepped and opt_steps % self.val_every == 0:
                     if self._maybe_validate(steps, epoch):
-                        return self.best, steps
+                        # last_train_loss, not self.best: self.best is only
+                        # updated at an epoch boundary, so a run that stops
+                        # mid-epoch returned inf from here.
+                        return self.last_train_loss, steps
             if accum % self.grad_accum != 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
@@ -991,7 +1110,23 @@ class Trainer:
                 opt_steps += 1
             avg = total / max(batches, 1)
             self._end_epoch(epoch, steps, avg, epoch_start)
-        return self.best, steps
+        return self.last_train_loss, steps
+
+    def _diverged(self, loss, steps, epoch):
+        # Hard stop on a non-finite loss. The spike check is separate and
+        # recoverable-by-nothing: it only counts, so one bad minibatch (a
+        # corrupt window, a lone huge target) does not end a long run.
+        if not math.isfinite(loss):
+            return True
+        if not self.spike_factor or loss <= self.best_finite * self.spike_factor:
+            self.spike_count = 0
+            return False
+        self.spike_count += 1
+        if self.spike_count == 1:
+            print(f"  step {steps:,} epoch {epoch} | loss spike "
+                  f"{loss:.4f} > {self.spike_factor:g}x best "
+                  f"{self.best_finite:.4f}", flush=True)
+        return self.spike_count >= self.spike_patience
 
     def _unwrap(self):
         return self.model.module if hasattr(self.model, "module") else self.model
@@ -1003,7 +1138,6 @@ class Trainer:
         now = time.perf_counter()
         dt = now - self.window_start
         self.window_start = now
-        s = max(steps, 1)
         tokens = (steps - self.last_logged_step) * self.sampler.batch_size * self.sampler.block
         tok_s = tokens / dt if dt > 0 else 0.0
         self.last_logged_step = steps
@@ -1051,7 +1185,8 @@ class Trainer:
             return
         model = self._unwrap()
         model.eval()
-        seed = self.tokenizer.encode(f"{USER_SPEAKER}: hola como estas\n{HER_SPEAKER}: ")
+        user_name, her_name = speaker_names()
+        seed = self.tokenizer.encode(f"{user_name}: hola como estas\n{her_name}: ")
         out = model.generate(
             torch.tensor([seed], device=self.device),
             max_new=32, temperature=0.8, top_k=20,
@@ -1060,15 +1195,35 @@ class Trainer:
         model.train()
         print(f"  sample: {self.tokenizer.decode(out)}", flush=True)
 
+    def epochs_done(self, steps):
+        # Epochs actually completed, not epochs requested. Writing the requested
+        # count made an interrupted run look finished: it stored 20 after 1.9,
+        # so a later resume thought the target had been met.
+        per = max(1, self.batches_per_epoch)
+        return int(steps) // per
+
     def save(self, loss, steps, val_loss=None):
         # `loss` and `step` are a matched pair: loss is the train loss observed
         # at exactly this step. best_val/best_step travel separately so a resume
         # can restore them instead of restarting the search from scratch.
+        # epochs_target is what the user originally asked for, so a bare resume
+        # still knows the goal; epochs is how much has actually happened.
         state_dict = self._unwrap().state_dict()
+        # Never persist non-finite weights. Saving them would replace a good
+        # checkpoint with an unusable one and the run could not recover.
+        if not math.isfinite(loss) or any(
+                not torch.isfinite(v).all() for v in state_dict.values()
+                if v.is_floating_point()):
+            print("  refusing to save: non-finite loss or weights; the "
+                  "existing checkpoint is untouched", flush=True)
+            return False
         torch.save(
             {"model": state_dict, "loss": float(loss), "cfg": self.cfg,
              "tokenizer": bpe_state(self.tokenizer), "step": int(steps),
-             "epochs": self.epochs, "best": _finite_or_none(self.best),
+             "epochs": self.epochs_done(steps),
+             "epochs_target": int(self.epochs_target),
+             "steps_per_epoch": int(max(1, self.batches_per_epoch)),
+             "best": _finite_or_none(self.best),
              "val_loss": _finite_or_none(
                  val_loss if val_loss is not None else self.best_val),
              "best_val": _finite_or_none(self.best_val),
@@ -1076,6 +1231,7 @@ class Trainer:
              "optim": self.optimizer.state_dict()},
             self.ckpt,
         )
+        return True
 
 
 def bpe_state(enc: BytePairEncoder):
@@ -1123,7 +1279,13 @@ def resolve_block(args, state, rank):
 
 def build_cfg(args, tokenizer):
     size = SIZE_PRESETS.get(args.size)
+    # Persist the canonical turn labels: the checkpoint is the only artifact
+    # that knows how its turns were labelled, so chatbot.py reads them from
+    # here instead of asking you to retype a name that has to match exactly.
+    user_name, her_name = speaker_names()
     cfg = {
+        "user_speaker": user_name,
+        "her_speaker": her_name,
         "vocab_size": tokenizer.vocab_size,
         "d_model": args.d_model,
         "n_heads": args.n_heads,
@@ -1165,7 +1327,131 @@ def trainable_count(model):
 def total_count(model):
     return sum(p.numel() for p in model.parameters())
 
-def parse_args(argv=None):
+
+DEFAULT_CONFIG = Path(__file__).parent / "her.config.json"
+# keys that describe the invocation rather than the run, so they are not
+# written into a generated config file
+_META_KEYS = ("help", "config", "dump_config")
+
+
+def load_config(path):
+    # A config only supplies defaults. Keeping argparse as the schema means
+    # --help, type checking and choices still work, and a flag on the command
+    # line always beats the file, so a config can never quietly override what
+    # you just typed.
+    import json
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(f"config not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"config {path} is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"config {path} must hold a JSON object, "
+                         f"not {type(data).__name__}")
+    return data
+
+
+def _coerce(action, value):
+    # The JSON author gets the same validation argparse would have applied, so
+    # "epochs": "20" behaves like --epochs 20 instead of failing deep in fit().
+    if isinstance(getattr(action, "const", None), bool):
+        if not isinstance(value, bool):
+            raise SystemExit(f"config: {action.dest} must be true or false, "
+                             f"not {value!r}")
+        return value
+    if action.choices and value not in action.choices:
+        raise SystemExit(f"config: {action.dest}={value!r} must be one of "
+                         f"{', '.join(map(str, action.choices))}")
+    if action.type is not None and value is not None:
+        try:
+            return action.type(value)
+        except (TypeError, ValueError):
+            raise SystemExit(f"config: {action.dest}={value!r} is not a valid "
+                             f"{getattr(action.type, '__name__', action.type)}")
+    return value
+
+
+def apply_config(ap, config):
+    if not config:
+        return
+    known = {a.dest: a for a in ap._actions if a.dest not in _META_KEYS}
+    unknown = sorted(set(config) - set(known))
+    if unknown:
+        # Refuse unknown keys rather than ignoring them: a misspelled option
+        # that is silently dropped leaves you training with settings you did
+        # not choose and no sign anything is wrong.
+        import difflib
+        hints = []
+        for name in unknown:
+            close = difflib.get_close_matches(name, list(known), n=2, cutoff=0.6)
+            hints.append(f"{name} -> {', '.join(close)}" if close else name)
+        raise SystemExit(
+            f"config: unknown option(s): {', '.join(unknown)}\n"
+            f"  closest match: {'; '.join(hints)}\n"
+            f"  valid options: {', '.join(sorted(known))}")
+    ap.set_defaults(**{k: _coerce(known[k], v) for k, v in config.items()})
+
+
+def _config_path_from_argv(argv):
+    for i, token in enumerate(argv):
+        if token == "--config" and i + 1 < len(argv):
+            return Path(argv[i + 1])
+        if token.startswith("--config="):
+            return Path(token.split("=", 1)[1])
+    return None
+
+
+def _bootstrap_config(ap, argv, default_path):
+    # Shared by her.py and chatbot.py: an explicit --config wins, else the
+    # script's own config file is auto-discovered, else built-in defaults.
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    explicit = _config_path_from_argv(raw)
+    path = explicit or (default_path if default_path and default_path.exists() else None)
+    if path is None:
+        return None
+    config = load_config(path)
+    if not explicit:
+        print(f"config: using defaults from {path}", flush=True)
+    return config
+
+
+def resolve_config_args(ap, argv=None, default_path=None):
+    """Config supplies defaults, explicit flags win. Exits on --dump-config."""
+    apply_config(ap, _bootstrap_config(ap, argv, default_path))
+    args = ap.parse_args(argv)
+    if args.dump_config:
+        written = dump_config(ap, args.dump_config)
+        print(f"wrote {len(written)} options to {args.dump_config}")
+        raise SystemExit(0)
+    return args
+
+
+def dump_config(ap, path):
+    # Relative paths, so a committed example works on any machine instead of
+    # pinning the absolute layout of whoever generated it.
+    import json
+    root = Path(__file__).parent.resolve()
+    body = {}
+    for action in ap._actions:
+        if action.dest in _META_KEYS:
+            continue
+        value = action.default
+        if isinstance(value, str):
+            try:
+                candidate = Path(value).resolve()
+                if candidate.is_relative_to(root):
+                    value = candidate.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                pass
+        body[action.dest] = value
+    ordered = {k: body[k] for k in sorted(body)}
+    Path(path).write_text(json.dumps(ordered, indent=2) + "\n", encoding="utf-8")
+    return ordered
+
+
+def parse_args(argv=None, config=None):
     ap = argparse.ArgumentParser(
         description="her: memorize the chat into a scalable decoder-only transformer",
     )
@@ -1174,9 +1460,21 @@ def parse_args(argv=None):
     ap.add_argument("--description", default=str(DEFAULT_DESC))
     ap.add_argument("--user", default=None,
                     help="your speaker name in the export (default: auto-detect)")
+    ap.add_argument("--user-speaker", default=None,
+                    help="canonical name for you in training turns "
+                         "(default: same as the export name)")
+    ap.add_argument("--her-speaker", default=None,
+                    help="canonical name for the persona in training turns; "
+                         "required, and kept out of the source on purpose, so a "
+                         "private name never lands in git history")
     ap.add_argument("--tokenizer-file", default=str(DEFAULT_BPE))
     ap.add_argument("--fresh", action="store_true",
                     help="retrain from scratch, ignore checkpoint and BPE cache")
+    ap.add_argument("--config", default=None, metavar="FILE",
+                    help="JSON file of defaults; explicit flags still win "
+                         f"(default: {DEFAULT_CONFIG.name} if it exists)")
+    ap.add_argument("--dump-config", default=None, metavar="FILE",
+                    help="write every option and its default to FILE, then exit")
     ap.add_argument("--size", default="nano",
                     choices=["none", "nano", "mini", "small"])
 
@@ -1187,7 +1485,19 @@ def parse_args(argv=None):
     ap.add_argument("--val-every", type=int, default=250,
                     help="run validation every N optimizer steps")
     ap.add_argument("--patience", type=int, default=10,
-                    help="stop after this many validations without improvement")
+                    help="stop after this many validations without improvement; "
+                         "0 disables early stopping, which is what a memorization "
+                         "run wants since its val loss rises as it memorizes")
+    ap.add_argument("--keep-last", action="store_true",
+                    help="save the final weights instead of the best-val ones; "
+                         "for memorizing, the last weights are the ones you want")
+    ap.add_argument("--spike-factor", type=float, default=4.0,
+                    help="abort if the train loss stays above this multiple of "
+                         "its running best for --spike-patience steps; 0 "
+                         "disables the spike test (a non-finite loss always "
+                         "aborts)")
+    ap.add_argument("--spike-patience", type=int, default=3,
+                    help="consecutive spiking steps tolerated before aborting")
     ap.add_argument("--block", type=int, default=None,
                     help="training sequence length; defaults to the size "
                          "preset's context (nano 128, mini 256, small 512)")
@@ -1234,7 +1544,19 @@ def parse_args(argv=None):
     ap.add_argument("--log-every", type=int, default=0)
     ap.add_argument("--log-best", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
-    return ap.parse_args(argv)
+
+    if config is None:
+        config = _bootstrap_config(ap, argv, DEFAULT_CONFIG)
+    apply_config(ap, config)
+    args = ap.parse_args(argv)
+    # remember which keys came from a config file, so a later decision can tell
+    # "the user asked for this" from "this is only the built-in default"
+    args._from_config = set(config or ())
+    if args.dump_config:
+        written = dump_config(ap, args.dump_config)
+        print(f"wrote {len(written)} options to {args.dump_config}")
+        raise SystemExit(0)
+    return args
 
 
 def load_corpus(args):
@@ -1334,28 +1656,68 @@ def _print_resume_override(args, stored_epochs, rank):
           flush=True)
 
 
-def reconcile_epochs(args, stored_epochs, rank):
-    # Which epoch count wins on resume: explicit --epochs, else the stored one.
+def reconcile_epochs(args, state, rank):
+    # Which epoch count wins on resume: an explicit --epochs, else whatever is
+    # left of the original target. args.epochs always means "epochs to run now",
+    # because total_steps = start_step + epochs * steps_per_epoch, so a bare
+    # resume has to subtract the work already done or it overshoots the target.
+    stored_done = state.get("epochs") or 0
+    stored_target = state.get("epochs_target")
+    stored_step = state.get("step") or 0
+    stored_spe = state.get("steps_per_epoch")
     if args.epochs_explicit:
-        _print_resume_override(args, stored_epochs, rank)
+        _print_resume_override(args, stored_target or stored_done, rank)
         return
-    args.epochs = stored_epochs or args.epochs
-    if stored_epochs and rank == 0:
-        print(f"resume: continuing for {stored_epochs} checkpoint epochs "
-              f"(pass --epochs to override)", flush=True)
+    if stored_target and stored_spe:
+        # Work out the shortfall in steps. Doing it in epochs loses the partial
+        # epoch the best checkpoint sits in and overshoots the target by one.
+        remaining = max(0, stored_target * stored_spe - stored_step)
+        args.epochs = max(1, remaining // stored_spe)
+        if rank == 0:
+            done = stored_step / stored_spe
+            print(f"resume: {done:.2f} of {stored_target} epoch(s) done "
+                  f"({stored_step:,}/{stored_target * stored_spe:,} steps), "
+                  f"running {args.epochs} more (pass --epochs to add more)",
+                  flush=True)
+        return
+    if stored_done:
+        # Legacy checkpoint: `epochs` recorded the requested count rather than
+        # completed work, so it cannot say how much is left. Trusting it would
+        # either stop immediately or train twice the original target.
+        args.epochs = stored_done
+        if rank == 0:
+            print(f"resume: checkpoint predates per-epoch tracking; its epoch "
+                  f"count ({stored_done}) was the request, not progress, so "
+                  f"training that many more. Pass --epochs to be precise.",
+                  flush=True)
 
 
-def resolve_model(args, state, tok, rank):
+def _flag_given(argv, name):
+    return name in (sys.argv[1:] if argv is None else argv)
+
+
+def resolve_model(args, state, tok, rank, argv=None):
     # Reuse the checkpoint's architecture when possible; otherwise build from flags.
     if state is None:
         cfg = build_cfg(args, tok)
         return cfg, build_model(cfg)
-    cfg = state["cfg"]
+    # Copy: cfg aliases state["cfg"], so writing to it would mutate the loaded
+    # checkpoint in place.
+    cfg = dict(state["cfg"])
     args.objective = cfg["objective"]
+    # dropout is a regularizer, not architecture: it does not change weight
+    # shapes, so an explicit --dropout can be honoured on resume. cfg otherwise
+    # won silently, which mattered because dropout is the main thing stopping a
+    # memorization run from driving its loss to zero.
+    if _flag_given(argv, "--dropout"):
+        cfg["dropout"] = args.dropout
+        if rank == 0:
+            print(f"dropout:         {args.dropout} (from flag, overriding "
+                  f"the checkpoint's {state['cfg']['dropout']})")
     # `epochs` is stored at the top level of the checkpoint by Trainer.save, not
     # inside cfg, so cfg.get("epochs") was always None and every bare re-run
     # silently fell back to the --epochs default.
-    reconcile_epochs(args, state.get("epochs"), rank)
+    reconcile_epochs(args, state, rank)
     model = build_model(cfg)
     try:
         # allow lora/quant flags to resume from identical architecture
@@ -1423,7 +1785,7 @@ def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
     if rank == 0:
         print(f"training for {args.epochs} epochs (~{trainer.total_steps:,} steps)")
         if trainer.val_windows is not None:
-            print(f"validation: {len(trainer.val_windows)} held-out windows, "
+            print(f"validation: {trainer.val_windows.num_windows} held-out windows, "
                   f"every {trainer.val_every} steps, patience {trainer.patience}")
         else:
             print("validation: DISABLED (--val-fraction 0) - training loss is "
@@ -1438,13 +1800,28 @@ def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
             print(f"saved checkpoint: {args.ckpt} (loss {final_loss:.4f}, "
                   f"{steps_done:,} steps)")
         elif trainer.best_step:
-            # _maybe_validate already wrote the retained checkpoint; overwriting
-            # it here would replace the best-val weights with the last weights
-            # and pair that loss with a step it was never measured at.
-            print(f"retained checkpoint: {args.ckpt} (best val "
-                  f"{trainer.best_val:.4f} at step {trainer.best_step:,}; "
-                  f"stopped at {steps_done:,})")
-            final_loss = trainer.best_val
+            if trainer.diverged:
+                # Nothing to write: the weights are not trustworthy and the
+                # retained checkpoint is the last good one.
+                print(f"kept previous checkpoint: {args.ckpt} (run diverged at "
+                      f"step {steps_done:,}; weights not saved)")
+            elif args.keep_last:
+                # Best-val retention keeps the least-memorized weights, which is
+                # backwards for a model whose job is to memorize. --keep-last
+                # writes the final weights instead.
+                if trainer.save(final_loss, steps_done):
+                    print(f"saved final weights: {args.ckpt} (train loss "
+                          f"{final_loss:.4f}, {steps_done:,} steps)")
+            else:
+                # _maybe_validate already wrote the retained checkpoint;
+                # overwriting it here would replace the best-val weights with
+                # the last weights and pair that loss with a step it was never
+                # measured at.
+                print(f"retained checkpoint: {args.ckpt} (best val "
+                      f"{trainer.best_val:.4f} at step {trainer.best_step:,}; "
+                      f"stopped at {steps_done:,})")
+            # final_loss stays the TRAIN loss from fit(): overwriting it with
+            # best_val made the summary report the val loss as the train loss.
         print_summary(args, cfg, tok, len(ids), trainable_count(model),
                       total_count(model), final_loss, steps_done,
                       state["step"] if state else 0, device, elapsed,
@@ -1462,9 +1839,15 @@ def main(argv=None):
 
     args = parse_args(argv)
     # was --epochs passed on the CLI? resume must not silently override it
-    args.epochs_explicit = "--epochs" in (sys.argv[1:] if argv is None else argv)
+    args.epochs_explicit = ("--epochs" in (sys.argv[1:] if argv is None else argv)
+                            # A config-supplied epochs means the same thing the
+                            # flag does, otherwise the stored target silently
+                            # overrode the config on every resume.
+                            or "epochs" in getattr(args, "_from_config", ()))
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    # before load_corpus, which labels the persona turns
+    configure_speakers(args.user_speaker, args.her_speaker)
 
     device, rank, world, local = init_process(args)
     state = load_checkpoint(args, rank, world)
@@ -1479,7 +1862,7 @@ def main(argv=None):
     else:
         val_corpus = ""
     tok = load_tokenizer(args, corpus, state, rank)
-    cfg, model = resolve_model(args, state, tok, rank)
+    cfg, model = resolve_model(args, state, tok, rank, argv)
 
     n_train = trainable_count(model)
     n_total = total_count(model)
@@ -1512,8 +1895,19 @@ def print_summary(args, cfg, tok, n_tokens, n_train, n_total, final_loss,
     if trainer is not None and trainer.val_windows is not None:
         print(f"val loss (best):  {trainer.best_val:.4f} at step "
               f"{trainer.best_step:,}")
+        print(f"val loss (last):  {trainer.last_val:.4f}"
+              if trainer.last_val == trainer.last_val else
+              "val loss (last):  n/a")
         print(f"early stop:      {'yes' if trainer.stopped_early else 'no'}"
               f" (patience {trainer.patience}, every {trainer.val_every} steps)")
+        if trainer.stopped_early:
+            # The gap between these two IS the diagnosis: train falling while
+            # val rises is overfitting, which for a memorization model is the
+            # goal, not a fault. The stop fires anyway because patience counts
+            # val checks, so it halts the run at the point it starts working.
+            print(f"note:           train {final_loss:.4f} vs val "
+                  f"{trainer.best_val:.4f}; a rising val loss here means "
+                  f"memorizing, not a problem to fix")
     else:
         print("val loss:        DISABLED")
     print(f"train loss:      {final_loss:.4f}")

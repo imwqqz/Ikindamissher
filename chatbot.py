@@ -10,15 +10,17 @@ from her import (
     DEFAULT_CKPT,
     DEFAULT_DATA,
     DEFAULT_DESC,
-    HER_SPEAKER,
-    USER_SPEAKER,
-    build_corpus,
     build_model,
     bpe_from_state,
+    configure_speakers,
     detect_user,
     parse_wa,
     persona_lines,
+    resolve_config_args,
+    speaker_names,
 )
+
+CHAT_CONFIG = Path(__file__).parent / "chatbot.config.json"
 
 BOT_LABEL = "her"
 
@@ -41,57 +43,58 @@ def clip_msg(msg, max_tokens, tokenizer):
     return text.strip()
 
 
-def match_score(prompt_toks, question, tokenizer):
-    q = tokenizer.encode(question)
-    common = sum(1 for t in prompt_toks if t in q)
-    if common == 0 or not prompt_toks or not q:
-        return 0.0
-    return common / (len(prompt_toks) ** 0.5 * len(q) ** 0.5)
+def chat_pairs(text):
+    # Consecutive user->persona exchanges from a normalized corpus.
+    user_name, her_name = speaker_names()
+    turn = re.compile(rf"^({re.escape(user_name)}|{re.escape(her_name)}): (.*)$")
+    turns = []
+    for line in text.splitlines():
+        m = turn.match(line)
+        if m:
+            turns.append((m.group(1), m.group(2).strip()))
+    return [(turns[i - 1][1], turns[i][1]) for i in range(1, len(turns))
+            if turns[i][0] == her_name and turns[i - 1][0] == user_name]
 
 
-# Retrieve similar users1 <=> her exchanges as in-context demos (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+def pick_demos(pairs, prompt, shots, tokenizer):
+    # Rank candidate demos by token overlap with the prompt
+    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    prompt_tokens = tokenizer.encode(prompt) if prompt else []
+    if not prompt_tokens or shots <= 0:
+        return []
+
+    def overlap(question):
+        q = tokenizer.encode(question)
+        if not q:
+            return 0.0
+        common = sum(1 for t in prompt_tokens if t in q)
+        return common / (len(prompt_tokens) ** 0.5 * len(q) ** 0.5)
+
+    scored = sorted(((overlap(q), (q, a)) for q, a in pairs),
+                    key=lambda item: item[0], reverse=True)
+    return [pair for score, pair in scored if score > 0][:shots]
+
+
 def few_shot_pairs(text, shots, demo_len, tokenizer, prompt=""):
+    # Retrieve similar user1<=>her exchanges as in-context demos
+    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    user_name, her_name = speaker_names()
     pairs = chat_pairs(text)
     if not pairs:
         return "", 0
     selected = pick_demos(pairs, prompt, shots, tokenizer)
     context = "\n".join(
-        f"{USER_SPEAKER}: {clip_msg(q, demo_len, tokenizer)}\n"
-        f"{HER_SPEAKER}: {clip_msg(a, demo_len, tokenizer)}"
+        f"{user_name}: {clip_msg(q, demo_len, tokenizer)}\n"
+        f"{her_name}: {clip_msg(a, demo_len, tokenizer)}"
         for q, a in selected
     )
     return context, len(selected)
 
 
-def chat_pairs(text):
-    # Extract consecutive user->her exchanges from a normalized corpus
-    turns = []
-    for line in text.splitlines():
-        match = re.match(rf"^({USER_SPEAKER}|{HER_SPEAKER}): (.*)$", line)
-        if match:
-            turns.append((match.group(1), match.group(2).strip()))
-    pairs = []
-    for i in range(1, len(turns)):
-        if turns[i][0] == HER_SPEAKER and turns[i - 1][0] == USER_SPEAKER:
-            pairs.append((turns[i - 1][1], turns[i][1]))
-    return pairs
-
-
-def pick_demos(pairs, prompt, shots, tokenizer):
-    # Rank candidate demos by token overlap with the user's prompt (T5, section 2.1 https://arxiv.org/abs/2005.14165)
-    prompt_tokens = tokenizer.encode(prompt) if prompt else []
-    if not prompt_tokens or shots <= 0:
-        return []
-    scored = sorted(
-        ((match_score(prompt_tokens, q, tokenizer), (q, a)) for q, a in pairs),
-        key=lambda item: item[0],
-        reverse=True,
-    )
-    return [pair for score, pair in scored if score > 0][:shots]
-
-
-# Text-to-text prompt: persona + demos + history + her hint (T5, section 2.1 https://arxiv.org/abs/2005.14165)
 def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
+    # Text-to-text prompt: persona + demos + history + her hint
+    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    user_name, her_name = speaker_names()
     description = ""
     # Path("") resolves to ".", which exists, so an unset --description used to
     # read_text() a directory and die with PermissionError.
@@ -114,11 +117,10 @@ def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
         raise SystemExit(
             f"--max-reply {args.max_reply} leaves no room in a context of "
             f"{state['cfg']['max_len']}; lower it")
-    parts = [p for p in (description, demos) if p]
-    prefix = "\n".join(parts)
+    prefix = "\n".join(p for p in (description, demos) if p)
     hist = "\n".join(history)
-    full = "\n".join(p for p in (prefix, hist, f"{USER_SPEAKER}: {prompt}") if p)
-    ids = tokenizer.encode(full + f"\n{HER_SPEAKER}: ")
+    full = "\n".join(p for p in (prefix, hist, f"{user_name}: {prompt}") if p)
+    ids = tokenizer.encode(full + f"\n{her_name}: ")
     if len(ids) > max_ctx:
         # Keep the tail (the actual question) but do not start mid-subword:
         # cutting at an arbitrary token left the model reading a broken word
@@ -157,20 +159,21 @@ def load_assets(args, device):
 
 
 def load_corpus(args):
-    # Normalize the export into canonical user1/her turns for demo retrieval
+    # Normalize the export into canonical user/persona turns for demo retrieval
+    user_name, _ = speaker_names()
     if not Path(args.data).exists():
         return ""
-    raw_text = Path(args.data).read_text(encoding="utf-8")
-    user = args.user or detect_user(raw_text, HER_SPEAKER)
-    aliases = {user: USER_SPEAKER} if user.lower() != USER_SPEAKER else None
-    corpus_text = parse_wa(raw_text, speakers=(USER_SPEAKER, HER_SPEAKER),
-                           aliases=aliases)
+    raw = Path(args.data).read_text(encoding="utf-8")
+    user = args.user or detect_user(raw)
+    aliases = {user.lower(): user_name} if user.lower() != user_name else None
+    corpus_text = parse_wa(raw, aliases=aliases)
     if args.shots > 0:
         print(f"few-shot retrieval on {args.data} (user: {user})")
     return corpus_text
 
 
 def generate_reply(args, state, model, tokenizer, prompt, history, corpus_text, device):
+    user_name, _ = speaker_names()
     ids, _ = build_prompt(args, state, tokenizer, prompt, history, corpus_text)
     gen = model.generate(
         torch.tensor([ids], device=device),
@@ -181,27 +184,25 @@ def generate_reply(args, state, model, tokenizer, prompt, history, corpus_text, 
         repeat_penalty=args.repeat_penalty,
         stop_ids=tokenizer.stop_ids(),
     )
-    reply = tokenizer.decode(gen).strip()
-    reply = re.sub(r"^[:\s]+", "", reply)
-    return re.split(rf"(?:\n|{USER_SPEAKER}:)", reply)[0].strip()
+    reply = re.sub(r"^[:\s]+", "", tokenizer.decode(gen).strip())
+    return re.split(rf"(?:\n|{re.escape(user_name)}:)", reply)[0].strip()
 
 
-def main(argv=None):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except AttributeError:
-        pass
-
+def build_parser():
     ap = argparse.ArgumentParser(
         description="chatbot: talk to her using the memory trained by her.py")
     ap.add_argument("--ckpt", default=str(DEFAULT_CKPT))
     ap.add_argument("--data", default=str(DEFAULT_DATA))
-    ap.add_argument("--description",
-                    default=str(Path(__file__).parent / "data" / "input" / "description.txt"))
+    ap.add_argument("--description", default=str(DEFAULT_DESC))
     ap.add_argument("--user", default=None,
                     help="your speaker name in the export (default: auto-detect)")
+    ap.add_argument("--user-speaker", default=None,
+                    help="canonical name for you, as used when training")
+    ap.add_argument("--her-speaker", default=None,
+                    help="canonical name for the persona; must match training, "
+                         "and is kept out of the source on purpose")
     ap.add_argument("--shots", type=int, default=2,
-                    help="real user1/her exchanges matched to your prompt")
+                    help="real user/persona exchanges matched to your prompt")
     ap.add_argument("--demo-len", type=int, default=20,
                     help="max tokens per demo message")
     ap.add_argument("--max-reply", type=int, default=40)
@@ -210,7 +211,21 @@ def main(argv=None):
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--repeat-penalty", type=float, default=1.15)
     ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args(argv)
+    ap.add_argument("--config", default=None, metavar="FILE",
+                    help="JSON file of defaults; explicit flags still win "
+                         f"(default: {CHAT_CONFIG.name} if it exists)")
+    ap.add_argument("--dump-config", default=None, metavar="FILE",
+                    help="write every option and its default to FILE, then exit")
+    return ap
+
+
+def main(argv=None):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
+    args = resolve_config_args(build_parser(), argv, CHAT_CONFIG)
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -221,20 +236,43 @@ def main(argv=None):
     print(f"device: {device}")
 
     state, model, tokenizer = load_assets(args, device)
+    # The checkpoint is the only artifact that knows how its turns were
+    # labelled, so prefer those names and let the flags override. A mismatch
+    # silently detaches every persona turn, so this is never guessed.
+    cfg = state["cfg"]
+    configure_speakers(args.user_speaker or cfg.get("user_speaker"),
+                       args.her_speaker or cfg.get("her_speaker"))
+    user_name, her_name = speaker_names()
+    if not user_name or not her_name:
+        raise SystemExit(
+            "this checkpoint predates speaker persistence and no names were "
+            'given. Pass the same values you trained with, e.g.\n'
+            '  py chatbot.py --user-speaker "<name>" --her-speaker "<name>"\n'
+            "Retraining stores them in the checkpoint, so this is only "
+            "needed for older files.")
+    if (cfg.get("her_speaker") and her_name != cfg["her_speaker"]) or \
+       (cfg.get("user_speaker") and user_name != cfg["user_speaker"]):
+        print(f"note: overriding checkpoint labels (trained as "
+              f"{cfg.get('user_speaker')!r}/{cfg.get('her_speaker')!r})")
+
     corpus_text = load_corpus(args)
 
     history = []
-    print(f"chatting with her - type 'exit' to quit")
+    print(f"chatting with her as {her_name!r} - type 'exit' to quit")
     while True:
-        prompt = input(f"<{USER_SPEAKER}>: ").strip()
+        try:
+            prompt = input(f"<{user_name}>: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
         if not prompt or prompt.lower() in ("exit", "quit"):
             break
         reply = generate_reply(args, state, model, tokenizer, prompt,
                                history, corpus_text, device)
         if reply:
             print(f"{BOT_LABEL}: {reply}")
-            history.append(f"{USER_SPEAKER}: {clip_msg(prompt, 15, tokenizer)}")
-            history.append(f"{HER_SPEAKER}: {clip_msg(reply, 15, tokenizer)}")
+            history.append(f"{user_name}: {clip_msg(prompt, 15, tokenizer)}")
+            history.append(f"{her_name}: {clip_msg(reply, 15, tokenizer)}")
             history = history[-16:]
 
 
