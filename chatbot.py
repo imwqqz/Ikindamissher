@@ -24,10 +24,21 @@ BOT_LABEL = "her"
 
 
 def clip_msg(msg, max_tokens, tokenizer):
+    # Byte-level BPE: slicing tokens mid-sequence can split a multi-byte
+    # character, and decode() substitutes U+FFFD for the dangling bytes, so a
+    # clipped message ended in replacement garbage. Re-encode a character
+    # boundary instead of trusting the token count, and mark the cut so a
+    # truncated turn is still readable as truncated.
+    msg = msg.strip()
     toks = tokenizer.encode(msg)
     if len(toks) <= max_tokens:
         return msg
-    return tokenizer.decode(toks[:max_tokens])
+    text = tokenizer.decode(toks[:max_tokens])
+    # decode() already replaced the broken tail; drop it and anything partial.
+    text = text.replace("\ufffd", "")
+    if text and not text[-1].isspace():
+        text += "..."
+    return text.strip()
 
 
 def match_score(prompt_toks, question, tokenizer):
@@ -82,7 +93,9 @@ def pick_demos(pairs, prompt, shots, tokenizer):
 # Text-to-text prompt: persona + demos + history + her hint (T5, section 2.1 https://arxiv.org/abs/2005.14165)
 def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
     description = ""
-    if Path(args.description).exists():
+    # Path("") resolves to ".", which exists, so an unset --description used to
+    # read_text() a directory and die with PermissionError.
+    if args.description and Path(args.description).exists():
         description = "\n".join(persona_lines(
             Path(args.description).read_text(encoding="utf-8")))
 
@@ -92,14 +105,34 @@ def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
         demos, n_shots = few_shot_pairs(corpus_text, args.shots,
                                         args.demo_len, tokenizer, prompt)
 
-    max_ctx = state["cfg"]["max_len"] - 40
+    # Headroom has to cover the reply the model is about to write. It used to be
+    # a hardcoded 40, which happened to match the default --max-reply and
+    # overflowed RoPE for any larger value, since rotary positions only exist
+    # for max_len.
+    max_ctx = state["cfg"]["max_len"] - args.max_reply - 1
+    if max_ctx < 1:
+        raise SystemExit(
+            f"--max-reply {args.max_reply} leaves no room in a context of "
+            f"{state['cfg']['max_len']}; lower it")
     parts = [p for p in (description, demos) if p]
     prefix = "\n".join(parts)
     hist = "\n".join(history)
     full = "\n".join(p for p in (prefix, hist, f"{USER_SPEAKER}: {prompt}") if p)
     ids = tokenizer.encode(full + f"\n{HER_SPEAKER}: ")
     if len(ids) > max_ctx:
+        # Keep the tail (the actual question) but do not start mid-subword:
+        # cutting at an arbitrary token left the model reading a broken word
+        # fragment as its first input. Snap forward to the next line break, but
+        # only when that still leaves most of the window -- taking the first
+        # break unconditionally collapsed the prompt to a handful of tokens
+        # whenever the retained history was repetitive.
         ids = ids[-max_ctx:]
+        nl = set(tokenizer.encode("\n"))
+        floor = max_ctx // 2
+        starts = [i + 1 for i, tok in enumerate(ids)
+                  if tok in nl and len(ids) - (i + 1) >= floor]
+        if starts:
+            ids = ids[starts[0]:]
     return ids, n_shots
 
 

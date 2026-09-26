@@ -273,9 +273,27 @@ def persona_lines(text: str):
                     lines.append("her: " + chunk.strip())
     return lines
 
+def _split_turns(conv: str, val_fraction: float):
+    # Contiguous tail split on a turn boundary. A random window split would leak:
+    # sliding windows overlap by block-1 tokens, so a random split puts almost
+    # every validation token into training too.
+    lines = conv.splitlines()
+    if len(lines) < 8 or val_fraction <= 0:
+        return conv, ""
+    n_val = max(2, int(len(lines) * val_fraction))
+    cut = len(lines) - n_val
+    # start validation on a user turn so user->her pairs stay intact
+    while cut < len(lines) and not lines[cut].startswith(f"{USER_SPEAKER}:"):
+        cut += 1
+    if cut >= len(lines) - 2:
+        return conv, ""
+    return "\n".join(lines[:cut]) + "\n", "\n".join(lines[cut:]) + "\n"
+
+
 # (T5, section 2.1 https://arxiv.org/abs/2005.14165).
 def build_corpus(data_path: Path, desc_path: Path, label: str = HER_SPEAKER,
-                 user: Optional[str] = None):
+                 user: Optional[str] = None, val_fraction: float = 0.0):
+    # Returns the corpus string, or (train, val) when val_fraction > 0.
     raw = data_path.read_text(encoding="utf-8")
     if user is None:
         user = detect_user(raw, label)
@@ -286,12 +304,16 @@ def build_corpus(data_path: Path, desc_path: Path, label: str = HER_SPEAKER,
         aliases[label.lower()] = HER_SPEAKER
     corpus = parse_wa(raw, speakers=(USER_SPEAKER, HER_SPEAKER), aliases=aliases or None)
     corpus = corpus.replace(f"\n{label}: ", f"\n{HER_SPEAKER}: ")
+
+    train, val = _split_turns(corpus, val_fraction)
+    # the persona block goes to train only: it is appended at the end of the
+    # corpus, so a naive tail split would hold the whole persona out of training
     desc = ""
     if desc_path.exists():
         desc = "\n".join(persona_lines(desc_path.read_text(encoding="utf-8")))
     if desc:
-        corpus = corpus.rstrip("\n") + "\n\n" + desc + "\n"
-    return corpus
+        train = train.rstrip("\n") + "\n\n" + desc + "\n"
+    return (train, val) if val else train
 
 
 # 3. RoPE, Attention Is All You Need, section 3.5 (positional encoding lineage) https://arxiv.org/abs/1706.03762
@@ -559,7 +581,11 @@ class GPT(nn.Module):
         device = idx.device
         self(idx, use_cache=True)
         gen = []
-        for _ in range(max_new):
+        # Rotary positions are only allocated for max_len, so sampling past it
+        # fed out-of-range positions into RoPE and crashed on a shape mismatch.
+        # A prompt sized at max_len left the caller no room to answer at all.
+        budget = max(0, self.max_len - idx.shape[1])
+        for _ in range(min(max_new, budget)):
             logits = self(idx[:, -1:], use_cache=True)[0, -1] / max(temperature, 1e-8)
             if repeat_penalty != 1.0 and gen:
                 # Penalize already-generated tokens (presence penalty) (The Curious Case of Neural Text Degeneration, section 5 https://arxiv.org/abs/1904.09751)
@@ -711,9 +737,47 @@ class BatchSampler:
             # model to predict two tokens ahead (attention is causal) (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
             yield self.ids[idx], self.ids[idx]
 
+def _opt_float(value, default):
+    # Checkpoints store None for metrics a given run never produced.
+    return default if value is None else float(value)
+
+
+def _finite_or_none(value):
+    # The train-loss "best" stays inf forever under validation gating, which
+    # torch.save would otherwise persist as a bare inf.
+    if value is None:
+        return None
+    value = float(value)
+    return None if value == float("inf") else value
+
+
+class ValWindows:
+    # Deterministic, non-overlapping windows: stride == block, no shuffling, so
+    # every validation token is predicted exactly once. BatchSampler instead
+    # draws a fresh randperm over all sliding windows each epoch, which is
+    # right for training but makes a validation number meaningless.
+    # Yields exactly `block` tokens, same as BatchSampler: the model allocates
+    # rotary positions for max_len == block, so block+1 overflows RoPE.
+    def __init__(self, ids, block, device):
+        self.ids = torch.tensor(ids, dtype=torch.long, device=device)
+        self.block = block
+        self.device = device
+
+    def __len__(self):
+        return max(0, self.ids.numel() // self.block)
+
+    def __iter__(self):
+        n = self.ids.numel()
+        for start in range(0, n - self.block + 1, self.block):
+            chunk = self.ids[start:start + self.block]
+            if chunk.numel() < 2:
+                break
+            yield chunk.unsqueeze(0)
+
+
 class Trainer:
     def __init__(self, args, cfg, model, ids, device, tokenizer, ckpt,
-                 start_step=0, rank=0, world=1):
+                 start_step=0, rank=0, world=1, val_ids=None, state=None):
         self.model = model
         self.cfg = cfg
         self.device = device
@@ -730,6 +794,13 @@ class Trainer:
         self.start_step = start_step
         self.precision = getattr(args, "precision_dtype", None)
         self.sample_every_epoch = 4
+        self.val_every = max(1, args.val_every)
+        self.patience = max(0, args.patience)
+        self.val_windows = (ValWindows(val_ids, args.block, device)
+                            if val_ids and len(val_ids) > args.block + 1 else None)
+        self.since_best = 0
+        self.stopped_early = False
+        self.last_train_loss = float("inf")
 
         self.sampler = BatchSampler(ids, args.block, args.batch, device,
                                     rank=rank, world=world)
@@ -748,7 +819,25 @@ class Trainer:
         self.base_lr = (args.lr * math.sqrt(args.warmup_steps)
                         if args.warmup_steps > 0 else args.lr)
 
-        self.best = float("inf")
+        # Restore the best-so-far across resumes. Resetting to inf each run meant
+        # "best" only ever meant "best within this process". Checkpoints written
+        # by a validation run store None for the unused train-loss best, so every
+        # field has to tolerate None.
+        state = state or {}
+        self.best = _opt_float(state.get("best"), float("inf"))
+        self.best_step = int(state.get("best_step") or 0)
+        self.best_val = _opt_float(state.get("best_val"), float("inf"))
+        # Adam's first/second moments are not derivable from the weights, so
+        # dropping them made every resume restart the moment estimates from
+        # zero and spike the loss. The LR schedule needs no state: it is a pure
+        # function of the step counter.
+        if state.get("optim"):
+            try:
+                self.optimizer.load_state_dict(state["optim"])
+            except (ValueError, KeyError):
+                # Param groups changed shape; a fresh optimizer is the safe
+                # fallback, so keep going rather than refusing to resume.
+                pass
         self.recent = deque(maxlen=max(args.log_every, 1))
         self.run_start = time.perf_counter()
         self.window_start = self.run_start
@@ -795,8 +884,74 @@ class Trainer:
         loss.backward()
         return loss
 
+    def evaluate(self):
+        # Held-out loss with dropout off and no shuffling. Returns None when no
+        # validation split was built.
+        if self.val_windows is None:
+            return None
+        model = self._unwrap()
+        model.eval()
+        total, count = 0.0, 0
+        with torch.no_grad():
+            for chunk in self.val_windows:
+                batch = chunk.to(self.device)
+                with torch.autocast("cuda", dtype=self.precision,
+                                    enabled=self.precision is not None
+                                    and self.device.type == "cuda"):
+                    loss = self._forward_loss(batch, batch)
+                total += loss.item()
+                count += 1
+        model.train()
+        return total / count if count else None
+
+    def _maybe_validate(self, steps, epoch):
+        # Only rank 0 holds the validation data and writes the checkpoint, so
+        # only rank 0 can decide to stop. That decision has to reach every
+        # rank: if rank 0 returned from fit() alone, the others would keep
+        # entering DDP all-reduce collectives with a peer that had left, and
+        # the job would hang instead of exiting.
+        stop = self._validate_on_rank0(steps, epoch)
+        if self.world > 1:
+            import torch.distributed as dist
+            flag = torch.tensor([1 if stop else 0], device=self.device)
+            dist.broadcast(flag, src=0)
+            stop = bool(flag.item())
+            if stop:
+                self.stopped_early = True
+        return stop
+
+    def _validate_on_rank0(self, steps, epoch):
+        # Gate the retained checkpoint on validation loss, not training loss:
+        # with dropout off, training loss can only fall, so it never signals
+        # that the model has stopped generalizing.
+        if self.val_windows is None or self.rank != 0:
+            return False
+        val = self.evaluate()
+        if val is None:
+            return False
+        if val < self.best_val - 1e-4:
+            self.best_val = val
+            self.best_step = steps
+            self.since_best = 0
+            self.save(self.last_train_loss, steps, val_loss=val)
+            print(f"  step {steps:,} epoch {epoch} | val {val:.4f} "
+                  f"| best {self.best_val:.4f} -> saved", flush=True)
+        else:
+            self.since_best += 1
+            print(f"  step {steps:,} epoch {epoch} | val {val:.4f} "
+                  f"| best {self.best_val:.4f} | stale {self.since_best}"
+                  f"/{self.patience}", flush=True)
+            if self.patience and self.since_best >= self.patience:
+                print(f"  early stop: no val improvement for {self.patience} "
+                      f"checks; best val {self.best_val:.4f} at step "
+                      f"{self.best_step:,}", flush=True)
+                self.stopped_early = True
+                return True
+        return False
+
     def fit(self):
         steps = self.start_step
+        opt_steps = 0
         for epoch in range(1, self.epochs + 1):
             epoch_start = time.perf_counter()
             total = 0.0
@@ -813,16 +968,27 @@ class Trainer:
                 total += loss.item()
                 batches += 1
                 accum += 1
+                stepped = False
                 if accum % self.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    opt_steps += 1
+                    stepped = True
+                self.last_train_loss = loss.item() * self.grad_accum
                 if self.log_every and steps % self.log_every == 0:
                     self._log_step(steps, epoch, loss.item())
+                # --val-every counts optimizer steps, but `steps` (and the
+                # checkpoint's step/best_step) counts micro-batches. Gate on the
+                # former and report the latter so the units never mix.
+                if stepped and opt_steps % self.val_every == 0:
+                    if self._maybe_validate(steps, epoch):
+                        return self.best, steps
             if accum % self.grad_accum != 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+                opt_steps += 1
             avg = total / max(batches, 1)
             self._end_epoch(epoch, steps, avg, epoch_start)
         return self.best, steps
@@ -870,7 +1036,9 @@ class Trainer:
         self.save_if_best(avg, steps)
 
     def save_if_best(self, avg, steps):
-        if self.rank != 0 or avg >= self.best:
+        # Only used when there is no validation split; with one, _maybe_validate
+        # owns which checkpoint gets retained.
+        if self.rank != 0 or self.val_windows is not None or avg >= self.best:
             return
         self.best = avg
         self.save(avg, steps)
@@ -892,12 +1060,20 @@ class Trainer:
         model.train()
         print(f"  sample: {self.tokenizer.decode(out)}", flush=True)
 
-    def save(self, loss, steps):
+    def save(self, loss, steps, val_loss=None):
+        # `loss` and `step` are a matched pair: loss is the train loss observed
+        # at exactly this step. best_val/best_step travel separately so a resume
+        # can restore them instead of restarting the search from scratch.
         state_dict = self._unwrap().state_dict()
         torch.save(
-            {"model": state_dict, "loss": loss, "cfg": self.cfg,
-             "tokenizer": bpe_state(self.tokenizer), "step": steps,
-             "epochs": self.epochs},
+            {"model": state_dict, "loss": float(loss), "cfg": self.cfg,
+             "tokenizer": bpe_state(self.tokenizer), "step": int(steps),
+             "epochs": self.epochs, "best": _finite_or_none(self.best),
+             "val_loss": _finite_or_none(
+                 val_loss if val_loss is not None else self.best_val),
+             "best_val": _finite_or_none(self.best_val),
+             "best_step": self.best_step,
+             "optim": self.optimizer.state_dict()},
             self.ckpt,
         )
 
@@ -923,8 +1099,30 @@ SIZE_PRESETS = {
 }
 
 
+def resolve_block(args, state, rank):
+    # --block sets the training sequence length: it drives the tokenizer windows,
+    # BatchSampler, and the validation split. The size preset's max_len must
+    # never silently override it, or RoPE gets sized for a different context
+    # than the data actually uses (build_cfg used to let the preset win).
+    # Default to the preset's context so presets keep their intended size.
+    if state is not None:
+        # A checkpoint fixes the architecture, so its context wins over a flag.
+        stored = state["cfg"].get("max_len")
+        if stored and args.block is not None and args.block != stored:
+            if rank == 0:
+                print(f"resume: --block {args.block} ignored; checkpoint "
+                      f"trained with context {stored}", flush=True)
+            args.block = stored
+        elif stored:
+            args.block = stored
+        return
+    if args.block is None:
+        preset = SIZE_PRESETS.get(args.size) or {}
+        args.block = preset.get("max_len", 128)
+
+
 def build_cfg(args, tokenizer):
-    size = SIZE_PRESETS[args.size]
+    size = SIZE_PRESETS.get(args.size)
     cfg = {
         "vocab_size": tokenizer.vocab_size,
         "d_model": args.d_model,
@@ -942,9 +1140,11 @@ def build_cfg(args, tokenizer):
         "gc": getattr(args, "gc", False),
         "tokenizer_arch": "bpe",
     }
-    if args.size != "none":
+    if size:
         for k, v in size.items():
-            cfg[k] = v
+            # max_len is owned by --block; see resolve_block.
+            if k != "max_len":
+                cfg[k] = v
     return cfg
 
 
@@ -981,7 +1181,16 @@ def parse_args(argv=None):
                     choices=["none", "nano", "mini", "small"])
 
     ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--block", type=int, default=128)
+    ap.add_argument("--val-fraction", type=float, default=0.1,
+                    help="tail fraction of turns held out for validation; 0 "
+                         "disables it (no generalization signal, no early stop)")
+    ap.add_argument("--val-every", type=int, default=250,
+                    help="run validation every N optimizer steps")
+    ap.add_argument("--patience", type=int, default=10,
+                    help="stop after this many validations without improvement")
+    ap.add_argument("--block", type=int, default=None,
+                    help="training sequence length; defaults to the size "
+                         "preset's context (nano 128, mini 256, small 512)")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--dropout", type=float, default=0.1,
@@ -1033,7 +1242,8 @@ def load_corpus(args):
     if not data.exists():
         print(f"training data not found at {data}")
         raise SystemExit(1)
-    return build_corpus(data, Path(args.description), user=args.user)
+    return build_corpus(data, Path(args.description), user=args.user,
+                        val_fraction=args.val_fraction)
 
 
 def setup_ddp():
@@ -1142,7 +1352,10 @@ def resolve_model(args, state, tok, rank):
         return cfg, build_model(cfg)
     cfg = state["cfg"]
     args.objective = cfg["objective"]
-    reconcile_epochs(args, cfg.get("epochs"), rank)
+    # `epochs` is stored at the top level of the checkpoint by Trainer.save, not
+    # inside cfg, so cfg.get("epochs") was always None and every bare re-run
+    # silently fell back to the --epochs default.
+    reconcile_epochs(args, state.get("epochs"), rank)
     model = build_model(cfg)
     try:
         # allow lora/quant flags to resume from identical architecture
@@ -1201,23 +1414,41 @@ def report_setup(args, cfg, rank, n_train, n_total):
     print(f"trainable params: {n_train:,} / {n_total:,}")
 
 
-def run_training(args, cfg, model, ids, device, tok, state, rank, world, local):
+def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
+                 val_ids=None):
     # Optimizer loop + final checkpoint/summary, then teardown the process group.
     trainer = Trainer(args, cfg, model, ids, device, tok, args.ckpt,
                       start_step=state["step"] if state else 0,
-                      rank=rank, world=world)
+                      rank=rank, world=world, val_ids=val_ids, state=state)
     if rank == 0:
         print(f"training for {args.epochs} epochs (~{trainer.total_steps:,} steps)")
+        if trainer.val_windows is not None:
+            print(f"validation: {len(trainer.val_windows)} held-out windows, "
+                  f"every {trainer.val_every} steps, patience {trainer.patience}")
+        else:
+            print("validation: DISABLED (--val-fraction 0) - training loss is "
+                  "the only signal and early stopping is off")
     t0 = time.perf_counter()
     final_loss, steps_done = trainer.fit()
     elapsed = time.perf_counter() - t0
 
     if rank == 0:
-        trainer.save(final_loss, steps_done)
-        print(f"saved checkpoint: {args.ckpt} (loss {final_loss:.4f}, {steps_done:,} steps)")
+        if trainer.val_windows is None:
+            trainer.save(final_loss, steps_done)
+            print(f"saved checkpoint: {args.ckpt} (loss {final_loss:.4f}, "
+                  f"{steps_done:,} steps)")
+        elif trainer.best_step:
+            # _maybe_validate already wrote the retained checkpoint; overwriting
+            # it here would replace the best-val weights with the last weights
+            # and pair that loss with a step it was never measured at.
+            print(f"retained checkpoint: {args.ckpt} (best val "
+                  f"{trainer.best_val:.4f} at step {trainer.best_step:,}; "
+                  f"stopped at {steps_done:,})")
+            final_loss = trainer.best_val
         print_summary(args, cfg, tok, len(ids), trainable_count(model),
                       total_count(model), final_loss, steps_done,
-                      state["step"] if state else 0, device, elapsed)
+                      state["step"] if state else 0, device, elapsed,
+                      trainer=trainer)
     if args.ddp:
         import torch.distributed as dist
         dist.destroy_process_group()
@@ -1237,7 +1468,16 @@ def main(argv=None):
 
     device, rank, world, local = init_process(args)
     state = load_checkpoint(args, rank, world)
+    # Must run before resolve_model: build_cfg is skipped when resuming, so
+    # args.block would stay None and BatchSampler would fail.
+    resolve_block(args, state, rank)
     corpus = load_corpus(args)
+    # With a validation split, fit the tokenizer on train text only so no
+    # held-out tokens can leak into the vocabulary.
+    if isinstance(corpus, tuple):
+        corpus, val_corpus = corpus
+    else:
+        val_corpus = ""
     tok = load_tokenizer(args, corpus, state, rank)
     cfg, model = resolve_model(args, state, tok, rank)
 
@@ -1253,18 +1493,30 @@ def main(argv=None):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local])
 
     ids = tok.encode(corpus)
+    val_ids = tok.encode(val_corpus) if val_corpus else None
     if rank == 0:
         print(f"corpus: {len(ids):,} tokens, vocab {tok.vocab_size:,}")
+        if val_ids:
+            print(f"held out: {len(val_ids):,} tokens for validation "
+                  f"({100 * len(val_ids) / (len(ids) + len(val_ids)):.1f}%)")
 
-    run_training(args, cfg, model, ids, device, tok, state, rank, world, local)
+    run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
+                 val_ids=val_ids)
 
 
 def print_summary(args, cfg, tok, n_tokens, n_train, n_total, final_loss,
-                  steps_done, start_step, device, elapsed):
+                  steps_done, start_step, device, elapsed, trainer=None):
     print("----------------------------------------")
     print("training summary")
     print("----------------------------------------")
-    print(f"loss:            {final_loss:.4f}")
+    if trainer is not None and trainer.val_windows is not None:
+        print(f"val loss (best):  {trainer.best_val:.4f} at step "
+              f"{trainer.best_step:,}")
+        print(f"early stop:      {'yes' if trainer.stopped_early else 'no'}"
+              f" (patience {trainer.patience}, every {trainer.val_every} steps)")
+    else:
+        print("val loss:        DISABLED")
+    print(f"train loss:      {final_loss:.4f}")
     print(f"steps:           {steps_done:,} total ({start_step:,} carried over)")
     print(f"objective:       {cfg['objective']}")
     print(f"epochs:          {args.epochs}")
