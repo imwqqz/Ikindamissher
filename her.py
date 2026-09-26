@@ -1272,6 +1272,9 @@ SIZE_PRESETS = {
     "small": dict(d_model=384, n_layers=8, n_heads=8, d_ff=1536, max_len=512),
 }
 
+# Dimensions a --size preset can supply, and a --d-model style flag can override.
+ARCH_KEYS = ("d_model", "n_layers", "n_heads", "d_ff")
+
 
 def resolve_block(args, state, rank):
     # --block sets the training sequence length: it drives the tokenizer windows,
@@ -1322,8 +1325,12 @@ def build_cfg(args, tokenizer):
     }
     if size:
         for k, v in size.items():
-            # max_len is owned by --block; see resolve_block.
-            if k != "max_len":
+            # max_len is owned by --block; see resolve_block. An explicitly
+            # given or config-supplied dimension also wins over the preset:
+            # otherwise --size small silently discards --d-model 512, and a
+            # config that lists a dimension reads as if it were in effect when
+            # the value actually used is the preset's.
+            if k != "max_len" and k not in getattr(args, "arch_explicit", ()):
                 cfg[k] = v
     return cfg
 
@@ -1437,16 +1444,20 @@ def _bootstrap_config(ap, argv, default_path):
 
 def resolve_config_args(ap, argv=None, default_path=None):
     """Config supplies defaults, explicit flags win. Exits on --dump-config."""
+    # Snapshot before apply_config replaces the defaults; see the note in
+    # parse_args. Reading action.default afterwards would dump the local config
+    # into the example, private speaker names included.
+    builtin_defaults = {a.dest: a.default for a in ap._actions}
     apply_config(ap, _bootstrap_config(ap, argv, default_path))
     args = ap.parse_args(argv)
     if args.dump_config:
-        written = dump_config(ap, args.dump_config)
+        written = dump_config(ap, args.dump_config, builtin_defaults)
         print(f"wrote {len(written)} options to {args.dump_config}")
         raise SystemExit(0)
     return args
 
 
-def dump_config(ap, path):
+def dump_config(ap, path, defaults=None):
     # Relative paths, so a committed example works on any machine instead of
     # pinning the absolute layout of whoever generated it.
     import json
@@ -1455,7 +1466,8 @@ def dump_config(ap, path):
     for action in ap._actions:
         if action.dest in _META_KEYS:
             continue
-        value = action.default
+        value = (defaults[action.dest] if defaults and action.dest in defaults
+                 else action.default)
         if isinstance(value, str):
             try:
                 candidate = Path(value).resolve()
@@ -1494,7 +1506,10 @@ def parse_args(argv=None, config=None):
     ap.add_argument("--dump-config", default=None, metavar="FILE",
                     help="write every option and its default to FILE, then exit")
     ap.add_argument("--size", default="nano",
-                    choices=["none", "nano", "mini", "small"])
+                    choices=["none", "nano", "mini", "small"],
+                    help="architecture preset; an explicit --d-model/"
+                         "--n-layers/--n-heads/--d-ff, from the command line "
+                         "or a config file, overrides the preset's value")
 
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--val-fraction", type=float, default=0.1,
@@ -1565,13 +1580,27 @@ def parse_args(argv=None, config=None):
 
     if config is None:
         config = _bootstrap_config(ap, argv, DEFAULT_CONFIG)
+    # Snapshot the built-in defaults before apply_config overwrites them with the
+    # config file's values. --dump-config reports the defaults, and reading
+    # action.default after the overwrite would emit whatever the local config
+    # happens to hold -- including the speaker names, which are private and are
+    # exactly what the committed example must not contain.
+    builtin_defaults = {a.dest: a.default for a in ap._actions}
     apply_config(ap, config)
     args = ap.parse_args(argv)
     # remember which keys came from a config file, so a later decision can tell
     # "the user asked for this" from "this is only the built-in default"
     args._from_config = set(config or ())
+    # Same question for the architecture numbers: --size is a preset, but if the
+    # user also named a dimension explicitly that number is the more specific
+    # request and has to win. Recorded here because this is the only place that
+    # can still see both the command line and the config file.
+    tokens = set(sys.argv[1:] if argv is None else argv)
+    args.arch_explicit = {k for k in ARCH_KEYS
+                          if f"--{k.replace('_', '-')}" in tokens
+                          or k in args._from_config}
     if args.dump_config:
-        written = dump_config(ap, args.dump_config)
+        written = dump_config(ap, args.dump_config, builtin_defaults)
         print(f"wrote {len(written)} options to {args.dump_config}")
         raise SystemExit(0)
     return args
