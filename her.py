@@ -889,8 +889,13 @@ class Trainer:
         self.spike_patience = max(1, args.spike_patience)
         self.spike_count = 0
         self.diverged = False
-        # Running best of the finite losses, the reference the spike test uses.
-        self.best_finite = float("inf")
+        # Reference for the spike test: the best *windowed mean* seen so far.
+        # This must not be the best single loss. Individual minibatches are noisy
+        # and the distribution has a long left tail, so one lucky batch sets a
+        # reference far below anything the run can reproduce; every later batch
+        # then looks like a spike and the guard kills a healthy run. A mean over
+        # a fixed window is stable enough to compare against itself.
+        self.best_window = float("inf")
         self.val_windows = (ValWindows(val_ids, args.block, device)
                             if val_ids and len(val_ids) > args.block + 1 else None)
         self.since_best = 0
@@ -936,7 +941,14 @@ class Trainer:
                 # Param groups changed shape; a fresh optimizer is the safe
                 # fallback, so keep going rather than refusing to resume.
                 pass
-        self.recent = deque(maxlen=max(args.log_every, 1))
+        # True per-step window, used for both the displayed average and the
+        # spike reference. It must not be sized from --log-every: that only
+        # controls how often a line is printed, and with log_every=200 this
+        # deque received one sample per 200 steps, so "window" averaged a few
+        # stale log points instead of recent steps and lagged reality by
+        # hundreds of steps. Bounded so it cannot grow with the run.
+        self.window_n = max(16, min(args.log_every, 256))
+        self.recent = deque(maxlen=self.window_n)
         self.run_start = time.perf_counter()
         self.window_start = self.run_start
         self.last_logged_step = start_step
@@ -1074,7 +1086,7 @@ class Trainer:
                 # propagate for hours and --keep-last would save an all-NaN
                 # checkpoint over the good one. Non-finite aborts immediately.
                 if math.isfinite(self.last_train_loss):
-                    self.best_finite = min(self.best_finite, self.last_train_loss)
+                    self.recent.append(self.last_train_loss)
                 if self._diverged(self.last_train_loss, steps, epoch):
                     self.diverged = True
                     print(f"\nDIVERGED at step {steps:,} epoch {epoch}: train "
@@ -1118,14 +1130,21 @@ class Trainer:
         # corrupt window, a lone huge target) does not end a long run.
         if not math.isfinite(loss):
             return True
-        if not self.spike_factor or loss <= self.best_finite * self.spike_factor:
+        # Needs a full window before it has a reference to compare against;
+        # until then there is nothing to call a spike.
+        if len(self.recent) < self.window_n:
+            self.spike_count = 0
+            return False
+        cur = sum(self.recent) / len(self.recent)
+        if not self.spike_factor or cur <= self.best_window * self.spike_factor:
+            self.best_window = min(self.best_window, cur)
             self.spike_count = 0
             return False
         self.spike_count += 1
         if self.spike_count == 1:
             print(f"  step {steps:,} epoch {epoch} | loss spike "
-                  f"{loss:.4f} > {self.spike_factor:g}x best "
-                  f"{self.best_finite:.4f}", flush=True)
+                  f"windowed mean {cur:.4f} > {self.spike_factor:g}x best "
+                  f"{self.best_window:.4f}", flush=True)
         return self.spike_count >= self.spike_patience
 
     def _unwrap(self):
@@ -1134,7 +1153,6 @@ class Trainer:
     def _log_step(self, steps, epoch, step_loss):
         if self.rank != 0:
             return
-        self.recent.append(step_loss)
         now = time.perf_counter()
         dt = now - self.window_start
         self.window_start = now
