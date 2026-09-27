@@ -26,11 +26,7 @@ BOT_LABEL = "her"
 
 
 def clip_msg(msg, max_tokens, tokenizer):
-    # Byte-level BPE: slicing tokens mid-sequence can split a multi-byte
-    # character, and decode() substitutes U+FFFD for the dangling bytes, so a
-    # clipped message ended in replacement garbage. Re-encode a character
-    # boundary instead of trusting the token count, and mark the cut so a
-    # truncated turn is still readable as truncated.
+    # Re-encode at a character boundary: slicing mid-sequence yields U+FFFD.
     msg = msg.strip()
     toks = tokenizer.encode(msg)
     if len(toks) <= max_tokens:
@@ -108,10 +104,7 @@ def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
         demos, n_shots = few_shot_pairs(corpus_text, args.shots,
                                         args.demo_len, tokenizer, prompt)
 
-    # Headroom has to cover the reply the model is about to write. It used to be
-    # a hardcoded 40, which happened to match the default --max-reply and
-    # overflowed RoPE for any larger value, since rotary positions only exist
-    # for max_len.
+    # Headroom must cover the reply, or RoPE overflows past max_len.
     max_ctx = state["cfg"]["max_len"] - args.max_reply - 1
     if max_ctx < 1:
         raise SystemExit(
@@ -122,12 +115,8 @@ def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
     full = "\n".join(p for p in (prefix, hist, f"{user_name}: {prompt}") if p)
     ids = tokenizer.encode(full + f"\n{her_name}: ")
     if len(ids) > max_ctx:
-        # Keep the tail (the actual question) but do not start mid-subword:
-        # cutting at an arbitrary token left the model reading a broken word
-        # fragment as its first input. Snap forward to the next line break, but
-        # only when that still leaves most of the window -- taking the first
-        # break unconditionally collapsed the prompt to a handful of tokens
-        # whenever the retained history was repetitive.
+        # Keep the tail but snap forward to a line break, so the prompt never
+        # starts mid-subword.
         ids = ids[-max_ctx:]
         nl = set(tokenizer.encode("\n"))
         floor = max_ctx // 2
@@ -236,9 +225,7 @@ def main(argv=None):
     print(f"device: {device}")
 
     state, model, tokenizer = load_assets(args, device)
-    # The checkpoint is the only artifact that knows how its turns were
-    # labelled, so prefer those names and let the flags override. A mismatch
-    # silently detaches every persona turn, so this is never guessed.
+    # The checkpoint is the only record of how turns were labelled; never guess.
     cfg = state["cfg"]
     configure_speakers(args.user_speaker or cfg.get("user_speaker"),
                        args.her_speaker or cfg.get("her_speaker"))

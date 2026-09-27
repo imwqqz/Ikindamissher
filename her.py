@@ -18,12 +18,7 @@ DEFAULT_CKPT = Path(__file__).parent / "data" / "her_model.pt"
 DEFAULT_DESC = Path(__file__).parent / "data" / "input" / "description.txt"
 DEFAULT_BPE = Path(__file__).parent / "data" / "input" / "bpe.json"
 
-# Canonical turn labels, resolved at run time from the config or --*-speaker
-# flags. Deliberately a dict rather than module constants: as default
-# argument values they were frozen at import time, so a later
-# configure_speakers() call left every default still reading the import-time
-# value and silently ignoring the configured name. The persona name is also
-# private, so a literal here would land in git history.
+# Speaker labels resolved at run time; a literal would land in git history.
 _SPEAKERS = {"user": "", "her": ""}
 
 
@@ -33,8 +28,7 @@ def speaker_names():
 
 
 def configure_speakers(user: Optional[str] = None, her: Optional[str] = None):
-    # Stored lowercased because parse_wa lowercases every label it emits, so
-    # prompts, regexes and persona lines all have to agree with the corpus.
+    # Stored lowercased to match what parse_wa emits.
     if user:
         _SPEAKERS["user"] = user.strip().lower()
     if her:
@@ -106,21 +100,16 @@ class BytePairEncoder:
 
     @staticmethod
     def _best_pair(ids: torch.Tensor):
-        # Vectorized argmax over adjacent pairs:
-        #   stats[(a,b)] = sum_t 1[a_t==a and a_{t+1}==b],
-        # computed by packing each pair into a scalar key `a*BASE + b`,
-        # sorting, and run-length encoding (O(n log n), no per-merge Python loop).
-        # Ties on count are broken by first appearance, matching the original
-        # pure-Python Counter max() insertion-order semantics.
+        # stats[(a,b)] = sum_t 1[a_t==a and a_(t+1)==b], via key = a*BASE+b, sort, run-length.
+        # O(n log n); ties keep first-occurrence order.
         n = ids.numel() - 1
         if n <= 0:
             return (0, 0), 0
         BASE = 4096  # largest possible id is 256 + n_merges < 4096 (bytes 0-255, boundary 256, merges 257+)
         # TODO: REVIEW: pair key `a*BASE + b` collides when a/256+n_merges >= BASE (i.e. --vocab-size > 4096)
         pairs = ids[:-1] * BASE + ids[1:]
-        # stable sort keeps first-occurrence order for equal pairs, so merges
-        # are reproducible across runs (BPE, Neural Machine Translation of
-        # Rare Words with Subword Units, section 3 https://arxiv.org/abs/1508.07909)
+        # Stable sort keeps merges reproducible across runs
+        # (BPE, section 3 https://arxiv.org/abs/1508.07909)
         pairs_sorted, order = torch.sort(pairs, stable=True)
         keys, counts = torch.unique_consecutive(pairs_sorted, return_counts=True)
         maxc = int(counts.max())
@@ -148,9 +137,7 @@ class BytePairEncoder:
 
     @staticmethod
     def _merge_vec(ids: torch.Tensor, a, b, k) -> torch.Tensor:
-        # Replace every occurrence of the pair (a,b) with token k in one pass.
-        # Greedy left-to-right (no overlapping merges): for runs of adjacent
-        # candidate starts, take every other one (`starts[::2]` within a run).
+        # Greedy left-to-right, no overlapping merges: every other candidate start in a run.
         n = ids.numel()
         is_start = (ids[:-1] == a) & (ids[1:] == b)
         if not bool(is_start.any()):
@@ -166,8 +153,7 @@ class BytePairEncoder:
             accepted = starts[within % 2 == 0]
         else:
             accepted = starts
-        # keep the accepted start (now holding token k); drop only the consumed
-        # successor (accepted+1) since the merged pair shrinks the output
+        # Keep the accepted start, drop only the consumed successor.
         removed = torch.zeros(n, dtype=torch.bool)
         removed[accepted + 1] = True
         vals = ids.clone()
@@ -199,13 +185,8 @@ class BytePairEncoder:
     def encode_masked(self, text: str, char_mask) -> Tuple[List[int], List[bool]]:
         """ids plus a per-token copy of char_mask.
 
-        A source character is not one token: an accented character is two byte
-        tokens, and one regex piece can span several characters that merge into
-        a single id. So the mask cannot be built by zipping characters against
-        tokens. Each piece's own character span is known, and every id that
-        piece produced is covered by that span, so the piece's label is
-        broadcast to all of its tokens. No second tokenizer pass, and the
-        result is exactly len(ids) long.
+        A character is not a token, so the piece's label is broadcast to every
+        id that piece produced: result is exactly len(ids).
         """
         ids_all: List[int] = []
         mask_all: List[bool] = []
@@ -235,8 +216,7 @@ class BytePairEncoder:
 
     def stop_ids(self, extra=()):
         nl = self.encode("\n")
-        # TODO: REVIEW: halting on the first newline truncates replies at the
-        # first line break (newline token boundary ids only, so emoji remain).
+        # TODO: REVIEW: stopping at the first newline truncates multi-line replies.
         stops = {nl[0]} if nl else set()
         stops.update(self.sentinel_id(i) for i in range(self.n_sentinels))
         stops.update(extra)
@@ -306,19 +286,11 @@ def detect_user(text: str, label: str = None):
 
 
 def persona_lines(text: str, label: str = None, alias: str = None):
-    # Turn the persona description into `name: line` statements, treating the persona as one more text-to-text turn (T5, section 2.1 https://arxiv.org/abs/2005.14165).
-    # label must be the canonical speaker: hardcoding "her" here would give the
-    # persona block a different label from its chat turns, so the model would
-    # learn two names for the same person. alias is the name the file may
-    # already use, rewritten to the canonical one.
+    # Persona description as `name: line` turns (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     user_name, her_name = speaker_names()
     label = her_name if label is None else label
-    # parse_wa lowercases every label it emits, so the persona block has to be
-    # lowercased too: otherwise the same person appears as both "alice" and
-    # "Alice" and the tokenizer assigns them different leading tokens
+    # Lowercased to match parse_wa, else one person gets two leading tokens.
     canonical = label.lower()
-    # each known name maps to its own canonical spelling, so a line about the
-    # user is not relabelled as the persona
     rename = {canonical: canonical, user_name: user_name}
     if alias and alias.lower() not in rename:
         rename[alias.lower()] = canonical
@@ -345,15 +317,9 @@ def persona_lines(text: str, label: str = None, alias: str = None):
 def target_char_mask(corpus: str, her_name: str) -> List[bool]:
     """True for the characters of her turns, False everywhere else.
 
-    The corpus is a single stream of both speakers, so an unmasked loss spends
-    close to half its terms learning to predict the other person's messages.
-    The model is never asked to produce those: generation always continues
-    after her label, so those tokens get learned and then suppressed at
-    sampling time. Masking them concentrates every gradient step on the text
-    that actually has to be reproduced.
-
-    This is the completion-only loss that TRL's SFTTrainer applies to
-    assistant turns, and that chat templates spell as train_on_prompt=false.
+    Completion-only loss: the corpus interleaves both speakers, so an unmasked
+    loss spends most terms on text generation never asks for.
+    TRL SFTTrainer, train_on_prompt=false.
     """
     mask = [False] * len(corpus)
     prefix = f"{her_name}: "
@@ -367,9 +333,8 @@ def target_char_mask(corpus: str, her_name: str) -> List[bool]:
 
 
 def _split_turns(conv: str, val_fraction: float):
-    # Contiguous tail split on a turn boundary. A random window split would leak:
-    # sliding windows overlap by block-1 tokens, so a random split puts almost
-    # every validation token into training too.
+    # Contiguous tail split on a turn boundary; windows overlap by block-1, so a
+    # random split leaks nearly every validation token into training.
     user_name, _ = speaker_names()
     lines = conv.splitlines()
     if len(lines) < 8 or val_fraction <= 0:
@@ -412,8 +377,8 @@ def build_corpus(data_path: Path, desc_path: Path, label: str = None,
     corpus = corpus.replace(f"\n{label.lower()}: ", f"\n{her_name}: ")
 
     train, val = _split_turns(corpus, val_fraction)
-    # the persona block goes to train only: it is appended at the end of the
-    # corpus, so a naive tail split would hold the whole persona out of training
+    # Persona goes to train only: it is appended at the corpus end, so a tail
+    # split would hold all of it out.
     desc = ""
     if desc_path.exists():
         desc = "\n".join(persona_lines(desc_path.read_text(encoding="utf-8"),
@@ -469,8 +434,7 @@ def nf4_quantize(weight: torch.Tensor, block: int = 64, scale_block: int = 256):
     norm = (blocks / scale.unsqueeze(1)).clamp(-1.0, 1.0)
     idx = (norm.unsqueeze(-1) - NF4_LEVELS).abs().argmin(-1)  # (nb, block) in 0..15
     idx = idx.view(-1)
-    # TODO: REVIEW: pair packing assumes an even element count; safe while n is
-    # padded to a multiple of block (64), breaks for odd block sizes.
+    # TODO: REVIEW: pair packing assumes an even element count.
     parity = (idx[0::2] << 4) | idx[1::2]
     qweight = parity.to(torch.uint8)
 
@@ -680,21 +644,16 @@ class GPT(nn.Module):
 
     def generate(self, idx, max_new=64, temperature=0.8, top_k=0, top_p=0.0,
                  repeat_penalty=1.0, stop_ids=()):
-        # KV-cache autoregressive sampling: prefill the cache with the whole
-        # prompt first, then sample one token at a time; without the prefill
-        # the first forward would only ever see the prompt's last token and
-        # the model could not condition on the question (Attention Is All You Need, section 5 https://arxiv.org/abs/1706.03762)
+        # KV-cache sampling: prefill the prompt, then sample one token at a time
+        # (Attention Is All You Need, section 5 https://arxiv.org/abs/1706.03762)
         self.reset_cache()
         device = idx.device
-        # The prefill already produced the logits for the position after the
-        # prompt, so read them here. Feeding idx[:, -1:] again would push the
-        # last prompt token through the model twice and shift every subsequent
-        # rotary position by one.
+        # Read logits from the prefill position; re-feeding idx[:,-1:] pushes the last
+        # prompt token through twice and shifts every later position by one.
         logits = self(idx, use_cache=True)[0, -1] / max(temperature, 1e-8)
         gen = []
-        # Rotary positions are only allocated for max_len, so sampling past it
-        # fed out-of-range positions into RoPE and crashed on a shape mismatch.
-        # A prompt sized at max_len left the caller no room to answer at all.
+        # RoPE allocates positions for max_len only, so a prompt at max_len leaves
+        # no room to answer.
         budget = max(0, self.max_len - idx.shape[1])
         for _ in range(min(max_new, budget)):
             if repeat_penalty != 1.0 and gen:
@@ -710,8 +669,7 @@ class GPT(nn.Module):
                 break
             gen.append(next_token)
             idx = torch.cat([idx, torch.tensor([[next_token]], device=device)], dim=1)
-            # advance the cache with the token just sampled; the prefill covered
-            # the prompt, so from here on only the new token needs a forward
+            # Advance the cache with the token just sampled.
             logits = self(idx[:, -1:], use_cache=True)[0, -1] / max(temperature, 1e-8)
         self.reset_cache()
         return gen
@@ -744,15 +702,11 @@ def sample_probs(logits, top_k, top_p):
 def lm_loss(logits, targets, label_smoothing):
     flat = logits[:, :-1].reshape(-1, logits.size(-1))
     tgt = targets[:, 1:].reshape(-1)
-    # -100 marks tokens excluded from the loss (see target_char_mask). Drop
-    # them before reducing, because averaging over a mixture of scored and
-    # unscored positions would divide by the wrong denominator and silently
-    # rescale every gradient by the scored fraction.
+    # -100 = excluded from the loss. Dropped before reducing, else the gradient
+    # is rescaled by the scored fraction.
     keep = tgt.ne(-100)
     if not bool(keep.any()):
-        # A window can be entirely one speaker's, e.g. a long monologue. There
-        # is nothing to learn from it, and cross_entropy over no valid target
-        # is NaN, which the divergence guard would read as a crash.
+        # An all-one-speaker window has no valid target; cross_entropy returns NaN.
         return logits.sum() * 0.0
     if not bool(keep.all()):
         flat = flat[keep]
@@ -844,9 +798,8 @@ class BatchSampler:
         self.rank = rank
         self.world = world
         self.ids = torch.tensor(ids, dtype=torch.long, device=device)
-        # Optional per-token labels, same length as ids, with -100 where the
-        # token is excluded from the loss. Sliced with the same offsets as ids
-        # so a window's labels always line up with the tokens they label.
+        # Optional per-token labels, -100 where excluded, sliced at the same offsets
+        # as ids.
         self.labels = (None if labels is None
                        else torch.tensor(labels, dtype=torch.long, device=device))
         self.num_windows = max(1, len(self.ids) - block)
@@ -863,9 +816,8 @@ class BatchSampler:
             if picks.numel() == 0:
                 continue
             idx = picks.unsqueeze(1) + self.offsets.unsqueeze(0)
-            # unshifted window: lm_loss applies the one-ahead shift itself,
-            # so yielding ids[idx + 1] here would double-shift and train the
-            # model to predict two tokens ahead (attention is causal) (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
+            # Unshifted window: lm_loss applies the one-ahead shift itself
+            # (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
             yield self.ids[idx], (self.ids[idx] if self.labels is None
                                   else self.labels[idx])
 
@@ -884,12 +836,8 @@ def _finite_or_none(value):
 
 
 class ValWindows:
-    # Deterministic, non-overlapping windows: stride == block, no shuffling, so
-    # every validation token is predicted exactly once. BatchSampler instead
-    # draws a fresh randperm over all sliding windows each epoch, which is
-    # right for training but makes a validation number meaningless.
-    # Yields exactly `block` tokens, same as BatchSampler: the model allocates
-    # rotary positions for max_len == block, so block+1 overflows RoPE.
+    # stride == block, no shuffle, so every validation token is predicted once.
+    # Yields exactly block tokens: block+1 overflows RoPE at max_len == block.
     def __init__(self, ids, block, device, batch_size=8, labels=None):
         # detach().clone() rather than torch.tensor(): ids is already a tensor
         # and torch.tensor() re-wraps it through __array__, which warns
@@ -913,10 +861,7 @@ class ValWindows:
             yield chunk
 
     def __iter__(self):
-        # Group windows into batches. Iterating them one at a time interleaved
-        # (1, block) forward passes with (batch, block) training steps, which
-        # forced the caching allocator to carve a new segment every validation
-        # and cost one device sync per window.
+        # Grouped into batches: one (batch, block) pass beats block interleaved ones.
         pending = []
         for chunk in self._windows():
             pending.append(chunk)
@@ -930,8 +875,7 @@ class ValWindows:
         ids = torch.stack(chunks)
         if self.labels is None:
             return ids, ids
-        # Windows are contiguous slices at stride == block, so the n-th window's
-        # labels start at the same offset as its tokens.
+        # Contiguous slices at stride == block: n-th labels at the n-th offset.
         labels = torch.stack([self.labels[i * self.block:(i + 1) * self.block]
                               for i in range(len(chunks))])
         return ids, labels
@@ -949,9 +893,8 @@ class Trainer:
         self.rank = rank
         self.world = world
         self.epochs = args.epochs
-        # The goal stays fixed across resumes. args.epochs is only what is left
-        # to run this time, so writing it back as the target would shrink the
-        # goal on every resume (20 -> 18 -> 16 ...).
+        # args.epochs means 'to run now'; writing it back as the target shrinks the
+        # goal on every resume.
         _stored_target = (state or {}).get("epochs_target")
         self.epochs_target = int(_stored_target) if _stored_target else int(args.epochs)
         self.label_smoothing = args.label_smoothing
@@ -968,12 +911,8 @@ class Trainer:
         self.spike_patience = max(1, args.spike_patience)
         self.spike_count = 0
         self.diverged = False
-        # Reference for the spike test: the best *windowed mean* seen so far.
-        # This must not be the best single loss. Individual minibatches are noisy
-        # and the distribution has a long left tail, so one lucky batch sets a
-        # reference far below anything the run can reproduce; every later batch
-        # then looks like a spike and the guard kills a healthy run. A mean over
-        # a fixed window is stable enough to compare against itself.
+        # Spike reference is the best windowed mean, never the best single minibatch:
+        # the loss distribution has a long left tail that one lucky batch sets.
         self.best_window = float("inf")
         self.val_windows = (ValWindows(val_ids, args.block, device,
                                        labels=val_label_ids)
@@ -1003,21 +942,15 @@ class Trainer:
         self.base_lr = (args.lr * math.sqrt(args.warmup_steps)
                         if args.warmup_steps > 0 else args.lr)
 
-        # Restore the best-so-far across resumes. Resetting to inf each run meant
-        # "best" only ever meant "best within this process". Checkpoints written
-        # by a validation run store None for the unused train-loss best, so every
-        # field has to tolerate None.
+        # Restored across resumes so 'best' is not scoped to this process.
         state = state or {}
         self.best = _opt_float(state.get("best"), float("inf"))
         self.best_step = int(state.get("best_step") or 0)
         self.best_val = _opt_float(state.get("best_val"), float("inf"))
-        # Tracked so the summary can show best vs last. For a memorization run
-        # the two drifting apart is the expected signal, not a fault.
+        # Kept for the summary; best and last drifting apart is the expected signal.
         self.last_val = float("nan")
-        # Adam's first/second moments are not derivable from the weights, so
-        # dropping them made every resume restart the moment estimates from
-        # zero and spike the loss. The LR schedule needs no state: it is a pure
-        # function of the step counter.
+        # Adam moments are not derivable from the weights; the LR schedule is a pure
+        # function of the step counter, so it needs no state.
         if state.get("optim"):
             try:
                 self.optimizer.load_state_dict(state["optim"])
@@ -1025,12 +958,8 @@ class Trainer:
                 # Param groups changed shape; a fresh optimizer is the safe
                 # fallback, so keep going rather than refusing to resume.
                 pass
-        # True per-step window, used for both the displayed average and the
-        # spike reference. It must not be sized from --log-every: that only
-        # controls how often a line is printed, and with log_every=200 this
-        # deque received one sample per 200 steps, so "window" averaged a few
-        # stale log points instead of recent steps and lagged reality by
-        # hundreds of steps. Bounded so it cannot grow with the run.
+        # True per-step window, sized independently of --log-every, which only sets
+        # how often a line prints. Bounded so it cannot grow with the run.
         self.window_n = max(16, min(args.log_every, 256))
         self.recent = deque(maxlen=self.window_n)
         self.run_start = time.perf_counter()
@@ -1038,19 +967,16 @@ class Trainer:
         self.last_logged_step = start_step
 
     def _schedule_lr(self, step):
-        # inverse-square-root / constant / cosine LR schedules after a linear
-        # warmup (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762;
-        # T5, section 3.4 https://arxiv.org/abs/2005.14165;
-        # SGDR, section 2.1 https://arxiv.org/abs/1608.03983)
+        # LR schedules after linear warmup (Attention, 5.3 https://arxiv.org/abs/1706.03762;
+        # T5, 3.4 https://arxiv.org/abs/2005.14165; SGDR, 2.1 https://arxiv.org/abs/1608.03983)
         if self.warmup_steps <= 0:
             return
         # linear warmup ramp applies to every schedule (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
         if step < self.warmup_steps:
             lr = self.lr * step / self.warmup_steps
         elif self.schedule == "cosine":
-            # lr(t) = lr_min + 0.5*(lr_max - lr_min)*(1 + cos(pi*t/T)),
-            # annealed to ~0 over the remaining steps (SGDR, section 2.1 https://arxiv.org/abs/1608.03983):
-            # <code> t = step - warmup, T = total_steps - warmup </code>
+            # lr(t) = lr_min + 0.5*(lr_max - lr_min)*(1 + cos(pi*t/T)), t = step - warmup,
+            # T = total_steps - warmup (SGDR, 2.1 https://arxiv.org/abs/1608.03983)
             t = step - self.warmup_steps
             T = max(self.total_steps - self.warmup_steps, 1)
             lr = self.lr * 0.5 * (1.0 + math.cos(math.pi * t / T))
@@ -1103,11 +1029,8 @@ class Trainer:
         return total / count if count else None
 
     def _maybe_validate(self, steps, epoch):
-        # Only rank 0 holds the validation data and writes the checkpoint, so
-        # only rank 0 can decide to stop. That decision has to reach every
-        # rank: if rank 0 returned from fit() alone, the others would keep
-        # entering DDP all-reduce collectives with a peer that had left, and
-        # the job would hang instead of exiting.
+        # Only rank 0 stops, but the flag must reach every rank or the others keep
+        # entering all-reduce with a peer that left, and hang.
         stop = self._validate_on_rank0(steps, epoch)
         if self.world > 1:
             import torch.distributed as dist
@@ -1119,9 +1042,7 @@ class Trainer:
         return stop
 
     def _validate_on_rank0(self, steps, epoch):
-        # Gate the retained checkpoint on validation loss, not training loss:
-        # with dropout off, training loss can only fall, so it never signals
-        # that the model has stopped generalizing.
+        # Gate retention on val loss: with dropout off, train loss can only fall.
         if self.val_windows is None or self.rank != 0:
             return False
         val = self.evaluate()
@@ -1165,11 +1086,8 @@ class Trainer:
                     inputs, targets = collate_span(rows, self.tokenizer)
                 loss = self._train_step(inputs, targets)
                 self.last_train_loss = loss.item() * self.grad_accum
-                # Runaway guard. clip_grad_norm_ bounds gradient size but cannot
-                # un-NaN the weights, and a memorization run with the val-plateau
-                # stop disabled has no other brake: a NaN would otherwise
-                # propagate for hours and --keep-last would save an all-NaN
-                # checkpoint over the good one. Non-finite aborts immediately.
+                # Runaway guard: clip_grad_norm_ bounds gradient size but cannot un-NaN the
+                # weights, and --keep-last would then save an all-NaN checkpoint.
                 if math.isfinite(self.last_train_loss):
                     self.recent.append(self.last_train_loss)
                 if self._diverged(self.last_train_loss, steps, epoch):
@@ -1191,14 +1109,10 @@ class Trainer:
                     stepped = True
                 if self.log_every and steps % self.log_every == 0:
                     self._log_step(steps, epoch, loss.item())
-                # --val-every counts optimizer steps, but `steps` (and the
-                # checkpoint's step/best_step) counts micro-batches. Gate on the
-                # former and report the latter so the units never mix.
+                # --val-every counts optimizer steps; steps counts micro-batches.
                 if stepped and opt_steps % self.val_every == 0:
                     if self._maybe_validate(steps, epoch):
-                        # last_train_loss, not self.best: self.best is only
-                        # updated at an epoch boundary, so a run that stops
-                        # mid-epoch returned inf from here.
+                        # last_train_loss, not self.best: best is only set at an epoch boundary.
                         return self.last_train_loss, steps
             if accum % self.grad_accum != 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -1210,13 +1124,11 @@ class Trainer:
         return self.last_train_loss, steps
 
     def _diverged(self, loss, steps, epoch):
-        # Hard stop on a non-finite loss. The spike check is separate and
-        # recoverable-by-nothing: it only counts, so one bad minibatch (a
-        # corrupt window, a lone huge target) does not end a long run.
+        # Non-finite is a hard stop; the spike check only counts, so one bad
+        # minibatch does not end the run.
         if not math.isfinite(loss):
             return True
-        # Needs a full window before it has a reference to compare against;
-        # until then there is nothing to call a spike.
+        # Needs a full window before it has a reference to compare against.
         if len(self.recent) < self.window_n:
             self.spike_count = 0
             return False
@@ -1299,21 +1211,15 @@ class Trainer:
         print(f"  sample: {self.tokenizer.decode(out)}", flush=True)
 
     def epochs_done(self, steps):
-        # Epochs actually completed, not epochs requested. Writing the requested
-        # count made an interrupted run look finished: it stored 20 after 1.9,
-        # so a later resume thought the target had been met.
+        # Epochs completed, not requested: an interrupted run stored 20 after 1.9.
         per = max(1, self.batches_per_epoch)
         return int(steps) // per
 
     def save(self, loss, steps, val_loss=None):
-        # `loss` and `step` are a matched pair: loss is the train loss observed
-        # at exactly this step. best_val/best_step travel separately so a resume
-        # can restore them instead of restarting the search from scratch.
-        # epochs_target is what the user originally asked for, so a bare resume
-        # still knows the goal; epochs is how much has actually happened.
+        # loss and step are a matched pair: the train loss at exactly this step.
+        # best_val/best_step travel separately so a resume restores them.
         state_dict = self._unwrap().state_dict()
-        # Never persist non-finite weights. Saving them would replace a good
-        # checkpoint with an unusable one and the run could not recover.
+        # Never persist non-finite weights over a good checkpoint.
         if not math.isfinite(loss) or any(
                 not torch.isfinite(v).all() for v in state_dict.values()
                 if v.is_floating_point()):
@@ -1362,11 +1268,8 @@ ARCH_KEYS = ("d_model", "n_layers", "n_heads", "d_ff")
 
 
 def resolve_block(args, state, rank):
-    # --block sets the training sequence length: it drives the tokenizer windows,
-    # BatchSampler, and the validation split. The size preset's max_len must
-    # never silently override it, or RoPE gets sized for a different context
-    # than the data actually uses (build_cfg used to let the preset win).
-    # Default to the preset's context so presets keep their intended size.
+    # --block owns max_len; the size preset must not override it or RoPE is sized
+    # for a context the data does not use.
     if state is not None:
         # A checkpoint fixes the architecture, so its context wins over a flag.
         stored = state["cfg"].get("max_len")
@@ -1385,9 +1288,8 @@ def resolve_block(args, state, rank):
 
 def build_cfg(args, tokenizer):
     size = SIZE_PRESETS.get(args.size)
-    # Persist the canonical turn labels: the checkpoint is the only artifact
-    # that knows how its turns were labelled, so chatbot.py reads them from
-    # here instead of asking you to retype a name that has to match exactly.
+    # Persist the turn labels: the checkpoint is the only record of how its turns
+    # were labelled, and chatbot.py reads them from here.
     user_name, her_name = speaker_names()
     cfg = {
         "user_speaker": user_name,
@@ -1449,10 +1351,8 @@ _META_KEYS = ("help", "config", "dump_config")
 
 
 def load_config(path):
-    # A config only supplies defaults. Keeping argparse as the schema means
-    # --help, type checking and choices still work, and a flag on the command
-    # line always beats the file, so a config can never quietly override what
-    # you just typed.
+    # A config only supplies defaults; argparse stays the schema, so a flag on the
+    # command line always beats the file.
     import json
     path = Path(path)
     if not path.exists():
@@ -1468,8 +1368,8 @@ def load_config(path):
 
 
 def _coerce(action, value):
-    # The JSON author gets the same validation argparse would have applied, so
-    # "epochs": "20" behaves like --epochs 20 instead of failing deep in fit().
+    # The JSON author gets argparse's validation, so "epochs": "20" behaves
+    # like --epochs 20.
     if isinstance(getattr(action, "const", None), bool):
         if not isinstance(value, bool):
             raise SystemExit(f"config: {action.dest} must be true or false, "
@@ -1493,9 +1393,8 @@ def apply_config(ap, config):
     known = {a.dest: a for a in ap._actions if a.dest not in _META_KEYS}
     unknown = sorted(set(config) - set(known))
     if unknown:
-        # Refuse unknown keys rather than ignoring them: a misspelled option
-        # that is silently dropped leaves you training with settings you did
-        # not choose and no sign anything is wrong.
+        # Refuse unknown keys: a misspelled option that is silently dropped leaves you
+        # training with settings you did not choose.
         import difflib
         hints = []
         for name in unknown:
@@ -1533,9 +1432,7 @@ def _bootstrap_config(ap, argv, default_path):
 
 def resolve_config_args(ap, argv=None, default_path=None):
     """Config supplies defaults, explicit flags win. Exits on --dump-config."""
-    # Snapshot before apply_config replaces the defaults; see the note in
-    # parse_args. Reading action.default afterwards would dump the local config
-    # into the example, private speaker names included.
+    # Snapshot before apply_config; see parse_args.
     builtin_defaults = {a.dest: a.default for a in ap._actions}
     apply_config(ap, _bootstrap_config(ap, argv, default_path))
     args = ap.parse_args(argv)
@@ -1677,24 +1574,16 @@ def parse_args(argv=None, config=None):
 
     if config is None:
         config = _bootstrap_config(ap, argv, DEFAULT_CONFIG)
-    # Snapshot the built-in defaults before apply_config overwrites them with the
-    # config file's values. --dump-config reports the defaults, and reading
-    # action.default after the overwrite would emit whatever the local config
-    # happens to hold -- including the speaker names, which are private and are
-    # exactly what the committed example must not contain.
+    # Snapshot the built-in defaults before apply_config overwrites them:
+    # --dump-config reports the defaults, and reading action.default afterwards
+    # would emit the local config, speaker names included.
     builtin_defaults = {a.dest: a.default for a in ap._actions}
     apply_config(ap, config)
     args = ap.parse_args(argv)
-    # remember which keys came from a config file, so a later decision can tell
-    # "the user asked for this" from "this is only the built-in default"
+    # Remember which keys came from a config file, to tell 'asked for' from default.
     args._from_config = set(config or ())
-    # Same question for the architecture numbers, but the answer needs to know
-    # *where* each value came from, because there are three sources and they
-    # rank differently: a flag on the command line beats a config file, which
-    # beats the --size preset. Collapsing them into one "was it set" set was
-    # wrong in a way that only showed up at runtime: with "d_model": 384 in
-    # her.config.json, `her.py --size nano` trained a 10M model and called it
-    # nano, because the config looked equally explicit as the flag.
+    # flag > config > --size preset, and each key records which of the three it
+    # came from.
     tokens = set(sys.argv[1:] if argv is None else argv)
     args.arch_src = {
         k: ("cli" if f"--{k.replace('_', '-')}" in tokens else "config")
@@ -1807,10 +1696,7 @@ def _print_resume_override(args, stored_epochs, rank):
 
 
 def reconcile_epochs(args, state, rank):
-    # Which epoch count wins on resume: an explicit --epochs, else whatever is
-    # left of the original target. args.epochs always means "epochs to run now",
-    # because total_steps = start_step + epochs * steps_per_epoch, so a bare
-    # resume has to subtract the work already done or it overshoots the target.
+    # Explicit --epochs wins, else the remaining shortfall of the original target.
     stored_done = state.get("epochs") or 0
     stored_target = state.get("epochs_target")
     stored_step = state.get("step") or 0
@@ -1819,8 +1705,7 @@ def reconcile_epochs(args, state, rank):
         _print_resume_override(args, stored_target or stored_done, rank)
         return
     if stored_target and stored_spe:
-        # Work out the shortfall in steps. Doing it in epochs loses the partial
-        # epoch the best checkpoint sits in and overshoots the target by one.
+        # Shortfall in steps, not epochs: the best checkpoint sits in a partial epoch.
         remaining = max(0, stored_target * stored_spe - stored_step)
         args.epochs = max(1, remaining // stored_spe)
         if rank == 0:
@@ -1831,9 +1716,7 @@ def reconcile_epochs(args, state, rank):
                   flush=True)
         return
     if stored_done:
-        # Legacy checkpoint: `epochs` recorded the requested count rather than
-        # completed work, so it cannot say how much is left. Trusting it would
-        # either stop immediately or train twice the original target.
+        # Legacy checkpoint: epochs recorded the request, not completed work.
         args.epochs = stored_done
         if rank == 0:
             print(f"resume: checkpoint predates per-epoch tracking; its epoch "
@@ -1849,10 +1732,7 @@ def _flag_given(argv, name):
 def _setting_given(args, argv, flag, key):
     """True when a setting was asked for, on the command line or in a config.
 
-    Checking argv alone is not enough. A value in the config file is just as
-    explicit a request as the same value on the command line, and treating it
-    as a mere default is how "dropout": 0.0 sat in her.config.json being
-    ignored on every resume, silently, while the file said otherwise.
+    A config value is as explicit a request as the same flag.
     """
     return (flag in (sys.argv[1:] if argv is None else argv)
             or key in getattr(args, "_from_config", ()))
@@ -1867,24 +1747,18 @@ def resolve_model(args, state, tok, rank, argv=None):
     # checkpoint in place.
     cfg = dict(state["cfg"])
     args.objective = cfg["objective"]
-    # dropout is a regularizer, not architecture: it does not change weight
-    # shapes, so an explicit --dropout can be honoured on resume. cfg otherwise
-    # won silently, which mattered because dropout is the main thing stopping a
-    # memorization run from driving its loss to zero.
+    # dropout is not architecture, so an explicit --dropout survives a resume.
     if _setting_given(args, argv, "--dropout", "dropout"):
         cfg["dropout"] = args.dropout
         if rank == 0:
             print(f"dropout:         {args.dropout} (explicit, overriding "
                   f"the checkpoint's {state['cfg']['dropout']})")
-    # The completion mask changes which tokens the loss scores, so flipping it
-    # across a resume would make the loss curve incomparable either side of the
-    # boundary. The checkpoint's setting stands unless it is asked for again.
+    # The mask changes which tokens are scored, so flipping it across a resume
+    # makes the loss curve incomparable. The checkpoint's setting stands.
     if _setting_given(args, argv, "--target-only-loss", "target_only_loss"):
         cfg["target_only_loss"] = bool(args.target_only_loss)
     args.target_only_loss = bool(cfg.get("target_only_loss", False))
-    # `epochs` is stored at the top level of the checkpoint by Trainer.save, not
-    # inside cfg, so cfg.get("epochs") was always None and every bare re-run
-    # silently fell back to the --epochs default.
+    # epochs is stored at checkpoint top level, not inside cfg.
     reconcile_epochs(args, state, rank)
     model = build_model(cfg)
     try:
@@ -1905,10 +1779,8 @@ def maybe_compile(args, model, rank):
     if not args.compile:
         return model
     if sys.platform == "win32":
-        # Triton is not packaged for Windows, so Inductor cannot build
-        # kernels; degrade to eager instead of aborting on the first forward
-        # pass (PyTorch 2 compile docs, https://pytorch.org/docs/stable/torch.compiler.html;
-        # torch._dynamo.config.suppress_errors)
+        # Triton is not packaged for Windows; degrade to eager
+        # (https://pytorch.org/docs/stable/torch.compiler.html)
         torch._dynamo.config.suppress_errors = True
         if rank == 0:
             print("[Warning] Windows: torch.compile will fall back to eager "
@@ -1975,22 +1847,17 @@ def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
                 print(f"kept previous checkpoint: {args.ckpt} (run diverged at "
                       f"step {steps_done:,}; weights not saved)")
             elif args.keep_last:
-                # Best-val retention keeps the least-memorized weights, which is
-                # backwards for a model whose job is to memorize. --keep-last
+                # Best-val retention is backwards for a memorization model; --keep-last
                 # writes the final weights instead.
                 if trainer.save(final_loss, steps_done):
                     print(f"saved final weights: {args.ckpt} (train loss "
                           f"{final_loss:.4f}, {steps_done:,} steps)")
             else:
-                # _maybe_validate already wrote the retained checkpoint;
-                # overwriting it here would replace the best-val weights with
-                # the last weights and pair that loss with a step it was never
-                # measured at.
+                # _maybe_validate already wrote the retained checkpoint.
                 print(f"retained checkpoint: {args.ckpt} (best val "
                       f"{trainer.best_val:.4f} at step {trainer.best_step:,}; "
                       f"stopped at {steps_done:,})")
-            # final_loss stays the TRAIN loss from fit(): overwriting it with
-            # best_val made the summary report the val loss as the train loss.
+            # final_loss stays the train loss from fit().
         print_summary(args, cfg, tok, len(ids), trainable_count(model),
                       total_count(model), final_loss, steps_done,
                       state["step"] if state else 0, device, elapsed,
@@ -2009,9 +1876,7 @@ def main(argv=None):
     args = parse_args(argv)
     # was --epochs passed on the CLI? resume must not silently override it
     args.epochs_explicit = ("--epochs" in (sys.argv[1:] if argv is None else argv)
-                            # A config-supplied epochs means the same thing the
-                            # flag does, otherwise the stored target silently
-                            # overrode the config on every resume.
+                            # A config-supplied epochs means the same as the flag.
                             or "epochs" in getattr(args, "_from_config", ()))
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -2089,10 +1954,7 @@ def print_summary(args, cfg, tok, n_tokens, n_train, n_total, final_loss,
         print(f"early stop:      {'yes' if trainer.stopped_early else 'no'}"
               f" (patience {trainer.patience}, every {trainer.val_every} steps)")
         if trainer.stopped_early:
-            # The gap between these two IS the diagnosis: train falling while
-            # val rises is overfitting, which for a memorization model is the
-            # goal, not a fault. The stop fires anyway because patience counts
-            # val checks, so it halts the run at the point it starts working.
+            # train falling while val rises is overfitting, which here is the goal.
             print(f"note:           train {final_loss:.4f} vs val "
                   f"{trainer.best_val:.4f}; a rising val loss here means "
                   f"memorizing, not a problem to fix")
