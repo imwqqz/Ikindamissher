@@ -618,6 +618,12 @@ class GPT(nn.Module):
         self.drop = nn.Dropout(cfg["dropout"])
         self.blocks = nn.ModuleList(Block(cfg, self.rotary) for _ in range(cfg["n_layers"]))
         self.norm = RMSNorm(cfg["d_model"])
+        # Variance scaling (Attention, 3.4): N(0, 1/d_model). forward() multiplies
+        # the embedding by sqrt(d_model), so the std must be d_model**-0.5 for
+        # that product to be unit. nn.Embedding defaults to std 1, which enters
+        # the blocks ~sqrt(d_model) too large and, through the tied head, gives
+        # logits of std ~20: step-0 loss 383 instead of ln(vocab) = 8.3.
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=cfg["d_model"] ** -0.5)
         self._pos = 0
 
     def reset_cache(self):
