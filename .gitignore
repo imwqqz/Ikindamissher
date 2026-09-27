@@ -7,6 +7,9 @@ chatbot.config.json
 commit.read.md
 seed_persona_qa.py
 
+### Generated report
+model_report.pdf
+
 ### Scratch tests and test outputs.
 test
 
