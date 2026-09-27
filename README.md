@@ -61,6 +61,19 @@ py her.py
 
 # chat
 py chatbot.py
+
+ wqqz@wqqz D:\....\Ikindamissher  master  py chatbot.py
+config: using defaults from D:\dev\Git\Ikindamissher\chatbot.config.json
+device: cuda
+loaded checkpoint: data\her_model.pt (loss 1.0207, trained 2,318 steps)
+objective: lm | lora: False | quant: none
+few-shot retrieval on data/input/wa_out.txt (user: wqqz)
+chatting with her as 'her' - type 'exit' to quit
+<wqqz>: holus
+her: holus
+<wqqz>: tqm
+her: y eso te hace mal
+<wqqz>: exit
 ```
 
 `--help` on either script lists every knob. A fresh run retrains the tokenizer
