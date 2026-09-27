@@ -185,16 +185,18 @@ class BytePairEncoder:
     def encode_masked(self, text: str, char_mask) -> Tuple[List[int], List[bool]]:
         """ids plus a per-token copy of char_mask.
 
-        A character is not a token, so the piece's label is broadcast to every
-        id that piece produced: result is exactly len(ids).
+        A character is not a token, so the label is broadcast to every id that the
+        piece produced: result is exactly len(ids). The label comes from any scored
+        character in the piece, not its first: BPE_PAT lets a piece carry a leading
+        space (" pq"), and that space is the last char of the "her: " prefix, so
+        reading char_mask[m.start()] unscored the first word of all 5,008 turns.
         """
         ids_all: List[int] = []
         mask_all: List[bool] = []
         for m in re.finditer(BPE_PAT, text):
             ids = self._encode_piece(m.group(0))
             ids_all.extend(ids)
-            start = m.start()
-            label = bool(char_mask[start]) if start < len(char_mask) else False
+            label = any(char_mask[m.start():m.end()])
             mask_all.extend([label] * len(ids))
         return ids_all, mask_all
 
@@ -577,7 +579,11 @@ class CausalSelfAttention(nn.Module):
             self._k = torch.cat([self._k, k], dim=2)
             self._v = torch.cat([self._v, v], dim=2)
             k, v = self._k, self._v
-            is_causal = False
+            # Causal only when the query covers the whole key range, i.e. a fresh
+            # prefill. Setting this False unconditionally let every prompt token
+            # attend to its own future, so the first sampled token came from a
+            # non-causal forward and the poisoned cache corrupted all later steps.
+            is_causal = q.shape[2] == k.shape[2]
         else:
             is_causal = True
         y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal,
@@ -878,9 +884,13 @@ class ValWindows:
 
     def __iter__(self):
         # Grouped into batches: one (batch, block) pass beats block interleaved ones.
+        # start tracks the global window index: _pack needs it, because labels are
+        # sliced at absolute offsets and every batch but the first is non-zero.
         pending = []
+        start = 0
         for chunk in self._windows():
-            pending.append(chunk)
+            pending.append((chunk, start))
+            start += self.block
             if len(pending) == self.batch_size:
                 yield self._pack(pending)
                 pending = []
@@ -888,12 +898,12 @@ class ValWindows:
             yield self._pack(pending)
 
     def _pack(self, chunks):
-        ids = torch.stack(chunks)
+        ids = torch.stack([c for c, _ in chunks])
         if self.labels is None:
             return ids, ids
-        # Contiguous slices at stride == block: n-th labels at the n-th offset.
-        labels = torch.stack([self.labels[i * self.block:(i + 1) * self.block]
-                              for i in range(len(chunks))])
+        # Contiguous slices at stride == block: the n-th window uses the n-th
+        # absolute offset, not its position inside this batch.
+        labels = torch.stack([self.labels[s:s + self.block] for _, s in chunks])
         return ids, labels
 
 
