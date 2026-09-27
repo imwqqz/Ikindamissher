@@ -324,9 +324,14 @@ def target_char_mask(corpus: str, her_name: str) -> List[bool]:
     mask = [False] * len(corpus)
     prefix = f"{her_name}: "
     pos = 0
-    for line in corpus.split("\n"):
+    lines = corpus.split("\n")
+    for n, line in enumerate(lines):
         if line.startswith(prefix):
-            for i in range(pos + len(prefix), pos + len(line)):
+            # +1 scores the newline that ends the turn: it is the only token that
+            # can follow her text, so leaving it out never taught the model to stop
+            # and replies ran on until --max-reply truncated them mid-sentence.
+            end = pos + len(line) + (1 if n < len(lines) - 1 else 0)
+            for i in range(pos + len(prefix), min(end, len(mask))):
                 mask[i] = True
         pos += len(line) + 1  # +1 for the newline that split removed
     return mask
