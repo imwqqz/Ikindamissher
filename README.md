@@ -39,8 +39,6 @@ Ikindamissher/
 │   ├── input/description.txt # the persona sheet
 │   ├── input/bpe.json        # tokenizer, written on a fresh run
 │   └── her_model.pt          # the trained weights
-├── test/                     # gitignored: reads the private export + weights
-│   └── verify.py             # py -3 test/verify.py
 └── pyproject.toml
 ```
 
