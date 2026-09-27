@@ -206,3 +206,8 @@ cython_debug/
 ### Commit her.config.example.json instead and copy it.
 her.config.json
 chatbot.config.json
+
+### Scratch tests and test outputs. Kept out of history on purpose: these
+### touch the private export and the checkpoint, so they are not reviewable.
+### Run: py -3 test/verify.py
+test/
