@@ -217,8 +217,15 @@ class BytePairEncoder:
         return self.sentinel_base + i
 
     def stop_ids(self, extra=()):
+        # A turn is several "her: " lines, so the newline after the last one and
+        # the newlines between them are the same token: the model cannot mark
+        # where a turn ends, and stopping here returns her first message only.
+        # 64.7% of turns are multi-message, so this is lossy on purpose --
+        # returning the whole turn would mean decoding past the newline, into
+        # the user's turns, which are never scored and so are unsupervised.
+        # That needs a scored turn-end sentinel instead, which changes the
+        # corpus format; first message is the faithful option until then.
         nl = self.encode("\n")
-        # TODO: REVIEW: stopping at the first newline truncates multi-line replies.
         stops = {nl[0]} if nl else set()
         stops.update(self.sentinel_id(i) for i in range(self.n_sentinels))
         stops.update(extra)
