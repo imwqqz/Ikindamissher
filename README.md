@@ -20,55 +20,50 @@
 
 ```
 Ikindamissher/
-|-- her.py                    trainer + model. Trains the decoder-only
-|                             transformer on the chat export and writes the
-|                             checkpoint. This is the entry point for training.
-|   BytePairEncoder           byte-level BPE, 100 reserved sentinel ids
-|   target_char_mask          which characters of a turn are scored
-|   encode_masked             text -> (ids, scored flags); the loss sees only
-|                             her turns, never yours
-|   GPT / CausalSelfAttention RoPE, pre-norm blocks, KV cache
-|   GPT.generate              prefill + sampled decode, stops on a turn end
-|   ValWindows                validation windows with correct global label
-|                             offsets
-|-- chatbot.py                talks to the trained model. Few-shot retrieval
-|                             finds real exchanges matching your prompt and
-|                             primes the model with them.
-|-- export_sft.py             converts the export to SFT jsonl for external
-|                             trainers (Unsloth/TRL).
-|-- her.config.example.json   every training knob, with defaults.
-|-- chatbot.config.example.json  decoding knobs, with defaults.
-|-- data/                     your export, tokenizer, checkpoint. Gitignored.
-|   input/wa_out.txt          the WhatsApp export
-|   input/description.txt     the persona sheet
-|   input/bpe.json            tokenizer, written on a fresh run
-|   her_model.pt              the trained weights
-|-- test/                     scratch tests. Gitignored: they read the private
-|                             export and the live checkpoint.
-|   verify.py                 py -3 test/verify.py
-`-- pyproject.toml
+├── her.py                    # trainer + model; the entry point for training
+│   ├── BytePairEncoder       # byte-level BPE, 100 reserved sentinel ids
+│   ├── target_char_mask      # which characters of a turn are scored
+│   ├── encode_masked         # text -> ids + scored flags; the loss sees only
+│   │                         #   her turns, never yours
+│   ├── GPT                   # RoPE, pre-norm blocks, weight tying
+│   │   └── CausalSelfAttention   # multi-head attention with the KV cache
+│   ├── GPT.generate          # prefill + sampled decode, stops at a turn end
+│   └── ValWindows            # validation windows with global label offsets
+├── chatbot.py                # talks to the trained model; few-shot retrieval
+│                             #   primes it with real matching exchanges
+├── export_sft.py             # export -> SFT jsonl for external trainers
+├── her.config.example.json   # every training knob, with defaults
+├── chatbot.config.example.json  # every decoding knob, with defaults
+├── data/                     # gitignored: your export, tokenizer, weights
+│   ├── input/wa_out.txt      # the WhatsApp export
+│   ├── input/description.txt # the persona sheet
+│   ├── input/bpe.json        # tokenizer, written on a fresh run
+│   └── her_model.pt          # the trained weights
+├── test/                     # gitignored: reads the private export + weights
+│   └── verify.py             # py -3 test/verify.py
+└── pyproject.toml
 ```
 
-Data flow:
+Data flow: the export goes through `parse_wa` into a corpus, `target_char_mask`
+marks her characters, `encode_masked` turns that into scored windows, `GPT`
+trains on them into `data/her_model.pt`, and `chatbot.py` reads it back.
 
-```
-wa_out.txt ──> her.py (parse_wa) ──> corpus ──> target_char_mask ──>
-    encode_masked ──> windows ──> GPT ──> data/her_model.pt ──> chatbot.py
-```
+## Getting started
 
-Both `her.py` and `chatbot.py` read their speaker names from your local
-`her.config.json` / `chatbot.config.json` (gitignored). The names are never
-written into the source, so they cannot end up in git history. Copy the
-example configs to start:
+Copy the example configs, then train and talk to her. Both configs are
+gitignored because they hold the speaker names, which are deliberately absent
+from the source so they can't reach git history.
 
-```
+```bash
 copy her.config.example.json her.config.json
 copy chatbot.config.example.json chatbot.config.json
-```
 
-Train, then talk to it:
-
-```
+# train; writes data/her_model.pt
 py her.py
+
+# chat
 py chatbot.py
 ```
+
+`--help` on either script lists every knob. A fresh run retrains the tokenizer
+and ignores any existing checkpoint; drop `--fresh` to resume.
