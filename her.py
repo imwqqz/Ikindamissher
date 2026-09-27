@@ -489,9 +489,14 @@ class ParameterEfficientLinear(nn.Module):
             self.qweight = self.qweight.contiguous()
         else:
             base = nn.Linear(in_features, out_features, bias=bias)
-            base.weight.requires_grad_(False)
-            if base.bias is not None:
-                base.bias.requires_grad_(False)
+            # Freeze only when a frozen base is the point. Unconditionally
+            # freezing here left wq/wk/wv/wo with no gradient at lora=False,
+            # qlora=False: 4,718,592 of 15,735,168 params frozen (30%), all of
+            # it attention, while FeedForward used plain nn.Linear and trained.
+            if lora:
+                base.weight.requires_grad_(False)
+                if base.bias is not None:
+                    base.bias.requires_grad_(False)
             self.base = base
 
         self.lora_enabled = lora
