@@ -15,3 +15,60 @@
     4-bit NormalFloat (NF4) block-wise quantization (3.1),
     double quantization of the constants (3.2), paged optimizers (3.3),
     frozen base + trainable adapters (3.4 / Algorithm 1)
+
+## Project structure
+
+```
+Ikindamissher/
+|-- her.py                    trainer + model. Trains the decoder-only
+|                             transformer on the chat export and writes the
+|                             checkpoint. This is the entry point for training.
+|   BytePairEncoder           byte-level BPE, 100 reserved sentinel ids
+|   target_char_mask          which characters of a turn are scored
+|   encode_masked             text -> (ids, scored flags); the loss sees only
+|                             her turns, never yours
+|   GPT / CausalSelfAttention RoPE, pre-norm blocks, KV cache
+|   GPT.generate              prefill + sampled decode, stops on a turn end
+|   ValWindows                validation windows with correct global label
+|                             offsets
+|-- chatbot.py                talks to the trained model. Few-shot retrieval
+|                             finds real exchanges matching your prompt and
+|                             primes the model with them.
+|-- export_sft.py             converts the export to SFT jsonl for external
+|                             trainers (Unsloth/TRL).
+|-- her.config.example.json   every training knob, with defaults.
+|-- chatbot.config.example.json  decoding knobs, with defaults.
+|-- data/                     your export, tokenizer, checkpoint. Gitignored.
+|   input/wa_out.txt          the WhatsApp export
+|   input/description.txt     the persona sheet
+|   input/bpe.json            tokenizer, written on a fresh run
+|   her_model.pt              the trained weights
+|-- test/                     scratch tests. Gitignored: they read the private
+|                             export and the live checkpoint.
+|   verify.py                 py -3 test/verify.py
+`-- pyproject.toml
+```
+
+Data flow:
+
+```
+wa_out.txt ──> her.py (parse_wa) ──> corpus ──> target_char_mask ──>
+    encode_masked ──> windows ──> GPT ──> data/her_model.pt ──> chatbot.py
+```
+
+Both `her.py` and `chatbot.py` read their speaker names from your local
+`her.config.json` / `chatbot.config.json` (gitignored). The names are never
+written into the source, so they cannot end up in git history. Copy the
+example configs to start:
+
+```
+copy her.config.example.json her.config.json
+copy chatbot.config.example.json chatbot.config.json
+```
+
+Train, then talk to it:
+
+```
+py her.py
+py chatbot.py
+```
