@@ -4,6 +4,8 @@ data
 ### Config
 her.config.json
 chatbot.config.json
+commit.read.md
+seed_persona_qa.py
 
 ### Scratch tests and test outputs.
 test

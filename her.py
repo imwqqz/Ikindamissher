@@ -16,6 +16,7 @@ import torch.nn.functional as F
 DEFAULT_DATA = Path(__file__).parent / "data" / "input" / "wa_out.txt"
 DEFAULT_CKPT = Path(__file__).parent / "data" / "her_model.pt"
 DEFAULT_DESC = Path(__file__).parent / "data" / "input" / "description.txt"
+DEFAULT_QA = Path(__file__).parent / "data" / "input" / "persona_qa.txt"
 DEFAULT_BPE = Path(__file__).parent / "data" / "input" / "bpe.json"
 
 # Speaker labels resolved at run time; a literal would land in git history.
@@ -323,6 +324,62 @@ def persona_lines(text: str, label: str = None, alias: str = None):
                     lines.append(f"{canonical}: {chunk.strip()}")
     return lines
 
+
+def persona_qa_turns(text: str, label: str = None, alias: str = None):
+    """Persona Q&A as alternating `user: q` / `her: a` turns.
+
+    The fact sheet is declarative, so training on it alone teaches the model to
+    *state* its attributes, never to *answer a question about* them: given
+    "cual es tu color favorito" the corpus contains no turn that continues with
+    "amarillo". Each fact therefore also needs an answer-shaped example, or
+    the model has no gradient path from a question to the fact.
+
+    Authored as `q:` / `a:` so the file carries no speaker name.
+    """
+    user_name, her_name = speaker_names()
+    her_name = her_name if label is None else label
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = WA_NAME_BOOTSTRAP.match(line)
+        who, msg = (m.group(0)[:-2].strip().lower(), line[m.end():]) if m \
+            else ("", line)
+        if not msg.strip():
+            continue
+        if who in ("q", "user", user_name.lower()):
+            lines.append(f"{user_name}: {msg}")
+        elif who in ("a", "her", her_name.lower()):
+            lines.append(f"{her_name}: {msg}")
+        else:
+            # Untagged lines are statements about her, same as description.txt.
+            lines.append(f"{her_name}: {line}")
+    return lines
+
+
+def spread_turns(conv: str, block: List[str], repeats: int) -> str:
+    """Interleave `block` through `conv` so it is not stranded at one offset.
+
+    A block appended once lands in a single window and is seen by ~0.15% of
+    training examples. Splicing it at `repeats` evenly spaced boundaries gives
+    it a real share of the loss.
+    """
+    if not block or repeats <= 0:
+        return conv
+    lines = conv.splitlines()
+    if not lines:
+        return conv
+    step = max(1, len(lines) // repeats)
+    out = []
+    for i, line in enumerate(lines):
+        if i and i % step == 0:
+            out.extend(block)
+        out.append(line)
+    out.extend(block)
+    return "\n".join(out) + "\n"
+
+
 def target_char_mask(corpus: str, her_name: str) -> List[bool]:
     """True for the characters of her turns, False everywhere else.
 
@@ -365,7 +422,8 @@ def _split_turns(conv: str, val_fraction: float):
 
 # (T5, section 2.1 https://arxiv.org/abs/2005.14165).
 def build_corpus(data_path: Path, desc_path: Path, label: str = None,
-                 user: Optional[str] = None, val_fraction: float = 0.0):
+                 user: Optional[str] = None, val_fraction: float = 0.0,
+                 qa_path: Optional[Path] = None, persona_repeat: int = 0):
     # Returns the corpus string, or (train, val) when val_fraction > 0.
     user_name, her_name = speaker_names()
     if label is None:
@@ -399,6 +457,14 @@ def build_corpus(data_path: Path, desc_path: Path, label: str = None,
                                        alias=label))
     if desc:
         train = train.rstrip("\n") + "\n\n" + desc + "\n"
+    # Answer-shaped persona examples, spread through the corpus so each one is
+    # seen by many windows instead of only the ones that land on it.
+    qa = []
+    if qa_path is not None and Path(qa_path).exists():
+        qa = persona_qa_turns(Path(qa_path).read_text(encoding="utf-8"),
+                              alias=label)
+    if qa:
+        train = spread_turns(train, qa, persona_repeat)
     return (train, val) if val else train
 
 
@@ -820,7 +886,8 @@ def span_loss(logits, labels):
 # Sliding-window batches shuffled every epoch (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
 class BatchSampler:
 
-    def __init__(self, ids, block, batch_size, device, rank=0, world=1, labels=None):
+    def __init__(self, ids, block, batch_size, device, rank=0, world=1,
+                 labels=None, prefix=None):
         self.block = block
         self.batch_size = batch_size
         self.device = device
@@ -831,8 +898,20 @@ class BatchSampler:
         # as ids.
         self.labels = (None if labels is None
                        else torch.tensor(labels, dtype=torch.long, device=device))
-        self.num_windows = max(1, len(self.ids) - block)
-        self.offsets = torch.arange(block, dtype=torch.long, device=device)
+        # Persona as a fixed per-window prefix, so every example is conditioned
+        # on the fact sheet instead of only the ~0.15% of windows that reach
+        # it at the corpus end. Masked out of the loss: it is context the model
+        # must read, not text it should emit. Sourced from the corpus, so no
+        # token crosses the block boundary and RoPE stays within max_len.
+        self.prefix = (None if not prefix
+                       else torch.tensor(prefix, dtype=torch.long, device=device))
+        self.n_prefix = 0 if self.prefix is None else int(self.prefix.numel())
+        self.span = max(1, block - self.n_prefix)
+        self.num_windows = max(1, len(self.ids) - self.span)
+        self.offsets = torch.arange(self.span, dtype=torch.long, device=device)
+        if self.n_prefix:
+            self.prefix_labels = torch.full((self.n_prefix,), -100,
+                                            dtype=torch.long, device=device)
 
     def batches_per_epoch(self):
         return math.ceil(self.num_windows / self.batch_size / self.world)
@@ -847,8 +926,16 @@ class BatchSampler:
             idx = picks.unsqueeze(1) + self.offsets.unsqueeze(0)
             # Unshifted window: lm_loss applies the one-ahead shift itself
             # (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
-            yield self.ids[idx], (self.ids[idx] if self.labels is None
-                                  else self.labels[idx])
+            if self.n_prefix:
+                wid = torch.cat([self.prefix.expand(idx.size(0), -1),
+                                 self.ids[idx]], dim=1)
+                wlab = torch.cat([self.prefix_labels.expand(idx.size(0), -1),
+                                  self.ids[idx] if self.labels is None
+                                  else self.labels[idx]], dim=1)
+                yield wid, wlab
+            else:
+                yield self.ids[idx], (self.ids[idx] if self.labels is None
+                                      else self.labels[idx])
 
 def _opt_float(value, default):
     # Checkpoints store None for metrics a given run never produced.
@@ -917,7 +1004,7 @@ class ValWindows:
 class Trainer:
     def __init__(self, args, cfg, model, ids, device, tokenizer, ckpt,
                  start_step=0, rank=0, world=1, val_ids=None, state=None,
-                 label_ids=None, val_label_ids=None):
+                 label_ids=None, val_label_ids=None, prefix_ids=None):
         self.model = model
         self.cfg = cfg
         self.device = device
@@ -959,7 +1046,8 @@ class Trainer:
         self.sampler = BatchSampler(ids, args.block, args.batch, device,
                                     rank=rank, world=world,
                                     labels=label_ids
-                                    if self.objective == "lm" else None)
+                                    if self.objective == "lm" else None,
+                                    prefix=prefix_ids)
         self.batches_per_epoch = self.sampler.batches_per_epoch()
         self.total_steps = start_step + self.epochs * self.batches_per_epoch
 
@@ -1507,6 +1595,18 @@ def parse_args(argv=None, config=None):
     ap.add_argument("--data", default=str(DEFAULT_DATA))
     ap.add_argument("--ckpt", default=str(DEFAULT_CKPT))
     ap.add_argument("--description", default=str(DEFAULT_DESC))
+    ap.add_argument("--persona-prefix", action="store_true",
+                    help="prepend the fact sheet to every training window, "
+                         "masked from the loss, so each example is conditioned "
+                         "on it instead of only the windows that reach the "
+                         "corpus end")
+    ap.add_argument("--persona-qa", default=str(DEFAULT_QA),
+                    help="question/answer turns for the facts; declarative "
+                         "facts alone teach the model to state them, not "
+                         "answer a question about them")
+    ap.add_argument("--persona-repeat", type=int, default=0,
+                    help="how many times to splice the Q&A block through the "
+                         "corpus; 0 disables it")
     ap.add_argument("--user", default=None,
                     help="your speaker name in the export (default: auto-detect)")
     ap.add_argument("--user-speaker", default=None,
@@ -1637,7 +1737,11 @@ def load_corpus(args):
         print(f"training data not found at {data}")
         raise SystemExit(1)
     return build_corpus(data, Path(args.description), user=args.user,
-                        val_fraction=args.val_fraction)
+                        val_fraction=args.val_fraction,
+                        qa_path=Path(args.persona_qa)
+                        if getattr(args, "persona_qa", None) else None,
+                        persona_repeat=int(getattr(args, "persona_repeat", 0)
+                                           or 0))
 
 
 def setup_ddp():
@@ -1850,12 +1954,14 @@ def report_setup(args, cfg, rank, n_train, n_total):
 
 
 def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
-                 val_ids=None, label_ids=None, val_label_ids=None):
+                 val_ids=None, label_ids=None, val_label_ids=None,
+                 prefix_ids=None):
     # Optimizer loop + final checkpoint/summary, then teardown the process group.
     trainer = Trainer(args, cfg, model, ids, device, tok, args.ckpt,
                       start_step=state["step"] if state else 0,
                       rank=rank, world=world, val_ids=val_ids, state=state,
-                      label_ids=label_ids, val_label_ids=val_label_ids)
+                      label_ids=label_ids, val_label_ids=val_label_ids,
+                      prefix_ids=prefix_ids)
     if rank == 0:
         print(f"training for {args.epochs} epochs (~{trainer.total_steps:,} steps)")
         if trainer.val_windows is not None:
@@ -1958,19 +2064,35 @@ def main(argv=None):
         val_ids = tok.encode(val_corpus) if val_corpus else None
         label_ids = val_label_ids = None
         scored = len(ids)
+    # Persona prefix: the same fact sheet that chatbot.py puts at the head of an
+    # inference prompt, so training and inference see one identical layout.
+    prefix_ids = None
+    if getattr(args, "persona_prefix", False):
+        desc = Path(args.description)
+        if desc.exists():
+            head = "\n".join(persona_lines(desc.read_text(encoding="utf-8"),
+                                          alias=her_name)) + "\n"
+            prefix_ids = tok.encode(head)
+            budget = max(1, args.block // 2)
+            if len(prefix_ids) > budget:
+                prefix_ids = prefix_ids[-budget:]
     if rank == 0:
         print(f"corpus: {len(ids):,} tokens, vocab {tok.vocab_size:,}")
         if mask_on:
             print(f"loss: completion-only, {scored:,} of {len(ids):,} tokens "
                   f"scored ({100 * scored / max(len(ids), 1):.1f}%) - the rest "
                   f"are {speaker_names()[0]}'s turns and persona labels")
+        if prefix_ids:
+            print(f"persona prefix: {len(prefix_ids)} tokens on every window, "
+                  f"masked from the loss; {max(1, args.block - len(prefix_ids))} "
+                  f"tokens of dialogue per window")
         if val_ids:
             print(f"held out: {len(val_ids):,} tokens for validation "
                   f"({100 * len(val_ids) / (len(ids) + len(val_ids)):.1f}%)")
 
     run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
                  val_ids=val_ids, label_ids=label_ids,
-                 val_label_ids=val_label_ids)
+                 val_label_ids=val_label_ids, prefix_ids=prefix_ids)
 
 
 def print_summary(args, cfg, tok, n_tokens, n_train, n_total, final_loss,
