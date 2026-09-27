@@ -174,25 +174,48 @@ class BytePairEncoder:
         vals[accepted] = k
         return vals[~removed]
 
+    def _encode_piece(self, p: str) -> List[int]:
+        ids = list(p.encode("utf-8"))
+        while len(ids) >= 2:
+            stats = Counter(zip(ids, ids[1:]))
+            pair = None
+            best = None
+            for (a, b), rank in stats.items():
+                if (a, b) in self.merges:
+                    if best is None or rank < best:
+                        best = rank
+                        pair = (a, b)
+            if pair is None:
+                break
+            ids = self._merge(ids, pair[0], pair[1], self.merges[pair])
+        return ids
+
     def encode(self, text: str) -> List[int]:
-        pieces = re.findall(BPE_PAT, text)
         ids_all = []
-        for p in pieces:
-            ids = list(p.encode("utf-8"))
-            while len(ids) >= 2:
-                stats = Counter(zip(ids, ids[1:]))
-                pair = None
-                best = None
-                for (a, b), rank in stats.items():
-                    if (a, b) in self.merges:
-                        if best is None or rank < best:
-                            best = rank
-                            pair = (a, b)
-                if pair is None:
-                    break
-                ids = self._merge(ids, pair[0], pair[1], self.merges[pair])
-            ids_all.extend(ids)
+        for p in re.findall(BPE_PAT, text):
+            ids_all.extend(self._encode_piece(p))
         return ids_all
+
+    def encode_masked(self, text: str, char_mask) -> Tuple[List[int], List[bool]]:
+        """ids plus a per-token copy of char_mask.
+
+        A source character is not one token: an accented character is two byte
+        tokens, and one regex piece can span several characters that merge into
+        a single id. So the mask cannot be built by zipping characters against
+        tokens. Each piece's own character span is known, and every id that
+        piece produced is covered by that span, so the piece's label is
+        broadcast to all of its tokens. No second tokenizer pass, and the
+        result is exactly len(ids) long.
+        """
+        ids_all: List[int] = []
+        mask_all: List[bool] = []
+        for m in re.finditer(BPE_PAT, text):
+            ids = self._encode_piece(m.group(0))
+            ids_all.extend(ids)
+            start = m.start()
+            label = bool(char_mask[start]) if start < len(char_mask) else False
+            mask_all.extend([label] * len(ids))
+        return ids_all, mask_all
 
     def decode(self, ids: List[int]) -> str:
         raw = b"".join(self.tokens[i] if i < len(self.tokens) else b"" for i in ids)
@@ -318,6 +341,30 @@ def persona_lines(text: str, label: str = None, alias: str = None):
                 if chunk.strip():
                     lines.append(f"{canonical}: {chunk.strip()}")
     return lines
+
+def target_char_mask(corpus: str, her_name: str) -> List[bool]:
+    """True for the characters of her turns, False everywhere else.
+
+    The corpus is a single stream of both speakers, so an unmasked loss spends
+    close to half its terms learning to predict the other person's messages.
+    The model is never asked to produce those: generation always continues
+    after her label, so those tokens get learned and then suppressed at
+    sampling time. Masking them concentrates every gradient step on the text
+    that actually has to be reproduced.
+
+    This is the completion-only loss that TRL's SFTTrainer applies to
+    assistant turns, and that chat templates spell as train_on_prompt=false.
+    """
+    mask = [False] * len(corpus)
+    prefix = f"{her_name}: "
+    pos = 0
+    for line in corpus.split("\n"):
+        if line.startswith(prefix):
+            for i in range(pos + len(prefix), pos + len(line)):
+                mask[i] = True
+        pos += len(line) + 1  # +1 for the newline that split removed
+    return mask
+
 
 def _split_turns(conv: str, val_fraction: float):
     # Contiguous tail split on a turn boundary. A random window split would leak:
@@ -697,6 +744,19 @@ def sample_probs(logits, top_k, top_p):
 def lm_loss(logits, targets, label_smoothing):
     flat = logits[:, :-1].reshape(-1, logits.size(-1))
     tgt = targets[:, 1:].reshape(-1)
+    # -100 marks tokens excluded from the loss (see target_char_mask). Drop
+    # them before reducing, because averaging over a mixture of scored and
+    # unscored positions would divide by the wrong denominator and silently
+    # rescale every gradient by the scored fraction.
+    keep = tgt.ne(-100)
+    if not bool(keep.any()):
+        # A window can be entirely one speaker's, e.g. a long monologue. There
+        # is nothing to learn from it, and cross_entropy over no valid target
+        # is NaN, which the divergence guard would read as a crash.
+        return logits.sum() * 0.0
+    if not bool(keep.all()):
+        flat = flat[keep]
+        tgt = tgt[keep]
     if label_smoothing <= 0:
         return F.cross_entropy(flat, tgt)
     vocab = flat.size(-1)
@@ -777,13 +837,18 @@ def span_loss(logits, labels):
 # Sliding-window batches shuffled every epoch (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
 class BatchSampler:
 
-    def __init__(self, ids, block, batch_size, device, rank=0, world=1):
+    def __init__(self, ids, block, batch_size, device, rank=0, world=1, labels=None):
         self.block = block
         self.batch_size = batch_size
         self.device = device
         self.rank = rank
         self.world = world
         self.ids = torch.tensor(ids, dtype=torch.long, device=device)
+        # Optional per-token labels, same length as ids, with -100 where the
+        # token is excluded from the loss. Sliced with the same offsets as ids
+        # so a window's labels always line up with the tokens they label.
+        self.labels = (None if labels is None
+                       else torch.tensor(labels, dtype=torch.long, device=device))
         self.num_windows = max(1, len(self.ids) - block)
         self.offsets = torch.arange(block, dtype=torch.long, device=device)
 
@@ -801,7 +866,8 @@ class BatchSampler:
             # unshifted window: lm_loss applies the one-ahead shift itself,
             # so yielding ids[idx + 1] here would double-shift and train the
             # model to predict two tokens ahead (attention is causal) (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
-            yield self.ids[idx], self.ids[idx]
+            yield self.ids[idx], (self.ids[idx] if self.labels is None
+                                  else self.labels[idx])
 
 def _opt_float(value, default):
     # Checkpoints store None for metrics a given run never produced.
@@ -824,10 +890,12 @@ class ValWindows:
     # right for training but makes a validation number meaningless.
     # Yields exactly `block` tokens, same as BatchSampler: the model allocates
     # rotary positions for max_len == block, so block+1 overflows RoPE.
-    def __init__(self, ids, block, device, batch_size=8):
+    def __init__(self, ids, block, device, batch_size=8, labels=None):
         # detach().clone() rather than torch.tensor(): ids is already a tensor
         # and torch.tensor() re-wraps it through __array__, which warns
         self.ids = torch.as_tensor(ids, dtype=torch.long).detach().clone().to(device)
+        self.labels = (None if labels is None else
+                       torch.as_tensor(labels, dtype=torch.long).detach().clone().to(device))
         self.block = block
         self.device = device
         self.batch_size = max(1, int(batch_size))
@@ -853,15 +921,26 @@ class ValWindows:
         for chunk in self._windows():
             pending.append(chunk)
             if len(pending) == self.batch_size:
-                yield torch.stack(pending)
+                yield self._pack(pending)
                 pending = []
         if pending:
-            yield torch.stack(pending)
+            yield self._pack(pending)
+
+    def _pack(self, chunks):
+        ids = torch.stack(chunks)
+        if self.labels is None:
+            return ids, ids
+        # Windows are contiguous slices at stride == block, so the n-th window's
+        # labels start at the same offset as its tokens.
+        labels = torch.stack([self.labels[i * self.block:(i + 1) * self.block]
+                              for i in range(len(chunks))])
+        return ids, labels
 
 
 class Trainer:
     def __init__(self, args, cfg, model, ids, device, tokenizer, ckpt,
-                 start_step=0, rank=0, world=1, val_ids=None, state=None):
+                 start_step=0, rank=0, world=1, val_ids=None, state=None,
+                 label_ids=None, val_label_ids=None):
         self.model = model
         self.cfg = cfg
         self.device = device
@@ -896,14 +975,19 @@ class Trainer:
         # then looks like a spike and the guard kills a healthy run. A mean over
         # a fixed window is stable enough to compare against itself.
         self.best_window = float("inf")
-        self.val_windows = (ValWindows(val_ids, args.block, device)
+        self.val_windows = (ValWindows(val_ids, args.block, device,
+                                       labels=val_label_ids)
                             if val_ids and len(val_ids) > args.block + 1 else None)
         self.since_best = 0
         self.stopped_early = False
         self.last_train_loss = float("inf")
 
+        # The span objective builds its own sentinel labels, so the completion
+        # mask only applies to plain language modelling.
         self.sampler = BatchSampler(ids, args.block, args.batch, device,
-                                    rank=rank, world=world)
+                                    rank=rank, world=world,
+                                    labels=label_ids
+                                    if self.objective == "lm" else None)
         self.batches_per_epoch = self.sampler.batches_per_epoch()
         self.total_steps = start_step + self.epochs * self.batches_per_epoch
 
@@ -1003,12 +1087,13 @@ class Trainer:
         model.eval()
         total, count = 0.0, 0
         with torch.no_grad():
-            for batch in self.val_windows:
+            for batch, labels in self.val_windows:
                 batch = batch.to(self.device, non_blocking=True)
+                targets = labels.to(self.device, non_blocking=True)
                 with torch.autocast("cuda", dtype=self.precision,
                                     enabled=self.precision is not None
                                     and self.device.type == "cuda"):
-                    loss = self._forward_loss(batch, batch)
+                    loss = self._forward_loss(batch, targets)
                 # weight by batch size so a trailing partial batch is not
                 # counted as heavily as a full one
                 n = batch.shape[0]
@@ -1314,6 +1399,7 @@ def build_cfg(args, tokenizer):
         "d_ff": args.d_ff,
         "max_len": args.block,
         "dropout": args.dropout,
+        "target_only_loss": bool(getattr(args, "target_only_loss", False)),
         "objective": args.objective,
         "lora": args.lora or args.qlora,
         "lora_r": args.lora_r,
@@ -1325,13 +1411,16 @@ def build_cfg(args, tokenizer):
     }
     if size:
         for k, v in size.items():
-            # max_len is owned by --block; see resolve_block. An explicitly
-            # given or config-supplied dimension also wins over the preset:
-            # otherwise --size small silently discards --d-model 512, and a
-            # config that lists a dimension reads as if it were in effect when
-            # the value actually used is the preset's.
-            if k != "max_len" and k not in getattr(args, "arch_explicit", ()):
-                cfg[k] = v
+            # max_len is owned by --block; see resolve_block.
+            if k == "max_len":
+                continue
+            src = getattr(args, "arch_src", {}).get(k)
+            if src == "cli":
+                continue                        # --d-model on the flag line
+            if getattr(args, "size_cli", False):
+                cfg[k] = v                      # --size on the flag line beats
+            elif src is None:                   # a config file, which only
+                cfg[k] = v                      # outranks the preset as a default
     return cfg
 
 
@@ -1548,7 +1637,15 @@ def parse_args(argv=None, config=None):
                          "https://arxiv.org/abs/1608.03983)")
     ap.add_argument("--label-smoothing", type=float, default=0.0,
                     help="label smoothing eps_ls (Attention Is All You Need, "
-                         "section 5.4 https://arxiv.org/abs/1706.03762)")
+                    "section 5.4 https://arxiv.org/abs/1706.03762)")
+    ap.add_argument("--target-only-loss", action="store_true",
+                    help="score only her turns. The corpus interleaves both "
+                         "speakers and the model is only ever asked to "
+                         "continue after her label, so the other half of the "
+                         "stream is otherwise learned and then suppressed at "
+                         "sampling time. Same idea as the completion-only loss "
+                         "TRL's SFTTrainer applies to assistant turns "
+                         "(train_on_prompt=false).")
     ap.add_argument("--warmup-steps", type=int, default=500)
     ap.add_argument("--grad-accum", type=int, default=1,
                     help="micro-batches per optimizer step (T5, section 3.4 "
@@ -1591,14 +1688,20 @@ def parse_args(argv=None, config=None):
     # remember which keys came from a config file, so a later decision can tell
     # "the user asked for this" from "this is only the built-in default"
     args._from_config = set(config or ())
-    # Same question for the architecture numbers: --size is a preset, but if the
-    # user also named a dimension explicitly that number is the more specific
-    # request and has to win. Recorded here because this is the only place that
-    # can still see both the command line and the config file.
+    # Same question for the architecture numbers, but the answer needs to know
+    # *where* each value came from, because there are three sources and they
+    # rank differently: a flag on the command line beats a config file, which
+    # beats the --size preset. Collapsing them into one "was it set" set was
+    # wrong in a way that only showed up at runtime: with "d_model": 384 in
+    # her.config.json, `her.py --size nano` trained a 10M model and called it
+    # nano, because the config looked equally explicit as the flag.
     tokens = set(sys.argv[1:] if argv is None else argv)
-    args.arch_explicit = {k for k in ARCH_KEYS
-                          if f"--{k.replace('_', '-')}" in tokens
-                          or k in args._from_config}
+    args.arch_src = {
+        k: ("cli" if f"--{k.replace('_', '-')}" in tokens else "config")
+        for k in ARCH_KEYS
+        if f"--{k.replace('_', '-')}" in tokens or k in args._from_config
+    }
+    args.size_cli = "--size" in tokens
     if args.dump_config:
         written = dump_config(ap, args.dump_config, builtin_defaults)
         print(f"wrote {len(written)} options to {args.dump_config}")
@@ -1743,6 +1846,18 @@ def _flag_given(argv, name):
     return name in (sys.argv[1:] if argv is None else argv)
 
 
+def _setting_given(args, argv, flag, key):
+    """True when a setting was asked for, on the command line or in a config.
+
+    Checking argv alone is not enough. A value in the config file is just as
+    explicit a request as the same value on the command line, and treating it
+    as a mere default is how "dropout": 0.0 sat in her.config.json being
+    ignored on every resume, silently, while the file said otherwise.
+    """
+    return (flag in (sys.argv[1:] if argv is None else argv)
+            or key in getattr(args, "_from_config", ()))
+
+
 def resolve_model(args, state, tok, rank, argv=None):
     # Reuse the checkpoint's architecture when possible; otherwise build from flags.
     if state is None:
@@ -1756,11 +1871,17 @@ def resolve_model(args, state, tok, rank, argv=None):
     # shapes, so an explicit --dropout can be honoured on resume. cfg otherwise
     # won silently, which mattered because dropout is the main thing stopping a
     # memorization run from driving its loss to zero.
-    if _flag_given(argv, "--dropout"):
+    if _setting_given(args, argv, "--dropout", "dropout"):
         cfg["dropout"] = args.dropout
         if rank == 0:
-            print(f"dropout:         {args.dropout} (from flag, overriding "
+            print(f"dropout:         {args.dropout} (explicit, overriding "
                   f"the checkpoint's {state['cfg']['dropout']})")
+    # The completion mask changes which tokens the loss scores, so flipping it
+    # across a resume would make the loss curve incomparable either side of the
+    # boundary. The checkpoint's setting stands unless it is asked for again.
+    if _setting_given(args, argv, "--target-only-loss", "target_only_loss"):
+        cfg["target_only_loss"] = bool(args.target_only_loss)
+    args.target_only_loss = bool(cfg.get("target_only_loss", False))
     # `epochs` is stored at the top level of the checkpoint by Trainer.save, not
     # inside cfg, so cfg.get("epochs") was always None and every bare re-run
     # silently fell back to the --epochs default.
@@ -1824,11 +1945,12 @@ def report_setup(args, cfg, rank, n_train, n_total):
 
 
 def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
-                 val_ids=None):
+                 val_ids=None, label_ids=None, val_label_ids=None):
     # Optimizer loop + final checkpoint/summary, then teardown the process group.
     trainer = Trainer(args, cfg, model, ids, device, tok, args.ckpt,
                       start_step=state["step"] if state else 0,
-                      rank=rank, world=world, val_ids=val_ids, state=state)
+                      rank=rank, world=world, val_ids=val_ids, state=state,
+                      label_ids=label_ids, val_label_ids=val_label_ids)
     if rank == 0:
         print(f"training for {args.epochs} epochs (~{trainer.total_steps:,} steps)")
         if trainer.val_windows is not None:
@@ -1922,16 +2044,35 @@ def main(argv=None):
     if args.ddp:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local])
 
-    ids = tok.encode(corpus)
-    val_ids = tok.encode(val_corpus) if val_corpus else None
+    her_name = speaker_names()[1]
+    mask_on = bool(getattr(args, "target_only_loss", False)) and args.objective == "lm"
+    if mask_on:
+        ids, flags = tok.encode_masked(corpus, target_char_mask(corpus, her_name))
+        label_ids = [i if f else -100 for i, f in zip(ids, flags)]
+        val_ids, val_flags = (tok.encode_masked(val_corpus,
+                                               target_char_mask(val_corpus, her_name))
+                              if val_corpus else (None, None))
+        val_label_ids = ([i if f else -100 for i, f in zip(val_ids, val_flags)]
+                         if val_ids else None)
+        scored = sum(1 for x in label_ids if x != -100)
+    else:
+        ids = tok.encode(corpus)
+        val_ids = tok.encode(val_corpus) if val_corpus else None
+        label_ids = val_label_ids = None
+        scored = len(ids)
     if rank == 0:
         print(f"corpus: {len(ids):,} tokens, vocab {tok.vocab_size:,}")
+        if mask_on:
+            print(f"loss: completion-only, {scored:,} of {len(ids):,} tokens "
+                  f"scored ({100 * scored / max(len(ids), 1):.1f}%) - the rest "
+                  f"are {speaker_names()[0]}'s turns and persona labels")
         if val_ids:
             print(f"held out: {len(val_ids):,} tokens for validation "
                   f"({100 * len(val_ids) / (len(ids) + len(val_ids)):.1f}%)")
 
     run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
-                 val_ids=val_ids)
+                 val_ids=val_ids, label_ids=label_ids,
+                 val_label_ids=val_label_ids)
 
 
 def print_summary(args, cfg, tok, n_tokens, n_train, n_total, final_loss,
