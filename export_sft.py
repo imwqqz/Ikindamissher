@@ -14,10 +14,17 @@ import argparse
 import json
 import re
 import statistics
+import sys
 from collections import Counter
 from pathlib import Path
 
-import her
+_ROOT = Path(__file__).resolve().parent
+for _p in (str(_ROOT / "src"), str(_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from config import DEFAULT_DATA, DEFAULT_DESC, PROJECT_ROOT
+from data import WA_LINE, configure_speakers, detect_user, persona_lines
 
 # Media and deletions carry no text; dropped, not turned into empty turns.
 NOISE = re.compile(
@@ -37,7 +44,7 @@ SYSTEM = re.compile(
 
 def _new_turn(line, speakers, aliases, stats):
     """(matched, turn) for one line. Filtered lines match but yield no turn."""
-    match = her.WA_LINE.match(line)
+    match = WA_LINE.match(line)
     if not match:
         return False, None
     name, msg = match.group(1).strip(), match.group(2).strip()
@@ -128,18 +135,18 @@ def to_sharegpt(conversations):
     ]
 
 
-def pct(values, q):
+def percentile(values, quantile):
     values = sorted(values)
     if not values:
         return 0
-    return values[min(len(values) - 1, int(len(values) * q))]
+    return values[min(len(values) - 1, int(len(values) * quantile))]
 
 
 def _load_config(args):
     # Canonical labels come from the gitignored her.config.json.
     cfg = {}
-    for candidate in (args.data.parent.parent / "her.config.json",
-                      Path("her.config.json")):
+    for candidate in (PROJECT_ROOT / "configs" / "her.config.json",
+                      PROJECT_ROOT / "her.config.json"):
         if candidate.exists():
             cfg = json.loads(candidate.read_text(encoding="utf-8"))
             break
@@ -153,7 +160,7 @@ def _resolve_speakers(args, cfg):
         raise SystemExit(
             "no speaker names configured; pass --user-speaker and --her-speaker"
         )
-    her.configure_speakers(user, her_name)
+    configure_speakers(user, her_name)
     return user.lower(), her_name.lower()
 
 
@@ -178,7 +185,7 @@ def _drop_long_conversations(convs, max_chars):
 def _persona_block(args, her_name):
     if not (args.persona and args.description.exists()):
         return None
-    persona = "\n".join(her.persona_lines(
+    persona = "\n".join(persona_lines(
         args.description.read_text(encoding="utf-8"), alias=her_name))
     return re.sub(rf"^{her_name}:\s*", "", persona, flags=re.M).strip()
 
@@ -229,9 +236,9 @@ def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
     print(f"  unpaired turns      {orphans:,} (no completion, cannot train)")
     if too_long:
         print(f"  over {args.max_chars} chars  {dict(too_long)} message(s) dropped")
-    print(f"  turns/conversation  p50={pct(turns_per, .5)} p90={pct(turns_per, .9)} "
+    print(f"  turns/conversation  p50={percentile(turns_per, .5)} p90={percentile(turns_per, .9)} "
           f"max={max(turns_per, default=0)}")
-    print(f"  message chars       p50={pct(msg_chars, .5)} p90={pct(msg_chars, .9)} "
+    print(f"  message chars       p50={percentile(msg_chars, .5)} p90={percentile(msg_chars, .9)} "
           f"max={max(msg_chars, default=0)}")
     if msg_chars:
         print(f"  mean message        {statistics.mean(msg_chars):.0f} chars")
@@ -247,7 +254,7 @@ def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--data", type=Path, default=her.DEFAULT_DATA)
+    ap.add_argument("--data", type=Path, default=DEFAULT_DATA)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument(
         "--format",
@@ -263,7 +270,7 @@ def main(argv=None):
         action="store_true",
         help="prepend description.txt as a system message on every example",
     )
-    ap.add_argument("--description", type=Path, default=her.DEFAULT_DESC)
+    ap.add_argument("--description", type=Path, default=DEFAULT_DESC)
     ap.add_argument(
         "--max-chars",
         type=int,
@@ -278,7 +285,7 @@ def main(argv=None):
 
     raw = args.data.read_text(encoding="utf-8")
     aliases = {}
-    detected = her.detect_user(raw, her_name)
+    detected = detect_user(raw, her_name)
     if detected != user:
         aliases[detected] = user
 

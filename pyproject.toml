@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "ikindamissher"
 version = "0.1.0"
@@ -5,6 +9,28 @@ requires-python = ">=3.14"
 dependencies = [
     "torch==2.14.0",
 ]
+
+[project.scripts]
+her-train = "her:main"
+her-chat = "chatbot:main"
+her-export-sft = "export_sft:main"
+
+[tool.hatch.build.targets.wheel]
+packages = []
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/tokenizer.py" = "tokenizer.py"
+"src/data.py" = "data.py"
+"src/model.py" = "model.py"
+"src/training.py" = "training.py"
+"src/checkpoint.py" = "checkpoint.py"
+"src/config.py" = "config.py"
+"her.py" = "her.py"
+"chatbot.py" = "chatbot.py"
+"export_sft.py" = "export_sft.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/her.py", "/chatbot.py", "/export_sft.py", "/configs", "/README.md"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }

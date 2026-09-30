@@ -2,8 +2,8 @@
 data
 
 ### Config
-her.config.json
-chatbot.config.json
+configs/her.config.json
+configs/chatbot.config.json
 commit.read.md
 seed_persona_qa.py
 
