@@ -87,22 +87,43 @@ def few_shot_pairs(text, shots, demo_len, tokenizer, prompt=""):
     return context, len(selected)
 
 
+def _read_description(args):
+    # Path("") resolves to ".", which exists, so an unset --description used to
+    # read_text() a directory and die with PermissionError.
+    if args.description and Path(args.description).exists():
+        return "\n".join(persona_lines(
+            Path(args.description).read_text(encoding="utf-8")))
+    return ""
+
+
+def _select_demos(corpus_text, args, prompt, tokenizer):
+    if corpus_text and args.shots > 0:
+        return few_shot_pairs(corpus_text, args.shots,
+                              args.demo_len, tokenizer, prompt)
+    return "", 0
+
+
+def _trim_prompt(ids, max_ctx, tokenizer):
+    if len(ids) <= max_ctx:
+        return ids
+    # Keep the tail but snap forward to a line break, so the prompt never
+    # starts mid-subword.
+    ids = ids[-max_ctx:]
+    nl = set(tokenizer.encode("\n"))
+    floor = max_ctx // 2
+    starts = [i + 1 for i, tok in enumerate(ids)
+              if tok in nl and len(ids) - (i + 1) >= floor]
+    if starts:
+        ids = ids[starts[0]:]
+    return ids
+
+
 def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
     # Text-to-text prompt: persona + demos + history + her hint
     # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     user_name, her_name = speaker_names()
-    description = ""
-    # Path("") resolves to ".", which exists, so an unset --description used to
-    # read_text() a directory and die with PermissionError.
-    if args.description and Path(args.description).exists():
-        description = "\n".join(persona_lines(
-            Path(args.description).read_text(encoding="utf-8")))
-
-    demos = ""
-    n_shots = 0
-    if corpus_text and args.shots > 0:
-        demos, n_shots = few_shot_pairs(corpus_text, args.shots,
-                                        args.demo_len, tokenizer, prompt)
+    description = _read_description(args)
+    demos, n_shots = _select_demos(corpus_text, args, prompt, tokenizer)
 
     # Headroom must cover the reply, or RoPE overflows past max_len.
     max_ctx = state["cfg"]["max_len"] - args.max_reply - 1
@@ -114,17 +135,7 @@ def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
     hist = "\n".join(history)
     full = "\n".join(p for p in (prefix, hist, f"{user_name}: {prompt}") if p)
     ids = tokenizer.encode(full + f"\n{her_name}: ")
-    if len(ids) > max_ctx:
-        # Keep the tail but snap forward to a line break, so the prompt never
-        # starts mid-subword.
-        ids = ids[-max_ctx:]
-        nl = set(tokenizer.encode("\n"))
-        floor = max_ctx // 2
-        starts = [i + 1 for i, tok in enumerate(ids)
-                  if tok in nl and len(ids) - (i + 1) >= floor]
-        if starts:
-            ids = ids[starts[0]:]
-    return ids, n_shots
+    return _trim_prompt(ids, max_ctx, tokenizer), n_shots
 
 
 def load_assets(args, device):
@@ -208,27 +219,30 @@ def build_parser():
     return ap
 
 
-def main(argv=None):
+def _init_stdout():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
         pass
 
-    args = resolve_config_args(build_parser(), argv, CHAT_CONFIG)
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
+def _setup_device():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         print("[Warning] CUDA is not available. Exiting.")
         sys.exit(1)
     print(f"device: {device}")
+    return device
 
-    state, model, tokenizer = load_assets(args, device)
+
+def _pick_speakers(args, cfg):
+    return args.user_speaker or cfg.get("user_speaker"), \
+        args.her_speaker or cfg.get("her_speaker")
+
+
+def _configure_from_checkpoint(args, cfg):
     # The checkpoint is the only record of how turns were labelled; never guess.
-    cfg = state["cfg"]
-    configure_speakers(args.user_speaker or cfg.get("user_speaker"),
-                       args.her_speaker or cfg.get("her_speaker"))
+    configure_speakers(*_pick_speakers(args, cfg))
     user_name, her_name = speaker_names()
     if not user_name or not her_name:
         raise SystemExit(
@@ -241,11 +255,11 @@ def main(argv=None):
        (cfg.get("user_speaker") and user_name != cfg["user_speaker"]):
         print(f"note: overriding checkpoint labels (trained as "
               f"{cfg.get('user_speaker')!r}/{cfg.get('her_speaker')!r})")
+    return user_name, her_name
 
-    corpus_text = load_corpus(args)
 
-    history = []
-    print(f"chatting with her as {her_name!r} - type 'exit' to quit")
+def _chat_loop(args, state, model, tokenizer, history, corpus_text, device,
+               user_name, her_name):
     while True:
         try:
             prompt = input(f"<{user_name}>: ").strip()
@@ -261,6 +275,27 @@ def main(argv=None):
             history.append(f"{user_name}: {clip_msg(prompt, 15, tokenizer)}")
             history.append(f"{her_name}: {clip_msg(reply, 15, tokenizer)}")
             history = history[-16:]
+
+
+def main(argv=None):
+    _init_stdout()
+
+    args = resolve_config_args(build_parser(), argv, CHAT_CONFIG)
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    device = _setup_device()
+
+    state, model, tokenizer = load_assets(args, device)
+    cfg = state["cfg"]
+    user_name, her_name = _configure_from_checkpoint(args, cfg)
+
+    corpus_text = load_corpus(args)
+
+    history = []
+    print(f"chatting with her as {her_name!r} - type 'exit' to quit")
+    _chat_loop(args, state, model, tokenizer, history, corpus_text, device,
+               user_name, her_name)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,35 @@ SYSTEM = re.compile(
 )
 
 
+def _new_turn(line, speakers, aliases, stats):
+    """(matched, turn) for one line. Filtered lines match but yield no turn."""
+    match = her.WA_LINE.match(line)
+    if not match:
+        return False, None
+    name, msg = match.group(1).strip(), match.group(2).strip()
+    name = aliases.get(name.lower(), name.lower())
+    if name not in speakers:
+        stats["unknown_speaker"] += 1
+        return True, None
+    if NOISE.match(msg):
+        stats["media_or_deleted"] += 1
+        return True, None
+    if not msg:
+        stats["empty"] += 1
+        return True, None
+    return True, [name, msg]
+
+
+def _continuation(line, turns, stats):
+    if not line.strip():
+        return
+    if turns:
+        turns[-1][1] += "\n" + line.rstrip()
+        stats["continuation"] += 1
+    else:
+        stats["system_notice"] += 1
+
+
 def parse_turns(text, speakers, aliases):
     """Return (turns, stats) where turns is [(speaker, message)].
 
@@ -47,29 +76,28 @@ def parse_turns(text, speakers, aliases):
         if SYSTEM.match(line.strip()):
             stats["system_notice"] += 1
             continue
-        match = her.WA_LINE.match(line)
-        if match:
-            name, msg = match.group(1).strip(), match.group(2).strip()
-            name = aliases.get(name.lower(), name.lower())
-            if name not in speakers:
-                stats["unknown_speaker"] += 1
-                continue
-            if NOISE.match(msg):
-                stats["media_or_deleted"] += 1
-                continue
-            if not msg:
-                stats["empty"] += 1
-                continue
-            turns.append([name, msg])
+        matched, turn = _new_turn(line, speakers, aliases, stats)
+        if matched:
+            if turn is not None:
+                turns.append(turn)
             continue
-        if not line.strip():
-            continue
-        if turns:
-            turns[-1][1] += "\n" + line.rstrip()
-            stats["continuation"] += 1
-        else:
-            stats["system_notice"] += 1
+        _continuation(line, turns, stats)
     return turns, stats
+
+
+def _fold_turn(current, convs, role, msg, orphans):
+    if role == "user" or not current:
+        if role == "assistant":
+            return [], orphans + 1    # her reply with no question before it
+        if current:
+            convs.append(current)
+            orphans += 1              # her side already closed; this is unpaired
+        current = []
+    if current and current[-1]["role"] == role:
+        current[-1]["content"] += "\n" + msg
+    else:
+        current.append({"role": role, "content": msg})
+    return current, orphans
 
 
 def group_conversations(turns, user, her_name):
@@ -82,18 +110,7 @@ def group_conversations(turns, user, her_name):
     orphans = 0
     for name, msg in turns:
         role = "user" if name == user else "assistant"
-        if role == "user" or not current:
-            if role == "assistant":
-                orphans += 1          # her reply with no question before it
-                continue
-            if current:
-                orphans += 1          # her side already closed; this is unpaired
-                convs.append(current)
-            current = []
-        if current and current[-1]["role"] == role:
-            current[-1]["content"] += "\n" + msg
-        else:
-            current.append({"role": role, "content": msg})
+        current, orphans = _fold_turn(current, convs, role, msg, orphans)
     if current:
         if len(current) < 2:
             orphans += 1
@@ -116,6 +133,116 @@ def pct(values, q):
     if not values:
         return 0
     return values[min(len(values) - 1, int(len(values) * q))]
+
+
+def _load_config(args):
+    # Canonical labels come from the gitignored her.config.json.
+    cfg = {}
+    for candidate in (args.data.parent.parent / "her.config.json",
+                      Path("her.config.json")):
+        if candidate.exists():
+            cfg = json.loads(candidate.read_text(encoding="utf-8"))
+            break
+    return cfg
+
+
+def _resolve_speakers(args, cfg):
+    user = args.user_speaker or cfg.get("user_speaker")
+    her_name = args.her_speaker or cfg.get("her_speaker")
+    if not user or not her_name:
+        raise SystemExit(
+            "no speaker names configured; pass --user-speaker and --her-speaker"
+        )
+    her.configure_speakers(user, her_name)
+    return user.lower(), her_name.lower()
+
+
+def _drop_long_conversations(convs, max_chars):
+    """Drop any message longer than max_chars; emptied conversations fall away."""
+    if not max_chars:
+        return convs, Counter()
+    too_long = Counter()
+    kept = []
+    for c in convs:
+        keep = []
+        for m in c:
+            if len(m["content"]) > max_chars:
+                too_long[m["role"]] += 1
+            else:
+                keep.append(m)
+        if len(keep) >= 2:
+            kept.append(keep)
+    return kept, too_long
+
+
+def _persona_block(args, her_name):
+    if not (args.persona and args.description.exists()):
+        return None
+    persona = "\n".join(her.persona_lines(
+        args.description.read_text(encoding="utf-8"), alias=her_name))
+    return re.sub(rf"^{her_name}:\s*", "", persona, flags=re.M).strip()
+
+
+def _build_rows(convs, fmt, persona):
+    if fmt == "sharegpt":
+        rows = to_sharegpt(convs)
+        key, lead = "conversations", {"from": "system", "value": persona}
+    else:
+        rows = [{"messages": c} for c in convs]
+        key, lead = "messages", {"role": "system", "content": persona}
+    if persona:
+        for row in rows:
+            row[key] = [lead, *row[key]]
+    return rows
+
+
+def _write_rows(rows, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _her_chars(convs):
+    return sum(len(m["content"]) for c in convs
+               for m in c if m["role"] == "assistant")
+
+
+def _tally(convs):
+    # Two her-shares: quoting either alone is misleading.
+    train_chars = _her_chars(convs)
+    kept_chars = sum(len(m["content"]) for c in convs for m in c)
+    turns_per = [len(c) for c in convs]
+    msg_chars = [len(m["content"]) for c in convs for m in c]
+    return train_chars, kept_chars, turns_per, msg_chars
+
+
+def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
+            train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
+            parsed_total, persona):
+    print(f"wrote {len(rows)} conversations to {out}  ({fmt} format)")
+    print(f"  turns parsed        {len(turns):,}")
+    print(f"  continuation kept   {stats['continuation']} lines (her.py drops these)")
+    print(f"  system notice       {stats['system_notice']}")
+    print(f"  media/deleted       {stats['media_or_deleted']:,}")
+    print(f"  unknown speaker     {stats['unknown_speaker']}")
+    print(f"  unpaired turns      {orphans:,} (no completion, cannot train)")
+    if too_long:
+        print(f"  over {args.max_chars} chars  {dict(too_long)} message(s) dropped")
+    print(f"  turns/conversation  p50={pct(turns_per, .5)} p90={pct(turns_per, .9)} "
+          f"max={max(turns_per, default=0)}")
+    print(f"  message chars       p50={pct(msg_chars, .5)} p90={pct(msg_chars, .9)} "
+          f"max={max(msg_chars, default=0)}")
+    if msg_chars:
+        print(f"  mean message        {statistics.mean(msg_chars):.0f} chars")
+    if parsed_total:
+        print(f"  her share, all text {parsed_chars[her_name] / parsed_total:.1%}")
+    if kept_chars:
+        print(f"  her share, trainable{train_chars / kept_chars:.1%} <- assistant loss "
+              f"sees this")
+    print(f"  approx tokens       {kept_chars // 4:,} (guess; needs the real tokenizer)")
+    if persona:
+        print(f"  system message      {len(persona):,} chars of persona on every row")
 
 
 def main(argv=None):
@@ -146,20 +273,8 @@ def main(argv=None):
     )
     args = ap.parse_args(argv)
 
-    # Canonical labels come from the gitignored her.config.json.
-    cfg = {}
-    for candidate in (args.data.parent.parent / "her.config.json", Path("her.config.json")):
-        if candidate.exists():
-            cfg = json.loads(candidate.read_text(encoding="utf-8"))
-            break
-    user = args.user_speaker or cfg.get("user_speaker")
-    her_name = args.her_speaker or cfg.get("her_speaker")
-    if not user or not her_name:
-        raise SystemExit(
-            "no speaker names configured; pass --user-speaker and --her-speaker"
-        )
-    her.configure_speakers(user, her_name)
-    user, her_name = user.lower(), her_name.lower()
+    cfg = _load_config(args)
+    user, her_name = _resolve_speakers(args, cfg)
 
     raw = args.data.read_text(encoding="utf-8")
     aliases = {}
@@ -174,74 +289,15 @@ def main(argv=None):
     parsed_total = sum(parsed_chars.values())
 
     convs, orphans = group_conversations(turns, user, her_name)
+    convs, too_long = _drop_long_conversations(convs, args.max_chars)
+    persona = _persona_block(args, her_name)
+    rows = _build_rows(convs, args.format, persona)
+    _write_rows(rows, args.out)
 
-    too_long = Counter()
-    if args.max_chars:
-        for c in convs:
-            for m in c:
-                if len(m["content"]) > args.max_chars:
-                    too_long[m["role"]] += 1
-        convs = [
-            [m for m in c if len(m["content"]) <= args.max_chars]
-            for c in convs
-        ]
-        convs = [c for c in convs if len(c) >= 2]
-
-    persona = None
-    if args.persona and args.description.exists():
-        persona = "\n".join(
-            her.persona_lines(
-                args.description.read_text(encoding="utf-8"), alias=her_name
-            )
-        )
-        persona = re.sub(rf"^{her_name}:\s*", "", persona, flags=re.M).strip()
-
-    if args.format == "sharegpt":
-        rows = to_sharegpt(convs)
-        key, lead = "conversations", {"from": "system", "value": persona}
-    else:
-        rows = [{"messages": c} for c in convs]
-        key, lead = "messages", {"role": "system", "content": persona}
-    if persona:
-        for row in rows:
-            row[key] = [lead, *row[key]]
-
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    # Two her-shares: quoting either alone is misleading.
-    train_chars = sum(
-        len(m["content"]) for c in convs for m in c if m["role"] == "assistant"
-    )
-    kept_chars = sum(len(m["content"]) for c in convs for m in c)
-    turns_per = [len(c) for c in convs]
-    msg_chars = [len(m["content"]) for c in convs for m in c]
-
-    print(f"wrote {len(rows)} conversations to {args.out}  ({args.format} format)")
-    print(f"  turns parsed        {len(turns):,}")
-    print(f"  continuation kept   {stats['continuation']} lines (her.py drops these)")
-    print(f"  system notice       {stats['system_notice']}")
-    print(f"  media/deleted       {stats['media_or_deleted']:,}")
-    print(f"  unknown speaker     {stats['unknown_speaker']}")
-    print(f"  unpaired turns      {orphans:,} (no completion, cannot train)")
-    if too_long:
-        print(f"  over {args.max_chars} chars  {dict(too_long)} message(s) dropped")
-    print(f"  turns/conversation  p50={pct(turns_per, .5)} p90={pct(turns_per, .9)} "
-          f"max={max(turns_per, default=0)}")
-    print(f"  message chars       p50={pct(msg_chars, .5)} p90={pct(msg_chars, .9)} "
-          f"max={max(msg_chars, default=0)}")
-    if msg_chars:
-        print(f"  mean message        {statistics.mean(msg_chars):.0f} chars")
-    if parsed_total:
-        print(f"  her share, all text {parsed_chars[her_name] / parsed_total:.1%}")
-    if kept_chars:
-        print(f"  her share, trainable{train_chars / kept_chars:.1%} <- assistant loss "
-              f"sees this")
-    print(f"  approx tokens       {kept_chars // 4:,} (guess; needs the real tokenizer)")
-    if persona:
-        print(f"  system message      {len(persona):,} chars of persona on every row")
+    train_chars, kept_chars, turns_per, msg_chars = _tally(convs)
+    _report(args, rows, args.out, args.format, stats, turns, orphans, too_long,
+            train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
+            parsed_total, persona)
 
 
 if __name__ == "__main__":

@@ -256,6 +256,22 @@ WA_LINE = re.compile(
 )
 WA_NAME_BOOTSTRAP = re.compile(r"^[^:\n]+: ")
 
+WA_NOISE = re.compile(
+    r"(<media omitted>|media omitted|you deleted this message|this message was deleted)",
+    re.I,
+)
+
+
+def _wa_turn(line: str, aliases, speakers):
+    match = WA_LINE.match(line)
+    if not match:
+        return None
+    name, msg = match.group(1).strip(), match.group(2).strip()
+    name_lower = aliases.get(name.lower(), name.lower())
+    if WA_NOISE.match(msg) or not msg or name_lower not in speakers:
+        return None
+    return f"{name_lower}: {msg}"
+
 
 def parse_wa(text: str, speakers=None, aliases=None):
     # Normalize the exporter's speaker names to canonical turns. (T5, section 2.1 https://arxiv.org/abs/2005.14165)
@@ -263,20 +279,8 @@ def parse_wa(text: str, speakers=None, aliases=None):
         speakers = speaker_names()
     speakers = tuple(s.lower() for s in speakers)
     aliases = {k.lower(): v.lower() for k, v in (aliases or {}).items()}
-    lines = []
-    for line in text.splitlines():
-        match = WA_LINE.match(line)
-        if not match:
-            continue
-        name, msg = match.group(1).strip(), match.group(2).strip()
-        name_lower = aliases.get(name.lower(), name.lower())
-        if re.match(r"(<media omitted>|media omitted|you deleted this message|this message was deleted)", msg, re.I):
-            continue
-        if not msg:
-            continue
-        if name_lower not in speakers:
-            continue
-        lines.append(f"{name_lower}: {msg}")
+    lines = [turn for turn in (_wa_turn(line, aliases, speakers)
+                               for line in text.splitlines()) if turn]
     return "\n".join(lines) + "\n"
 
 
@@ -295,6 +299,19 @@ def detect_user(text: str, label: str = None):
     return counts.most_common(1)[0][0] if counts else user_name
 
 
+def _persona_line(line: str, rename, canonical: str):
+    m = WA_NAME_BOOTSTRAP.match(line)
+    if m:
+        name = m.group(0)[:-2].strip().lower()
+        if name in rename:
+            return [f"{rename[name]}: {line[m.end():]}"]
+        return [line]
+    if len(line) <= 400:
+        return [f"{canonical}: {line}"]
+    return [f"{canonical}: {chunk.strip()}"
+            for chunk in re.split(r"(?<=[.!?])\s+", line) if chunk.strip()]
+
+
 def persona_lines(text: str, label: str = None, alias: str = None):
     # Persona description as `name: line` turns (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     user_name, her_name = speaker_names()
@@ -305,24 +322,27 @@ def persona_lines(text: str, label: str = None, alias: str = None):
     if alias and alias.lower() not in rename:
         rename[alias.lower()] = canonical
     lines = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = WA_NAME_BOOTSTRAP.match(line)
-        if m:
-            name = m.group(0)[:-2].strip().lower()
-            if name in rename:
-                line = f"{rename[name]}: {line[m.end():]}"
-            lines.append(line)
-            continue
-        if len(line) <= 400:
-            lines.append(f"{canonical}: {line}")
-        else:
-            for chunk in re.split(r"(?<=[.!?])\s+", line):
-                if chunk.strip():
-                    lines.append(f"{canonical}: {chunk.strip()}")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line:
+            lines.extend(_persona_line(line, rename, canonical))
     return lines
+
+
+def _qa_turn(stripped: str, user_name: str, her_name: str):
+    m = WA_NAME_BOOTSTRAP.match(stripped)
+    if m:
+        who = m.group(0)[:-2].strip().lower()
+        msg = stripped[m.end():]
+    else:
+        who, msg = "", stripped
+    if not msg.strip():
+        return []
+    if who in ("q", "user", user_name.lower()):
+        return [f"{user_name}: {msg}"]
+    if who in ("a", "her", her_name.lower()):
+        return [f"{her_name}: {msg}"]
+    return [f"{her_name}: {stripped}"]
 
 
 def persona_qa_turns(text: str, label: str = None, alias: str = None):
@@ -339,22 +359,10 @@ def persona_qa_turns(text: str, label: str = None, alias: str = None):
     user_name, her_name = speaker_names()
     her_name = her_name if label is None else label
     lines = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = WA_NAME_BOOTSTRAP.match(line)
-        who, msg = (m.group(0)[:-2].strip().lower(), line[m.end():]) if m \
-            else ("", line)
-        if not msg.strip():
-            continue
-        if who in ("q", "user", user_name.lower()):
-            lines.append(f"{user_name}: {msg}")
-        elif who in ("a", "her", her_name.lower()):
-            lines.append(f"{her_name}: {msg}")
-        else:
-            # Untagged lines are statements about her, same as description.txt.
-            lines.append(f"{her_name}: {line}")
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped and not stripped.startswith("#"):
+            lines.extend(_qa_turn(stripped, user_name, her_name))
     return lines
 
 
@@ -420,12 +428,7 @@ def _split_turns(conv: str, val_fraction: float):
     return "\n".join(lines[:cut]) + "\n", "\n".join(lines[cut:]) + "\n"
 
 
-# (T5, section 2.1 https://arxiv.org/abs/2005.14165).
-def build_corpus(data_path: Path, desc_path: Path, label: str = None,
-                 user: Optional[str] = None, val_fraction: float = 0.0,
-                 qa_path: Optional[Path] = None, persona_repeat: int = 0):
-    # Returns the corpus string, or (train, val) when val_fraction > 0.
-    user_name, her_name = speaker_names()
+def _resolve_speakers(label, user_name, her_name):
     if label is None:
         label = her_name
     if not user_name or not her_name:
@@ -436,14 +439,43 @@ def build_corpus(data_path: Path, desc_path: Path, label: str = None,
             '--her-speaker "<name>", or set user_speaker and her_speaker in '
             "the config file.\nThey are absent from the source on purpose: a "
             "literal would end up in git history.")
-    raw = data_path.read_text(encoding="utf-8")
-    if user is None:
-        user = detect_user(raw, label)
+    return label, user_name, her_name
+
+
+def _resolve_aliases(user, label, user_name, her_name):
     aliases = {}
     if user.lower() != user_name:
         aliases[user.lower()] = user_name
     if label.lower() != her_name:
         aliases[label.lower()] = her_name
+    return aliases
+
+
+def _append_persona(train: str, desc_text: str, label: str) -> str:
+    desc = "\n".join(persona_lines(desc_text, alias=label))
+    if not desc:
+        return train
+    return train.rstrip("\n") + "\n\n" + desc + "\n"
+
+
+def _persona_qa_lines(qa_path, label):
+    if qa_path is None or not Path(qa_path).exists():
+        return []
+    return persona_qa_turns(Path(qa_path).read_text(encoding="utf-8"),
+                            alias=label)
+
+
+# (T5, section 2.1 https://arxiv.org/abs/2005.14165).
+def build_corpus(data_path: Path, desc_path: Path, label: str = None,
+                 user: Optional[str] = None, val_fraction: float = 0.0,
+                 qa_path: Optional[Path] = None, persona_repeat: int = 0):
+    # Returns the corpus string, or (train, val) when val_fraction > 0.
+    user_name, her_name = speaker_names()
+    label, user_name, her_name = _resolve_speakers(label, user_name, her_name)
+    raw = data_path.read_text(encoding="utf-8")
+    if user is None:
+        user = detect_user(raw, label)
+    aliases = _resolve_aliases(user, label, user_name, her_name)
     corpus = parse_wa(raw, aliases=aliases or None)
     # lowercase, to match what parse_wa emits for every other turn
     corpus = corpus.replace(f"\n{label.lower()}: ", f"\n{her_name}: ")
@@ -451,18 +483,12 @@ def build_corpus(data_path: Path, desc_path: Path, label: str = None,
     train, val = _split_turns(corpus, val_fraction)
     # Persona goes to train only: it is appended at the corpus end, so a tail
     # split would hold all of it out.
-    desc = ""
     if desc_path.exists():
-        desc = "\n".join(persona_lines(desc_path.read_text(encoding="utf-8"),
-                                       alias=label))
-    if desc:
-        train = train.rstrip("\n") + "\n\n" + desc + "\n"
+        train = _append_persona(train, desc_path.read_text(encoding="utf-8"),
+                                label)
     # Answer-shaped persona examples, spread through the corpus so each one is
     # seen by many windows instead of only the ones that land on it.
-    qa = []
-    if qa_path is not None and Path(qa_path).exists():
-        qa = persona_qa_turns(Path(qa_path).read_text(encoding="utf-8"),
-                              alias=label)
+    qa = _persona_qa_lines(qa_path, label)
     if qa:
         train = spread_turns(train, qa, persona_repeat)
     return (train, val) if val else train
@@ -1013,10 +1039,7 @@ class Trainer:
         self.rank = rank
         self.world = world
         self.epochs = args.epochs
-        # args.epochs means 'to run now'; writing it back as the target shrinks the
-        # goal on every resume.
-        _stored_target = (state or {}).get("epochs_target")
-        self.epochs_target = int(_stored_target) if _stored_target else int(args.epochs)
+        self.epochs_target = self._resolve_epochs_target(args, state)
         self.label_smoothing = args.label_smoothing
         self.log_every = args.log_every
         self.log_best = args.log_best
@@ -1034,25 +1057,58 @@ class Trainer:
         # Spike reference is the best windowed mean, never the best single minibatch:
         # the loss distribution has a long left tail that one lucky batch sets.
         self.best_window = float("inf")
-        self.val_windows = (ValWindows(val_ids, args.block, device,
-                                       labels=val_label_ids)
-                            if val_ids and len(val_ids) > args.block + 1 else None)
+        self.val_windows = self._make_val_windows(args, device, val_ids,
+                                                  val_label_ids)
         self.since_best = 0
         self.stopped_early = False
         self.last_train_loss = float("inf")
 
         # The span objective builds its own sentinel labels, so the completion
         # mask only applies to plain language modelling.
+        self._make_sampler(args, device, rank, world, ids, label_ids,
+                           prefix_ids)
+        self._make_optimizer(args)
+
+        # Restored across resumes so 'best' is not scoped to this process.
+        state = state or {}
+        self._restore_best(state)
+        # Adam moments are not derivable from the weights; the LR schedule is a pure
+        # function of the step counter, so it needs no state.
+        self._restore_optimizer(state)
+        # True per-step window, sized independently of --log-every, which only sets
+        # how often a line prints. Bounded so it cannot grow with the run.
+        self.window_n = max(16, min(args.log_every, 256))
+        self.recent = deque(maxlen=self.window_n)
+        self.run_start = time.perf_counter()
+        self.window_start = self.run_start
+        self.last_logged_step = start_step
+
+    @staticmethod
+    def _resolve_epochs_target(args, state):
+        # args.epochs means 'to run now'; writing it back as the target shrinks the
+        # goal on every resume.
+        _stored_target = (state or {}).get("epochs_target")
+        return int(_stored_target) if _stored_target else int(args.epochs)
+
+    def _make_val_windows(self, args, device, val_ids, val_label_ids):
+        if val_ids and len(val_ids) > args.block + 1:
+            return ValWindows(val_ids, args.block, device,
+                              labels=val_label_ids)
+        return None
+
+    def _make_sampler(self, args, device, rank, world, ids, label_ids,
+                      prefix_ids):
         self.sampler = BatchSampler(ids, args.block, args.batch, device,
                                     rank=rank, world=world,
                                     labels=label_ids
                                     if self.objective == "lm" else None,
                                     prefix=prefix_ids)
         self.batches_per_epoch = self.sampler.batches_per_epoch()
-        self.total_steps = start_step + self.epochs * self.batches_per_epoch
+        self.total_steps = self.start_step + self.epochs * self.batches_per_epoch
 
+    def _make_optimizer(self, args):
         # Adam with beta2 tuned for transformer training (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
-        trainable = [p for p in model.parameters() if p.requires_grad]
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
             trainable, lr=args.lr, betas=(0.9, 0.95), eps=1e-9,
             weight_decay=1e-2,
@@ -1063,29 +1119,22 @@ class Trainer:
         self.base_lr = (args.lr * math.sqrt(args.warmup_steps)
                         if args.warmup_steps > 0 else args.lr)
 
-        # Restored across resumes so 'best' is not scoped to this process.
-        state = state or {}
+    def _restore_best(self, state):
         self.best = _opt_float(state.get("best"), float("inf"))
         self.best_step = int(state.get("best_step") or 0)
         self.best_val = _opt_float(state.get("best_val"), float("inf"))
         # Kept for the summary; best and last drifting apart is the expected signal.
         self.last_val = float("nan")
-        # Adam moments are not derivable from the weights; the LR schedule is a pure
-        # function of the step counter, so it needs no state.
-        if state.get("optim"):
-            try:
-                self.optimizer.load_state_dict(state["optim"])
-            except (ValueError, KeyError):
-                # Param groups changed shape; a fresh optimizer is the safe
-                # fallback, so keep going rather than refusing to resume.
-                pass
-        # True per-step window, sized independently of --log-every, which only sets
-        # how often a line prints. Bounded so it cannot grow with the run.
-        self.window_n = max(16, min(args.log_every, 256))
-        self.recent = deque(maxlen=self.window_n)
-        self.run_start = time.perf_counter()
-        self.window_start = self.run_start
-        self.last_logged_step = start_step
+
+    def _restore_optimizer(self, state):
+        if not state.get("optim"):
+            return
+        try:
+            self.optimizer.load_state_dict(state["optim"])
+        except (ValueError, KeyError):
+            # Param groups changed shape; a fresh optimizer is the safe
+            # fallback, so keep going rather than refusing to resume.
+            pass
 
     def _schedule_lr(self, step):
         # LR schedules after linear warmup (Attention, 5.3 https://arxiv.org/abs/1706.03762;
@@ -1195,54 +1244,79 @@ class Trainer:
         opt_steps = 0
         for epoch in range(1, self.epochs + 1):
             epoch_start = time.perf_counter()
-            total = 0.0
-            batches = 0
-            accum = 0
-            for inputs, targets in self.sampler:
-                steps += 1
-                self._schedule_lr(steps)
-                if self.objective == "span":
-                    rows = [span_corrupt_pair(row, encoder=self.tokenizer)
-                            for row in inputs]
-                    inputs, targets = collate_span(rows, self.tokenizer)
-                loss = self._train_step(inputs, targets)
-                self.last_train_loss = loss.item() * self.grad_accum
-                # Runaway guard: clip_grad_norm_ bounds gradient size but cannot un-NaN the
-                # weights, and --keep-last would then save an all-NaN checkpoint.
-                if math.isfinite(self.last_train_loss):
-                    self.recent.append(self.last_train_loss)
-                if self._diverged(self.last_train_loss, steps, epoch):
-                    self.diverged = True
-                    print(f"\nDIVERGED at step {steps:,} epoch {epoch}: train "
-                          f"loss {self.last_train_loss}. Aborting without "
-                          f"saving so the retained checkpoint stays usable.",
-                          flush=True)
-                    return self.last_train_loss, steps
-                total += loss.item()
-                batches += 1
-                accum += 1
-                stepped = False
-                if accum % self.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    opt_steps += 1
-                    stepped = True
-                if self.log_every and steps % self.log_every == 0:
-                    self._log_step(steps, epoch, loss.item())
-                # --val-every counts optimizer steps; steps counts micro-batches.
-                if stepped and opt_steps % self.val_every == 0:
-                    if self._maybe_validate(steps, epoch):
-                        # last_train_loss, not self.best: best is only set at an epoch boundary.
-                        return self.last_train_loss, steps
+            result = self._fit_epoch(epoch, opt_steps, steps)
+            if result is None:
+                return self.last_train_loss, steps
+            total, batches, accum, steps, opt_steps = result
             if accum % self.grad_accum != 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                self._optimizer_step()
                 opt_steps += 1
             avg = total / max(batches, 1)
             self._end_epoch(epoch, steps, avg, epoch_start)
         return self.last_train_loss, steps
+
+    def _fit_epoch(self, epoch, opt_steps, steps):
+        total = 0.0
+        batches = 0
+        accum = 0
+        for inputs, targets in self.sampler:
+            steps += 1
+            self._schedule_lr(steps)
+            if self.objective == "span":
+                inputs, targets = self._corrupt_span(inputs)
+            loss = self._train_step(inputs, targets)
+            self._record_loss(loss)
+            # Runaway guard: clip_grad_norm_ bounds gradient size but cannot un-NaN the
+            # weights, and --keep-last would then save an all-NaN checkpoint.
+            if self._diverged(self.last_train_loss, steps, epoch):
+                self._abort_diverged(steps, epoch)
+                return None
+            total += loss.item()
+            batches += 1
+            accum += 1
+            stepped = False
+            if accum % self.grad_accum == 0:
+                self._optimizer_step()
+                opt_steps += 1
+                stepped = True
+            self._maybe_log(steps, epoch, loss.item())
+            # --val-every counts optimizer steps; steps counts micro-batches.
+            if self._stop_after_validate(steps, epoch, stepped, opt_steps):
+                # last_train_loss, not self.best: best is only set at an epoch boundary.
+                return None
+        return total, batches, accum, steps, opt_steps
+
+    def _corrupt_span(self, inputs):
+        rows = [span_corrupt_pair(row, encoder=self.tokenizer)
+                for row in inputs]
+        return collate_span(rows, self.tokenizer)
+
+    def _record_loss(self, loss):
+        self.last_train_loss = loss.item() * self.grad_accum
+        if math.isfinite(self.last_train_loss):
+            self.recent.append(self.last_train_loss)
+
+    def _optimizer_step(self):
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+    def _abort_diverged(self, steps, epoch):
+        self.diverged = True
+        print(f"\nDIVERGED at step {steps:,} epoch {epoch}: train "
+              f"loss {self.last_train_loss}. Aborting without "
+              f"saving so the retained checkpoint stays usable.",
+              flush=True)
+
+    def _maybe_log(self, steps, epoch, step_loss):
+        if self.log_every and steps % self.log_every == 0:
+            self._log_step(steps, epoch, step_loss)
+
+    def _stop_after_validate(self, steps, epoch, stepped, opt_steps):
+        if stepped and opt_steps % self.val_every == 0:
+            if self._maybe_validate(steps, epoch):
+                return True
+        return False
 
     def _diverged(self, loss, steps, epoch):
         # Non-finite is a hard stop; the spike check only counts, so one bad
@@ -1388,23 +1462,43 @@ SIZE_PRESETS = {
 ARCH_KEYS = ("d_model", "n_layers", "n_heads", "d_ff")
 
 
+def _resolve_stored_block(args, state, rank):
+    # A checkpoint fixes the architecture, so its context wins over a flag.
+    stored = state["cfg"].get("max_len")
+    if not stored:
+        return
+    if args.block is not None and args.block != stored:
+        if rank == 0:
+            print(f"resume: --block {args.block} ignored; checkpoint "
+                  f"trained with context {stored}", flush=True)
+    args.block = stored
+
+
 def resolve_block(args, state, rank):
     # --block owns max_len; the size preset must not override it or RoPE is sized
     # for a context the data does not use.
     if state is not None:
-        # A checkpoint fixes the architecture, so its context wins over a flag.
-        stored = state["cfg"].get("max_len")
-        if stored and args.block is not None and args.block != stored:
-            if rank == 0:
-                print(f"resume: --block {args.block} ignored; checkpoint "
-                      f"trained with context {stored}", flush=True)
-            args.block = stored
-        elif stored:
-            args.block = stored
+        _resolve_stored_block(args, state, rank)
         return
     if args.block is None:
         preset = SIZE_PRESETS.get(args.size) or {}
         args.block = preset.get("max_len", 128)
+
+
+def _apply_size_preset(args, cfg, size):
+    if not size:
+        return
+    for k, v in size.items():
+        # max_len is owned by --block; see resolve_block.
+        if k == "max_len":
+            continue
+        src = getattr(args, "arch_src", {}).get(k)
+        if src == "cli":
+            continue                        # --d-model on the flag line
+        if getattr(args, "size_cli", False):
+            cfg[k] = v                      # --size on the flag line beats
+        elif src is None:                   # a config file, which only
+            cfg[k] = v                      # outranks the preset as a default
 
 
 def build_cfg(args, tokenizer):
@@ -1433,17 +1527,7 @@ def build_cfg(args, tokenizer):
         "tokenizer_arch": "bpe",
     }
     if size:
-        for k, v in size.items():
-            # max_len is owned by --block; see resolve_block.
-            if k == "max_len":
-                continue
-            src = getattr(args, "arch_src", {}).get(k)
-            if src == "cli":
-                continue                        # --d-model on the flag line
-            if getattr(args, "size_cli", False):
-                cfg[k] = v                      # --size on the flag line beats
-            elif src is None:                   # a config file, which only
-                cfg[k] = v                      # outranks the preset as a default
+        _apply_size_preset(args, cfg, size)
     return cfg
 
 
@@ -1564,6 +1648,24 @@ def resolve_config_args(ap, argv=None, default_path=None):
     return args
 
 
+def _default_for(defaults, action):
+    if defaults and action.dest in defaults:
+        return defaults[action.dest]
+    return action.default
+
+
+def _to_relative_path(value, root):
+    if not isinstance(value, str):
+        return value
+    try:
+        candidate = Path(value).resolve()
+        if candidate.is_relative_to(root):
+            return candidate.relative_to(root).as_posix()
+    except (OSError, ValueError):
+        pass
+    return value
+
+
 def dump_config(ap, path, defaults=None):
     # Relative paths, so a committed example works on any machine instead of
     # pinning the absolute layout of whoever generated it.
@@ -1573,19 +1675,29 @@ def dump_config(ap, path, defaults=None):
     for action in ap._actions:
         if action.dest in _META_KEYS:
             continue
-        value = (defaults[action.dest] if defaults and action.dest in defaults
-                 else action.default)
-        if isinstance(value, str):
-            try:
-                candidate = Path(value).resolve()
-                if candidate.is_relative_to(root):
-                    value = candidate.relative_to(root).as_posix()
-            except (OSError, ValueError):
-                pass
+        value = _to_relative_path(_default_for(defaults, action), root)
         body[action.dest] = value
     ordered = {k: body[k] for k in sorted(body)}
     Path(path).write_text(json.dumps(ordered, indent=2) + "\n", encoding="utf-8")
     return ordered
+
+
+def _arch_sources(args, argv):
+    """flag > config > --size preset, and each key records which of the three
+    it came from."""
+    tokens = set(sys.argv[1:] if argv is None else argv)
+    return {
+        k: ("cli" if f"--{k.replace('_', '-')}" in tokens else "config")
+        for k in ARCH_KEYS
+        if f"--{k.replace('_', '-')}" in tokens or k in args._from_config
+    }, "--size" in tokens
+
+
+def _maybe_dump_config(ap, args, builtin_defaults):
+    if args.dump_config:
+        written = dump_config(ap, args.dump_config, builtin_defaults)
+        print(f"wrote {len(written)} options to {args.dump_config}")
+        raise SystemExit(0)
 
 
 def parse_args(argv=None, config=None):
@@ -1715,19 +1827,8 @@ def parse_args(argv=None, config=None):
     args = ap.parse_args(argv)
     # Remember which keys came from a config file, to tell 'asked for' from default.
     args._from_config = set(config or ())
-    # flag > config > --size preset, and each key records which of the three it
-    # came from.
-    tokens = set(sys.argv[1:] if argv is None else argv)
-    args.arch_src = {
-        k: ("cli" if f"--{k.replace('_', '-')}" in tokens else "config")
-        for k in ARCH_KEYS
-        if f"--{k.replace('_', '-')}" in tokens or k in args._from_config
-    }
-    args.size_cli = "--size" in tokens
-    if args.dump_config:
-        written = dump_config(ap, args.dump_config, builtin_defaults)
-        print(f"wrote {len(written)} options to {args.dump_config}")
-        raise SystemExit(0)
+    args.arch_src, args.size_cli = _arch_sources(args, argv)
+    _maybe_dump_config(ap, args, builtin_defaults)
     return args
 
 
@@ -1832,6 +1933,26 @@ def _print_resume_override(args, stored_epochs, rank):
           flush=True)
 
 
+def _report_remaining_epochs(args, rank, stored_target, stored_spe,
+                            stored_step):
+    if rank != 0:
+        return
+    done = stored_step / stored_spe
+    print(f"resume: {done:.2f} of {stored_target} epoch(s) done "
+          f"({stored_step:,}/{stored_target * stored_spe:,} steps), "
+          f"running {args.epochs} more (pass --epochs to add more)",
+          flush=True)
+
+
+def _report_legacy_epochs(args, rank, stored_done):
+    if rank != 0:
+        return
+    print(f"resume: checkpoint predates per-epoch tracking; its epoch "
+          f"count ({stored_done}) was the request, not progress, so "
+          f"training that many more. Pass --epochs to be precise.",
+          flush=True)
+
+
 def reconcile_epochs(args, state, rank):
     # Explicit --epochs wins, else the remaining shortfall of the original target.
     stored_done = state.get("epochs") or 0
@@ -1845,21 +1966,13 @@ def reconcile_epochs(args, state, rank):
         # Shortfall in steps, not epochs: the best checkpoint sits in a partial epoch.
         remaining = max(0, stored_target * stored_spe - stored_step)
         args.epochs = max(1, remaining // stored_spe)
-        if rank == 0:
-            done = stored_step / stored_spe
-            print(f"resume: {done:.2f} of {stored_target} epoch(s) done "
-                  f"({stored_step:,}/{stored_target * stored_spe:,} steps), "
-                  f"running {args.epochs} more (pass --epochs to add more)",
-                  flush=True)
+        _report_remaining_epochs(args, rank, stored_target, stored_spe,
+                                 stored_step)
         return
     if stored_done:
         # Legacy checkpoint: epochs recorded the request, not completed work.
         args.epochs = stored_done
-        if rank == 0:
-            print(f"resume: checkpoint predates per-epoch tracking; its epoch "
-                  f"count ({stored_done}) was the request, not progress, so "
-                  f"training that many more. Pass --epochs to be precise.",
-                  flush=True)
+        _report_legacy_epochs(args, rank, stored_done)
 
 
 def _flag_given(argv, name):
@@ -1953,6 +2066,50 @@ def report_setup(args, cfg, rank, n_train, n_total):
     print(f"trainable params: {n_train:,} / {n_total:,}")
 
 
+def _announce_start(args, trainer, rank):
+    if rank != 0:
+        return
+    print(f"training for {args.epochs} epochs (~{trainer.total_steps:,} steps)")
+    if trainer.val_windows is not None:
+        print(f"validation: {trainer.val_windows.num_windows} held-out windows, "
+              f"every {trainer.val_every} steps, patience {trainer.patience}")
+    else:
+        print("validation: DISABLED (--val-fraction 0) - training loss is "
+              "the only signal and early stopping is off")
+
+
+def _finalize_checkpoint(args, trainer, final_loss, steps_done, rank):
+    if rank != 0:
+        return
+    if trainer.val_windows is None:
+        trainer.save(final_loss, steps_done)
+        print(f"saved checkpoint: {args.ckpt} (loss {final_loss:.4f}, "
+              f"{steps_done:,} steps)")
+    elif trainer.best_step:
+        if trainer.diverged:
+            # Nothing to write: the weights are not trustworthy and the
+            # retained checkpoint is the last good one.
+            print(f"kept previous checkpoint: {args.ckpt} (run diverged at "
+                  f"step {steps_done:,}; weights not saved)")
+        elif args.keep_last:
+            # Best-val retention is backwards for a memorization model; --keep-last
+            # writes the final weights instead.
+            if trainer.save(final_loss, steps_done):
+                print(f"saved final weights: {args.ckpt} (train loss "
+                      f"{final_loss:.4f}, {steps_done:,} steps)")
+        else:
+            # _maybe_validate already wrote the retained checkpoint.
+            print(f"retained checkpoint: {args.ckpt} (best val "
+                  f"{trainer.best_val:.4f} at step {trainer.best_step:,}; "
+                  f"stopped at {steps_done:,})")
+
+
+def _teardown_process(args):
+    if args.ddp:
+        import torch.distributed as dist
+        dist.destroy_process_group()
+
+
 def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
                  val_ids=None, label_ids=None, val_label_ids=None,
                  prefix_ids=None):
@@ -1962,61 +2119,103 @@ def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
                       rank=rank, world=world, val_ids=val_ids, state=state,
                       label_ids=label_ids, val_label_ids=val_label_ids,
                       prefix_ids=prefix_ids)
-    if rank == 0:
-        print(f"training for {args.epochs} epochs (~{trainer.total_steps:,} steps)")
-        if trainer.val_windows is not None:
-            print(f"validation: {trainer.val_windows.num_windows} held-out windows, "
-                  f"every {trainer.val_every} steps, patience {trainer.patience}")
-        else:
-            print("validation: DISABLED (--val-fraction 0) - training loss is "
-                  "the only signal and early stopping is off")
+    _announce_start(args, trainer, rank)
     t0 = time.perf_counter()
     final_loss, steps_done = trainer.fit()
     elapsed = time.perf_counter() - t0
 
+    _finalize_checkpoint(args, trainer, final_loss, steps_done, rank)
     if rank == 0:
-        if trainer.val_windows is None:
-            trainer.save(final_loss, steps_done)
-            print(f"saved checkpoint: {args.ckpt} (loss {final_loss:.4f}, "
-                  f"{steps_done:,} steps)")
-        elif trainer.best_step:
-            if trainer.diverged:
-                # Nothing to write: the weights are not trustworthy and the
-                # retained checkpoint is the last good one.
-                print(f"kept previous checkpoint: {args.ckpt} (run diverged at "
-                      f"step {steps_done:,}; weights not saved)")
-            elif args.keep_last:
-                # Best-val retention is backwards for a memorization model; --keep-last
-                # writes the final weights instead.
-                if trainer.save(final_loss, steps_done):
-                    print(f"saved final weights: {args.ckpt} (train loss "
-                          f"{final_loss:.4f}, {steps_done:,} steps)")
-            else:
-                # _maybe_validate already wrote the retained checkpoint.
-                print(f"retained checkpoint: {args.ckpt} (best val "
-                      f"{trainer.best_val:.4f} at step {trainer.best_step:,}; "
-                      f"stopped at {steps_done:,})")
-            # final_loss stays the train loss from fit().
+        # final_loss stays the train loss from fit().
         print_summary(args, cfg, tok, len(ids), trainable_count(model),
                       total_count(model), final_loss, steps_done,
                       state["step"] if state else 0, device, elapsed,
                       trainer=trainer)
-    if args.ddp:
-        import torch.distributed as dist
-        dist.destroy_process_group()
+    _teardown_process(args)
 
 
-def main(argv=None):
+def _init_stdout():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
         pass
 
-    args = parse_args(argv)
+
+def _epochs_explicit(args, argv):
     # was --epochs passed on the CLI? resume must not silently override it
-    args.epochs_explicit = ("--epochs" in (sys.argv[1:] if argv is None else argv)
-                            # A config-supplied epochs means the same as the flag.
-                            or "epochs" in getattr(args, "_from_config", ()))
+    return ("--epochs" in (sys.argv[1:] if argv is None else argv)
+            # A config-supplied epochs means the same as the flag.
+            or "epochs" in getattr(args, "_from_config", ()))
+
+
+def _split_corpus(corpus):
+    if isinstance(corpus, tuple):
+        return corpus[0], corpus[1]
+    return corpus, ""
+
+
+def _masked_labels(tok, text, her_name):
+    ids, flags = tok.encode_masked(text, target_char_mask(text, her_name))
+    label_ids = [i if f else -100 for i, f in zip(ids, flags)]
+    return ids, label_ids
+
+
+def _encode_corpus(args, corpus, val_corpus, her_name, tok):
+    """Tokenize train/val corpora; masks make the loss completion-only."""
+    mask_on = bool(getattr(args, "target_only_loss", False)) \
+        and args.objective == "lm"
+    if mask_on:
+        ids, label_ids = _masked_labels(tok, corpus, her_name)
+        val_ids, val_label_ids = (_masked_labels(tok, val_corpus, her_name)
+                                  if val_corpus else (None, None))
+        scored = sum(1 for x in label_ids if x != -100)
+    else:
+        ids = tok.encode(corpus)
+        val_ids = tok.encode(val_corpus) if val_corpus else None
+        label_ids = val_label_ids = None
+        scored = len(ids)
+    return ids, label_ids, val_ids, val_label_ids, scored, mask_on
+
+
+def _persona_prefix_ids(args, her_name, tok):
+    # Persona prefix: the same fact sheet that chatbot.py puts at the head of an
+    # inference prompt, so training and inference see one identical layout.
+    if not getattr(args, "persona_prefix", False):
+        return None
+    desc = Path(args.description)
+    if not desc.exists():
+        return None
+    head = "\n".join(persona_lines(desc.read_text(encoding="utf-8"),
+                                   alias=her_name)) + "\n"
+    prefix_ids = tok.encode(head)
+    budget = max(1, args.block // 2)
+    if len(prefix_ids) > budget:
+        prefix_ids = prefix_ids[-budget:]
+    return prefix_ids
+
+
+def _report_corpus(args, rank, tok, ids, scored, prefix_ids, val_ids, mask_on):
+    if rank != 0:
+        return
+    print(f"corpus: {len(ids):,} tokens, vocab {tok.vocab_size:,}")
+    if mask_on:
+        print(f"loss: completion-only, {scored:,} of {len(ids):,} tokens "
+              f"scored ({100 * scored / max(len(ids), 1):.1f}%) - the rest "
+              f"are {speaker_names()[0]}'s turns and persona labels")
+    if prefix_ids:
+        print(f"persona prefix: {len(prefix_ids)} tokens on every window, "
+              f"masked from the loss; {max(1, args.block - len(prefix_ids))} "
+              f"tokens of dialogue per window")
+    if val_ids:
+        print(f"held out: {len(val_ids):,} tokens for validation "
+              f"({100 * len(val_ids) / (len(ids) + len(val_ids)):.1f}%)")
+
+
+def main(argv=None):
+    _init_stdout()
+
+    args = parse_args(argv)
+    args.epochs_explicit = _epochs_explicit(args, argv)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     # before load_corpus, which labels the persona turns
@@ -2030,10 +2229,7 @@ def main(argv=None):
     corpus = load_corpus(args)
     # With a validation split, fit the tokenizer on train text only so no
     # held-out tokens can leak into the vocabulary.
-    if isinstance(corpus, tuple):
-        corpus, val_corpus = corpus
-    else:
-        val_corpus = ""
+    corpus, val_corpus = _split_corpus(corpus)
     tok = load_tokenizer(args, corpus, state, rank)
     cfg, model = resolve_model(args, state, tok, rank, argv)
 
@@ -2049,46 +2245,10 @@ def main(argv=None):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local])
 
     her_name = speaker_names()[1]
-    mask_on = bool(getattr(args, "target_only_loss", False)) and args.objective == "lm"
-    if mask_on:
-        ids, flags = tok.encode_masked(corpus, target_char_mask(corpus, her_name))
-        label_ids = [i if f else -100 for i, f in zip(ids, flags)]
-        val_ids, val_flags = (tok.encode_masked(val_corpus,
-                                               target_char_mask(val_corpus, her_name))
-                              if val_corpus else (None, None))
-        val_label_ids = ([i if f else -100 for i, f in zip(val_ids, val_flags)]
-                         if val_ids else None)
-        scored = sum(1 for x in label_ids if x != -100)
-    else:
-        ids = tok.encode(corpus)
-        val_ids = tok.encode(val_corpus) if val_corpus else None
-        label_ids = val_label_ids = None
-        scored = len(ids)
-    # Persona prefix: the same fact sheet that chatbot.py puts at the head of an
-    # inference prompt, so training and inference see one identical layout.
-    prefix_ids = None
-    if getattr(args, "persona_prefix", False):
-        desc = Path(args.description)
-        if desc.exists():
-            head = "\n".join(persona_lines(desc.read_text(encoding="utf-8"),
-                                          alias=her_name)) + "\n"
-            prefix_ids = tok.encode(head)
-            budget = max(1, args.block // 2)
-            if len(prefix_ids) > budget:
-                prefix_ids = prefix_ids[-budget:]
-    if rank == 0:
-        print(f"corpus: {len(ids):,} tokens, vocab {tok.vocab_size:,}")
-        if mask_on:
-            print(f"loss: completion-only, {scored:,} of {len(ids):,} tokens "
-                  f"scored ({100 * scored / max(len(ids), 1):.1f}%) - the rest "
-                  f"are {speaker_names()[0]}'s turns and persona labels")
-        if prefix_ids:
-            print(f"persona prefix: {len(prefix_ids)} tokens on every window, "
-                  f"masked from the loss; {max(1, args.block - len(prefix_ids))} "
-                  f"tokens of dialogue per window")
-        if val_ids:
-            print(f"held out: {len(val_ids):,} tokens for validation "
-                  f"({100 * len(val_ids) / (len(ids) + len(val_ids)):.1f}%)")
+    ids, label_ids, val_ids, val_label_ids, scored, mask_on = \
+        _encode_corpus(args, corpus, val_corpus, her_name, tok)
+    prefix_ids = _persona_prefix_ids(args, her_name, tok)
+    _report_corpus(args, rank, tok, ids, scored, prefix_ids, val_ids, mask_on)
 
     run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
                  val_ids=val_ids, label_ids=label_ids,
