@@ -5,7 +5,23 @@ from pathlib import Path
 
 from data import speaker_names
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def _find_project_root(start):
+    # The pre-restructure entry scripts resolved data/ and configs/ next to
+    # themselves, i.e. at the repo root. Installed console scripts run copies of
+    # these modules from site-packages, so anchor on the working tree instead:
+    # walk up from the cwd to the project's pyproject.toml, falling back to this
+    # module's own checkout only when the cwd is outside the project.
+    for base in (start, *start.parents):
+        if (base / "pyproject.toml").exists():
+            return base
+    return None
+
+
+PROJECT_ROOT = (
+    _find_project_root(Path.cwd())
+    or _find_project_root(Path(__file__).resolve().parent)
+    or Path(__file__).resolve().parents[1]
+)
 
 DEFAULT_DATA = PROJECT_ROOT / "data" / "input" / "wa_out.txt"
 DEFAULT_CKPT = PROJECT_ROOT / "data" / "her_model.pt"
