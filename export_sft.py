@@ -226,7 +226,7 @@ def _tally(convs):
 
 def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
             train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
-            parsed_total, persona):
+            parsed_total, persona, her_name):
     print(f"wrote {len(rows)} conversations to {out}  ({fmt} format)")
     print(f"  turns parsed        {len(turns):,}")
     print(f"  continuation kept   {stats['continuation']} lines (her.py drops these)")
@@ -304,7 +304,7 @@ def main(argv=None):
     train_chars, kept_chars, turns_per, msg_chars = _tally(convs)
     _report(args, rows, args.out, args.format, stats, turns, orphans, too_long,
             train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
-            parsed_total, persona)
+            parsed_total, persona, her_name)
 
 
 if __name__ == "__main__":
