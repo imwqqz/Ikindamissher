@@ -1,11 +1,10 @@
 * Attention Is All You Need                          https://arxiv.org/abs/1706.03762
-    scaled dot-product / multi-head attention (3.2), residual+LayerNorm blocks (3.1),
+    scaled dot-product / multi-head attention (3.2), residual blocks (3.1),
     FFN (3.3), scaling embeddings by sqrt(d_model) and weight tying (3.4),
-    positional encoding (3.5), Adam + warmup/inverse-sqrt LR (5.3),
-    label smoothing + dropout (5.4)
+    Adam + warmup/inverse-sqrt LR (5.3), label smoothing + dropout (5.4)
 * Exploring the Limits of Transfer Learning with a
   Unified Text-to-Text Transformer (T5)              https://arxiv.org/abs/2005.14165
-    text-to-text framing, simplified LayerNorm without bias (2.1),
+    text-to-text framing, bias-free pre-norm normalization (2.1),
     pre-norm placement + GELU activation (3.1), span corruption (3.2),
     training strategy / inverse-sqrt decay / dropout (3.4)
 * LoRA: Low-Rank Adaptation of Large Language Models https://arxiv.org/abs/2106.09685
@@ -13,8 +12,19 @@
     practical benefits: fewer trainable params (4.3)
 * QLoRA: Efficient Finetuning of Quantized LLMs     https://arxiv.org/abs/2305.18290
     4-bit NormalFloat (NF4) block-wise quantization (3.1),
-    double quantization of the constants (3.2), paged optimizers (3.3),
+    double quantization of the constants (3.2),
     frozen base + trainable adapters (3.4 / Algorithm 1)
+* RoFormer: Enhanced Transformer with Rotary Position Embedding
+                                                     https://arxiv.org/abs/2104.09864
+    rotary position embedding: pairs of dims rotate by base^(-2i/d),
+    relative-position invariance (the q/k rotary in model.py)
+* The Curious Case of Neural Text Degeneration        https://arxiv.org/abs/1904.09751
+    nucleus (top-p) sampling (3.1) and the repetition/presence penalty (5)
+* SGDR: Stochastic Gradient Descent with Warm Restarts https://arxiv.org/abs/1608.03983
+    cosine annealing (2.1), the --schedule cosine option
+* Neural Machine Translation of Rare Words with
+  Subword Units (BPE)                                https://arxiv.org/abs/1508.07909
+    byte-pair encoding (3), the tokenizer's merge loop
 
 
 ```text

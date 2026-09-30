@@ -293,6 +293,9 @@ class Trainer:
 
     def _make_optimizer(self, args):
         # Adam with beta2 tuned for transformer training (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
+        # TODO: REVIEW: the paper's section 5.3 states beta1=0.9, beta2=0.98,
+        # eps=1e-9; this call uses beta2=0.95 and adds weight_decay=1e-2
+        # (AdamW, not in the paper). The citation is what differs, not the recipe.
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
             trainable, lr=args.lr, betas=(0.9, 0.95), eps=1e-9,
