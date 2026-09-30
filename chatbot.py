@@ -4,23 +4,31 @@ import re
 import sys
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parent
+for _p in (str(_ROOT / "src"), str(_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import torch
 
-from her import (
+from config import (
     DEFAULT_CKPT,
     DEFAULT_DATA,
     DEFAULT_DESC,
-    build_model,
-    bpe_from_state,
+    PROJECT_ROOT,
+    resolve_config_args,
+)
+from data import (
     configure_speakers,
     detect_user,
     parse_wa,
     persona_lines,
-    resolve_config_args,
     speaker_names,
 )
+from model import build_model
+from tokenizer import bpe_from_state
 
-CHAT_CONFIG = Path(__file__).parent / "chatbot.config.json"
+CHAT_CONFIG = PROJECT_ROOT / "configs" / "chatbot.config.json"
 
 BOT_LABEL = "her"
 
