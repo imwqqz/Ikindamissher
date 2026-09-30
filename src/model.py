@@ -14,11 +14,18 @@ NF4_LEVELS = torch.tensor([
     0.7229568362236023, 1.0,
 ])
 # 3. RoPE, Attention Is All You Need, section 3.5 (positional encoding lineage) https://arxiv.org/abs/1706.03762
+# TODO: REVIEW: RoPE is not from "Attention Is All You Need" (section 3.5 there
+# is fixed sinusoidal absolute encoding); RoPE is "RoFormer: Enhanced
+# Transformer with Rotary Position Embedding" (Su et al., 2021,
+# https://arxiv.org/abs/2104.09864). Behaviour is correct RoPE; the citation is not.
 def _rotate_half(x):
     x1, x2 = x[..., 0::2], x[..., 1::2]
     return torch.stack([-x2, x1], dim=-1).flatten(-2)
 
 # Rope, Params-Free Attention Is All You Need, sections 3.4-3.5 https://arxiv.org/abs/1706.03762
+# TODO: REVIEW: same as above -- RoPE cites "Attention Is All You Need"
+# sections 3.4-3.5, but those cover embedding sqrt-scaling/weight tying and
+# sinusoidal positions. RoPE source is RoFormer, https://arxiv.org/abs/2104.09864.
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_len: int, base: float = 10000.0):
         super().__init__()
@@ -35,6 +42,9 @@ class RotaryEmbedding(nn.Module):
         return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
 # No-bias normalization used in pre-norm blocks (T5, section 2.1 https://arxiv.org/abs/2005.14165).
+# TODO: REVIEW: T5 section 2.1 is a bias-free *LayerNorm* (mean-centred,
+# learned scale); this is RMSNorm (no mean subtraction, no bias), i.e. the
+# LLaMA-family normalisation, not T5's. Comment only; behaviour unchanged.
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -218,6 +228,8 @@ class FeedForward(nn.Module):
         return self.w2(F.gelu(self.w1(x)))
 
 # Pre-norm residual transformer block (T5, section 3.1 https://arxiv.org/abs/2005.14165; residual + LayerNorm, Attention Is All You Need, section 3.1 https://arxiv.org/abs/1706.03762)
+# TODO: REVIEW: "LayerNorm" here is RMSNorm (see the RMSNorm note above); the
+# pre-norm placement is as cited, the normalization is not LayerNorm.
 class Block(nn.Module):
 
     def __init__(self, cfg, rotary: RotaryEmbedding):
