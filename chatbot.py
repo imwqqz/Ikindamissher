@@ -209,7 +209,9 @@ def generate_reply(args, state, model, tokenizer, prompt, history, corpus_text, 
         stop_ids=tokenizer.stop_ids(),
     )
     reply = re.sub(r"^[:\s]+", "", tokenizer.decode(gen).strip())
-    return re.split(rf"(?:\n|{re.escape(user_name)}:)", reply)[0].strip()
+    # Keep the newlines inside her turn (they separate her messages); cut only
+    # if generation ran on into a user turn, which the sentinel should prevent.
+    return re.split(rf"\n{re.escape(user_name)}:", reply)[0].strip()
 
 
 def load_openers(args):
@@ -253,7 +255,7 @@ def generate_proactive(args, state, model, tokenizer, openers, device):
     )
     user_name, _ = speaker_names()
     reply = re.sub(r"^[:\s]+", "", tokenizer.decode(gen).strip())
-    reply = re.split(rf"(?:\n|{re.escape(user_name)}:)", reply)[0].strip()
+    reply = re.split(rf"\n{re.escape(user_name)}:", reply)[0].strip()
     if reply:
         return reply
     # Sampling can return nothing (immediate stop); a real opener is faithful.
