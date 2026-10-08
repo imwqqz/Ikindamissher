@@ -1,4 +1,5 @@
 import math
+import random
 import time
 from collections import deque
 from pathlib import Path
@@ -170,6 +171,26 @@ def _finite_or_none(value):
         return None
     value = float(value)
     return None if value == float("inf") else value
+def _capture_rng():
+    # Resume must continue the RNG stream, not replay the seed: shuffling and
+    # dropout both draw from these generators.
+    state = {"torch": torch.get_rng_state(), "python": random.getstate()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng(state):
+    rng = state.get("rng")
+    if not rng:
+        return
+    try:
+        torch.set_rng_state(rng["torch"])
+        if "cuda" in rng and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng["cuda"])
+        random.setstate(rng["python"])
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        pass
 class ValWindows:
     # stride == block, no shuffle, so every validation token is predicted once.
     # Yields exactly block tokens: block+1 overflows RoPE at max_len == block.
@@ -272,6 +293,7 @@ class Trainer:
         # function of the step counter, so it needs no state.
         self._restore_optimizer(state)
         self._restore_scaler(state)
+        _restore_rng(state)
         # True per-step window, sized independently of --log-every, which only sets
         # how often a line prints. Bounded so it cannot grow with the run.
         self.window_n = max(16, min(args.log_every, 256))
@@ -648,7 +670,8 @@ class Trainer:
              "best_val": _finite_or_none(self.best_val),
              "best_step": self.best_step,
              "optim": self.optimizer.state_dict(),
-             "scaler": self.scaler.state_dict()},
+             "scaler": self.scaler.state_dict(),
+             "rng": _capture_rng()},
             self.ckpt,
         )
         return True
