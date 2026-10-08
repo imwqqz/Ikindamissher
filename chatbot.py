@@ -1,8 +1,10 @@
 import argparse
+import math
 import random
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -65,23 +67,57 @@ def chat_pairs(text):
             if turns[i][0] == her_name and turns[i - 1][0] == user_name]
 
 
+def _idf_weights(pairs, tokenizer):
+    """Inverse document frequency per token across the demo questions.
+
+    Rare tokens (a topic word) weigh more than filler, so a demo that shares
+    the actual subject beats a generic greeting that matches everything.
+    """
+    document_counts = Counter()
+    for question, _ in pairs:
+        document_counts.update(set(tokenizer.encode(question)))
+    total = max(1, len(pairs))
+    return {token: math.log((total + 1) / (count + 1)) + 1.0
+            for token, count in document_counts.items()}
+
+
+def _weighted_overlap(prompt_tokens, question_tokens, weights):
+    """Cosine similarity over IDF-weighted token multisets."""
+    if not prompt_tokens or not question_tokens:
+        return 0.0
+    prompt_counts = Counter(prompt_tokens)
+    question_counts = Counter(question_tokens)
+    shared = sum(weights.get(token, 1.0)
+                 * min(prompt_counts[token], question_counts[token])
+                 for token in prompt_counts)
+    norm_p = math.sqrt(sum(weights.get(t, 1.0) * c * c
+                           for t, c in prompt_counts.items()))
+    norm_q = math.sqrt(sum(weights.get(t, 1.0) * c * c
+                           for t, c in question_counts.items()))
+    return shared / (norm_p * norm_q) if norm_p and norm_q else 0.0
+
+
 def pick_demos(pairs, prompt, shots, tokenizer):
-    # Rank candidate demos by token overlap with the prompt
+    # Rank candidate demos by IDF-weighted token overlap with the prompt
     # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     prompt_tokens = tokenizer.encode(prompt) if prompt else []
     if not prompt_tokens or shots <= 0:
         return []
-
-    def overlap(question):
-        q = tokenizer.encode(question)
-        if not q:
-            return 0.0
-        common = sum(1 for t in prompt_tokens if t in q)
-        return common / (len(prompt_tokens) ** 0.5 * len(q) ** 0.5)
-
-    scored = sorted(((overlap(q), (q, a)) for q, a in pairs),
-                    key=lambda item: item[0], reverse=True)
-    return [pair for score, pair in scored if score > 0][:shots]
+    weights = _idf_weights(pairs, tokenizer)
+    seen = set()
+    scored = []
+    for question, answer in pairs:
+        key = question.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens = tokenizer.encode(question)
+        score = _weighted_overlap(prompt_tokens, tokens, weights)
+        # Ties: a question of similar length is a better-shaped demo.
+        scored.append((score, -abs(len(tokens) - len(prompt_tokens)),
+                       (question, answer)))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [pair for score, _, pair in scored if score > 0][:shots]
 
 
 def few_shot_pairs(text, shots, demo_len, tokenizer, prompt=""):
@@ -92,12 +128,15 @@ def few_shot_pairs(text, shots, demo_len, tokenizer, prompt=""):
     if not pairs:
         return "", 0
     selected = pick_demos(pairs, prompt, shots, tokenizer)
-    context = "\n".join(
-        f"{user_name}: {clip_msg(q, demo_len, tokenizer)}\n"
-        f"{her_name}: {clip_msg(a, demo_len, tokenizer)}"
-        for q, a in selected
-    )
-    return context, len(selected)
+    blocks = []
+    for question, answer in selected:
+        user_text = clip_msg(question, demo_len, tokenizer)
+        her_text = clip_msg(answer, demo_len, tokenizer)
+        # An empty half would render as a bare label ("her: "), a lone-space
+        # token the model never saw; drop such demos instead.
+        if user_text and her_text:
+            blocks.append(f"{user_name}: {user_text}\n{her_name}: {her_text}")
+    return "\n".join(blocks), len(blocks)
 
 
 def _read_description(args):
@@ -147,7 +186,10 @@ def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
     prefix = "\n".join(p for p in (description, demos) if p)
     hist = "\n".join(history)
     full = "\n".join(p for p in (prefix, hist, f"{user_name}: {prompt}") if p)
-    ids = tokenizer.encode(full + f"\n{her_name}: ")
+    # No trailing space after the label: a bare space encodes as a token that
+    # never appears in training (a space always merges into the next word), so
+    # the model would start from an out-of-distribution token.
+    ids = tokenizer.encode(full + f"\n{her_name}:")
     return _trim_prompt(ids, max_ctx, tokenizer), n_shots
 
 
@@ -262,7 +304,7 @@ def generate_proactive(args, state, model, tokenizer, openers, device):
     head = _read_description(args)
     lines = ([head] if head else []) + [f"{her_name}: {d}" for d in demos]
     max_ctx = max(1, state["cfg"]["max_len"] - args.max_reply - 1)
-    ids = _trim_prompt(tokenizer.encode("\n".join(lines) + f"\n{her_name}: "),
+    ids = _trim_prompt(tokenizer.encode("\n".join(lines) + f"\n{her_name}:"),
                        max_ctx, tokenizer)
     gen = model.generate(
         torch.tensor([ids], device=device),

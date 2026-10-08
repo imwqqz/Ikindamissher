@@ -21,7 +21,9 @@ $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-foreach ($file in @("data\her_model.pt", "data\input\bpe.json")) {
+foreach ($file in @("data\her_model.pt", "data\input\bpe.json",
+                    "data\her_model_memory.pt", "data\her_model_style.pt",
+                    "data\input\bpe_memory.json", "data\input\bpe_style.json")) {
     if (Test-Path $file) {
         Copy-Item $file "$file.$stamp.bak"
         Write-Host "backed up $file -> $file.$stamp.bak"

@@ -26,6 +26,9 @@ WA_LINE = re.compile(
 )
 WA_NAME_BOOTSTRAP = re.compile(r"^[^:\n]+: ")
 
+# A silence this long between messages starts a new conversation in the corpus.
+CONVERSATION_GAP_MINUTES = 60
+
 # WhatsApp's time field for gap detection; the date is not needed, so only the
 # clock (and an optional a.m./p.m. marker) is captured.
 WA_TIME = re.compile(
@@ -51,14 +54,28 @@ def _wa_turn(line: str, aliases, speakers):
     return f"{name_lower}: {msg}"
 
 
-def parse_wa(text: str, speakers=None, aliases=None):
-    # Normalize the exporter's speaker names to canonical turns. (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+def parse_wa(text: str, speakers=None, aliases=None,
+             gap_minutes: int = CONVERSATION_GAP_MINUTES):
+    # Normalize the exporter's speaker names to canonical turns. A silence of
+    # `gap_minutes` or more becomes a blank line, i.e. a conversation boundary.
+    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     if speakers is None:
         speakers = speaker_names()
     speakers = tuple(s.lower() for s in speakers)
     aliases = {k.lower(): v.lower() for k, v in (aliases or {}).items()}
-    lines = [turn for turn in (_wa_turn(line, aliases, speakers)
-                               for line in text.splitlines()) if turn]
+    lines = []
+    previous_minute = None
+    for line in text.splitlines():
+        turn = _wa_turn(line, aliases, speakers)
+        if not turn:
+            continue
+        minute = _line_minute(line)
+        if (lines and minute is not None and previous_minute is not None
+                and (minute - previous_minute) % (24 * 60) >= gap_minutes):
+            lines.append("")
+        lines.append(turn)
+        if minute is not None:
+            previous_minute = minute
     return "\n".join(lines) + "\n"
 def detect_user(text: str, label: str = None):
     # Pick the most frequent non-her speaker so any WhatsApp contact works. (T5, section 2.1 https://arxiv.org/abs/2005.14165)
@@ -242,6 +259,20 @@ def target_char_mask(corpus: str, her_name: str) -> List[bool]:
         previous_her = line.startswith(prefix)
         pos += len(line) + 1  # +1 for the newline that split removed
     return mask
+
+
+def conversation_ends(corpus: str) -> List[int]:
+    """Offsets where a run of two or more newlines starts (a scene break).
+
+    That is exactly where the pretokenizer's whitespace piece begins, so the
+    tokenizer can inject the conversation-end sentinel just before it.
+    """
+    ends: List[int] = []
+    for index in range(len(corpus) - 1):
+        if (corpus[index] == "\n" and corpus[index + 1] == "\n"
+                and (index == 0 or corpus[index - 1] != "\n")):
+            ends.append(index)
+    return ends
 
 
 def her_turn_ends(corpus: str, her_name: str) -> List[int]:

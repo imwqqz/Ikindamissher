@@ -205,7 +205,7 @@ def check_turn_generation():
         loss.backward()
         optimizer.step()
     model.eval()
-    prompt = encoder.encode(f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: ")
+    prompt = encoder.encode(f"{SPEAKER_USER}: hola\n{SPEAKER_HER}:")
     gen = model.generate(torch.tensor([prompt]), max_new=40, temperature=1e-8,
                          top_k=1, stop_ids=encoder.stop_ids())
     reply = encoder.decode(gen)
@@ -213,6 +213,49 @@ def check_turn_generation():
         "multi-message": "\n" in reply,
         "no-user-bleed": f"{SPEAKER_USER}:" not in reply,
         "stopped-early": len(gen) < 40,
+        "prompt-no-bare-space": prompt[-1] not in set(encoder.encode(" ")),
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    return not failed, "ok" if not failed else f"failed: {failed}"
+
+
+def check_conversation_end():
+    encoder = toy_encoder()
+    if not hasattr(encoder, "conversation_end_id"):
+        return True, "skipped (conversation sentinel not implemented yet)"
+    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
+    corpus = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: que tal\n\n"
+              f"{SPEAKER_USER}: buenas\n{SPEAKER_HER}: hola\n")
+    scenes = data.conversation_ends(corpus)
+    turn_ends = data.her_turn_ends(corpus, SPEAKER_HER)
+    ids, mask = encoder.encode_masked(corpus,
+                                      data.target_char_mask(corpus, SPEAKER_HER),
+                                      turn_ends, scenes)
+    sentinel = encoder.conversation_end_id
+    positions = [i for i, token in enumerate(ids) if token == sentinel]
+    stripped = [t for t in ids if t not in (sentinel, encoder.turn_end_id)]
+    checks = {
+        "one-per-boundary": len(scenes) == 1 and len(positions) == 1,
+        "scored": bool(positions) and all(mask[i] for i in positions),
+        "concat": stripped == encoder.encode(corpus),
+        "distinct-ids": sentinel != encoder.turn_end_id,
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    return not failed, "ok" if not failed else f"failed: {failed}"
+
+
+def check_reply_shape():
+    import chatbot
+    user, her = SPEAKER_USER, SPEAKER_HER
+    raw = (f": hola que tal\n{her}: como estas\n{her}: nos vemos\n"
+           f"{user}: y vos\n")
+    cleaned = chatbot._clean_reply(raw, user, her)
+    checks = {
+        "non-empty": bool(cleaned),
+        "no-user-bleed": f"{user}:" not in cleaned,
+        "no-inner-label": f"{her}:" not in cleaned,
+        "multi-line-kept": "\n" in cleaned,
+        "leading-colon": not cleaned.startswith(":"),
     }
     failed = [name for name, ok in checks.items() if not ok]
     return not failed, "ok" if not failed else f"failed: {failed}"
@@ -242,7 +285,9 @@ CHECKS = [
     ("overfit-batch", check_overfit_batch),
     ("mask", check_mask_sanity),
     ("turn-end", check_turn_end_invariants),
+    ("conversation-end", check_conversation_end),
     ("turn-generation", check_turn_generation),
+    ("reply-shape", check_reply_shape),
     ("gnorm", check_grad_norm_telemetry),
 ]
 
