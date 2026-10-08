@@ -191,6 +191,29 @@ def _restore_rng(state):
         random.setstate(rng["python"])
     except (KeyError, TypeError, ValueError, RuntimeError):
         pass
+class WeightEMA:
+    # Decay-averaged copy of the trainable weights (Polyak averaging, as used
+    # by EMA in the timm/MAE lineage). Buffers are left alone; only the raw
+    # parameters a step would move are averaged.
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {name: param.detach().clone().float()
+                       for name, param in model.named_parameters()
+                       if param.requires_grad}
+
+    def update(self, model):
+        decay = self.decay
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self.shadow:
+                    self.shadow[name].mul_(decay).add_(
+                        param.detach().float(), alpha=1 - decay)
+
+    def load(self, state):
+        for name, value in state.items():
+            if name in self.shadow:
+                self.shadow[name] = value.float().clone()
 class ValWindows:
     # stride == block, no shuffle, so every validation token is predicted once.
     # Yields exactly block tokens: block+1 overflows RoPE at max_len == block.
@@ -294,6 +317,10 @@ class Trainer:
         self._restore_optimizer(state)
         self._restore_scaler(state)
         _restore_rng(state)
+        self.ema_decay = max(0.0, getattr(args, "ema", 0.0))
+        self.ema = (WeightEMA(self._unwrap(), self.ema_decay)
+                    if self.ema_decay else None)
+        self._restore_ema(state)
         # True per-step window, sized independently of --log-every, which only sets
         # how often a line prints. Bounded so it cannot grow with the run.
         self.window_n = max(16, min(args.log_every, 256))
@@ -389,6 +416,22 @@ class Trainer:
             self.scaler.load_state_dict(state["scaler"])
         except (ValueError, KeyError):
             pass
+
+    def _restore_ema(self, state):
+        if self.ema is None or not state.get("ema"):
+            return
+        try:
+            self.ema.load(state["ema"])
+        except (KeyError, TypeError, RuntimeError):
+            pass
+
+    def _ema_state(self, state_dict):
+        # EMA is stored as fp32; cast back to each weight's dtype so the
+        # checkpoint loads into the same model it was averaged from.
+        return {name: (self.ema.shadow[name].to(value.dtype)
+                       if name in self.ema.shadow and value.is_floating_point()
+                       else value)
+                for name, value in state_dict.items()}
 
     def _schedule_lr(self, step):
         # LR schedules after linear warmup (Attention, 5.3 https://arxiv.org/abs/1706.03762;
@@ -559,6 +602,8 @@ class Trainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
+        if self.ema is not None:
+            self.ema.update(self._unwrap())
 
     def _abort_diverged(self, steps, epoch):
         self.diverged = True
@@ -694,7 +739,8 @@ class Trainer:
              "optim": self.optimizer.state_dict(),
              "optim_groups": len(self.optimizer.param_groups),
              "scaler": self.scaler.state_dict(),
-             "rng": _capture_rng()},
+             "rng": _capture_rng(),
+             "ema": self._ema_state(state_dict) if self.ema else None},
             self.ckpt,
         )
         return True

@@ -157,7 +157,11 @@ def load_assets(args, device):
     state = torch.load(ckpt, map_location=device, weights_only=False)
     cfg = state["cfg"]
     model = build_model(cfg).to(device).eval()
-    model.load_state_dict(state["model"])
+    if state.get("ema") and not args.raw_weights:
+        model.load_state_dict(state["ema"])
+        print("weights: using the checkpoint's EMA average")
+    else:
+        model.load_state_dict(state["model"])
     tokenizer = bpe_from_state(state["tokenizer"])
     note = f", trained {state['step']:,} steps" if state.get("step") else ""
     print(f"loaded checkpoint: {ckpt} (loss {state['loss']:.4f}{note})")
@@ -219,6 +223,9 @@ def build_parser():
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--repeat-penalty", type=float, default=1.15)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--raw-weights", action="store_true",
+                    help="ignore the checkpoint's EMA average and load the "
+                         "raw weights instead")
     ap.add_argument("--config", default=None, metavar="FILE",
                     help="JSON file of defaults; explicit flags still win "
                          f"(default: {CHAT_CONFIG.name} if it exists)")
