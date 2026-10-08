@@ -198,6 +198,7 @@ class BytePairEncoder:
         return stops
 
     def save(self, path: Path):
+        path = Path(path)
         payload = {
             "merges": [[int(a), int(b)] for (a, b) in self.merges],
             "tokens_hex": [t.hex() for t in self.tokens],
