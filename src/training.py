@@ -239,6 +239,10 @@ class Trainer:
         self.objective = args.objective
         self.start_step = start_step
         self.precision = getattr(args, "precision_dtype", None)
+        # fp16 gradients can underflow; GradScaler is a no-op unless fp16 on CUDA.
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.precision == torch.float16
+            and self.device.type == "cuda")
         self.sample_every_epoch = 4
         self.val_every = max(1, args.val_every)
         self.patience = max(0, args.patience)
@@ -267,6 +271,7 @@ class Trainer:
         # Adam moments are not derivable from the weights; the LR schedule is a pure
         # function of the step counter, so it needs no state.
         self._restore_optimizer(state)
+        self._restore_scaler(state)
         # True per-step window, sized independently of --log-every, which only sets
         # how often a line prints. Bounded so it cannot grow with the run.
         self.window_n = max(16, min(args.log_every, 256))
@@ -331,6 +336,16 @@ class Trainer:
             # fallback, so keep going rather than refusing to resume.
             pass
 
+    def _restore_scaler(self, state):
+        # fp16 loss-scale state; absent on fp32 checkpoints, where the scaler
+        # is disabled and load_state_dict on it would be meaningless.
+        if not state.get("scaler"):
+            return
+        try:
+            self.scaler.load_state_dict(state["scaler"])
+        except (ValueError, KeyError):
+            pass
+
     def _schedule_lr(self, step):
         # LR schedules after linear warmup (Attention, 5.3 https://arxiv.org/abs/1706.03762;
         # T5, 3.4 https://arxiv.org/abs/2005.14165; SGDR, 2.1 https://arxiv.org/abs/1608.03983)
@@ -366,7 +381,7 @@ class Trainer:
         with torch.autocast("cuda", dtype=precision, enabled=precision is not None and self.device.type == "cuda"):
             loss = self._forward_loss(inputs, targets)
         loss = loss / self.grad_accum
-        loss.backward()
+        self.scaler.scale(loss).backward()
         return loss
 
     def evaluate(self):
@@ -492,8 +507,13 @@ class Trainer:
             self.recent.append(self.last_train_loss)
 
     def _optimizer_step(self):
+        # Unscale before clipping so the 1.0 threshold is in real units; the
+        # disabled fp32 path skips both calls (GradScaler no-ops them).
+        if self.scaler.is_enabled():
+            self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.optimizer.zero_grad()
 
     def _abort_diverged(self, steps, epoch):
@@ -627,7 +647,8 @@ class Trainer:
                  val_loss if val_loss is not None else self.best_val),
              "best_val": _finite_or_none(self.best_val),
              "best_step": self.best_step,
-             "optim": self.optimizer.state_dict()},
+             "optim": self.optimizer.state_dict(),
+             "scaler": self.scaler.state_dict()},
             self.ckpt,
         )
         return True
