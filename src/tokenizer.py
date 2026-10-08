@@ -1,7 +1,6 @@
 import json
 import re
 import time
-from collections import Counter
 from pathlib import Path
 from typing import List, Tuple
 
@@ -74,6 +73,11 @@ class BytePairEncoder:
         # (BPE, section 3 https://arxiv.org/abs/1508.07909)
         pairs_sorted, order = torch.sort(pairs, stable=True)
         keys, counts = torch.unique_consecutive(pairs_sorted, return_counts=True)
+        # The word-boundary id is never emitted by encode(), so a merge through
+        # it could never be applied: keep it out of the ranking entirely.
+        counts = counts.clone()
+        boundary = (keys // base == 256) | (keys % base == 256)
+        counts[boundary] = 0
         maxc = int(counts.max())
         cand = torch.nonzero(counts == maxc).reshape(-1)
         # first_occurrence = original position of each run's first element
@@ -123,19 +127,19 @@ class BytePairEncoder:
         return vals[~removed]
 
     def _encode_piece(self, p: str) -> List[int]:
+        # Canonical BPE: repeatedly apply the merge with the lowest rank (the
+        # id assigned when it was learned). Choosing by frequency here instead
+        # applied merges in an order training never used.
         ids = list(p.encode("utf-8"))
         while len(ids) >= 2:
-            stats = Counter(zip(ids, ids[1:]))
-            pair = None
             best = None
-            for (a, b), rank in stats.items():
-                if (a, b) in self.merges:
-                    if best is None or rank < best:
-                        best = rank
-                        pair = (a, b)
-            if pair is None:
+            for a, b in zip(ids, ids[1:]):
+                rank = self.merges.get((a, b))
+                if rank is not None and (best is None or rank < best[1]):
+                    best = ((a, b), rank)
+            if best is None:
                 break
-            ids = self._merge(ids, pair[0], pair[1], self.merges[pair])
+            ids = self._merge(ids, best[0][0], best[0][1], best[1])
         return ids
 
     def encode(self, text: str) -> List[int]:
