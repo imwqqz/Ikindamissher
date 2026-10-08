@@ -132,14 +132,17 @@ def check_overfit_batch():
 def check_mask_sanity():
     data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
     corpus = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: que tal\n"
-              f"{SPEAKER_USER}: bien\n{SPEAKER_HER}: y vos\n")
+              f"{SPEAKER_HER}: bien\n{SPEAKER_USER}: ok\n")
     mask = data.target_char_mask(corpus, SPEAKER_HER)
     prefix = f"{SPEAKER_HER}: "
     lines = corpus.split("\n")
     expected = 0
+    previous_her = False
     for index, line in enumerate(lines):
         if line.startswith(prefix):
-            expected += len(line) - len(prefix) + (1 if index < len(lines) - 1 else 0)
+            expected += len(line) - (0 if previous_her else len(prefix))
+            expected += 1 if index < len(lines) - 1 else 0
+        previous_her = line.startswith(prefix)
     actual = sum(mask)
     sane = actual == expected and 0 < actual < len(corpus)
     return sane, f"scored={actual} expected={expected}"
@@ -175,6 +178,46 @@ def check_turn_end_invariants():
     return not failed, "ok" if not failed else f"failed: {failed}"
 
 
+def check_turn_generation():
+    # Overfit a synthetic corpus with a two-message turn, then generate: the
+    # reply must contain the intra-turn newline and must not bleed into the
+    # user's turn. This is the end-to-end proof that the sentinel stops a turn.
+    encoder = toy_encoder()
+    if not hasattr(encoder, "turn_end_id"):
+        return True, "skipped (turn-end sentinel not implemented yet)"
+    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
+    corpus = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: hola que tal\n"
+              f"{SPEAKER_HER}: como estas\n{SPEAKER_USER}: bien y vos\n"
+              f"{SPEAKER_HER}: todo bien\n")
+    import her
+    ids, labels = her._masked_labels(encoder, corpus, SPEAKER_HER)
+    torch.manual_seed(0)
+    cfg = tiny_cfg(vocab_size=encoder.vocab_size, d_model=64, n_layers=2)
+    cfg["max_len"] = 128
+    model = build_model(cfg)
+    inputs = torch.tensor([ids])
+    targets = torch.tensor([labels])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    model.train()
+    for _ in range(600):
+        optimizer.zero_grad()
+        loss = lm_loss(model(inputs), targets, 0.0)
+        loss.backward()
+        optimizer.step()
+    model.eval()
+    prompt = encoder.encode(f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: ")
+    gen = model.generate(torch.tensor([prompt]), max_new=40, temperature=1e-8,
+                         top_k=1, stop_ids=encoder.stop_ids())
+    reply = encoder.decode(gen)
+    checks = {
+        "multi-message": "\n" in reply,
+        "no-user-bleed": f"{SPEAKER_USER}:" not in reply,
+        "stopped-early": len(gen) < 40,
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    return not failed, "ok" if not failed else f"failed: {failed}"
+
+
 def check_grad_norm_telemetry():
     torch.manual_seed(0)
     cfg = tiny_cfg()
@@ -199,6 +242,7 @@ CHECKS = [
     ("overfit-batch", check_overfit_batch),
     ("mask", check_mask_sanity),
     ("turn-end", check_turn_end_invariants),
+    ("turn-generation", check_turn_generation),
     ("gnorm", check_grad_norm_telemetry),
 ]
 

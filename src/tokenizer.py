@@ -148,7 +148,7 @@ class BytePairEncoder:
             ids_all.extend(self._encode_piece(p))
         return ids_all
 
-    def encode_masked(self, text: str, char_mask) -> Tuple[List[int], List[bool]]:
+    def encode_masked(self, text: str, char_mask, turn_ends=()) -> Tuple[List[int], List[bool]]:
         """ids plus a per-token copy of char_mask.
 
         A character is not a token, so the label is broadcast to every id that the
@@ -156,14 +156,25 @@ class BytePairEncoder:
         character in the piece, not its first: BPE_PAT lets a piece carry a leading
         space (" pq"), and that space is the last char of the "her: " prefix, so
         reading char_mask[m.start()] unscored the first word of all 5,008 turns.
+
+        `turn_ends` are char offsets where a turn of hers ends; the turn-end
+        sentinel is emitted there (scored) so multi-message turns have a token
+        the model can generate to stop.
         """
+        ends = set(turn_ends)
         ids_all: List[int] = []
         mask_all: List[bool] = []
         for m in re.finditer(BPE_PAT, text):
+            if m.start() in ends:
+                ids_all.append(self.turn_end_id)
+                mask_all.append(True)
             ids = self._encode_piece(m.group(0))
             ids_all.extend(ids)
             label = any(char_mask[m.start():m.end()])
             mask_all.extend([label] * len(ids))
+        if len(text) in ends:
+            ids_all.append(self.turn_end_id)
+            mask_all.append(True)
         return ids_all, mask_all
 
     def decode(self, ids: List[int]) -> str:
@@ -175,24 +186,25 @@ class BytePairEncoder:
         return 257 + self.n_merges
 
     @property
-    def vocab_size(self) -> int:
+    def turn_end_id(self) -> int:
+        # One id past the span sentinels: the scored end of a turn of hers.
         return self.sentinel_base + self.n_sentinels
+
+    @property
+    def vocab_size(self) -> int:
+        return self.sentinel_base + self.n_sentinels + 1
 
     def sentinel_id(self, i: int) -> int:
         assert 0 <= i < self.n_sentinels, "not enough sentinels reserved"
         return self.sentinel_base + i
 
     def stop_ids(self, extra=()):
-        # A turn is several "her: " lines, so the newline after the last one and
-        # the newlines between them are the same token: the model cannot mark
-        # where a turn ends, and stopping here returns her first message only.
-        # 64.7% of turns are multi-message, so this is lossy on purpose --
-        # returning the whole turn would mean decoding past the newline, into
-        # the user's turns, which are never scored and so are unsupervised.
-        # That needs a scored turn-end sentinel instead, which changes the
-        # corpus format; first message is the faithful option until then.
-        nl = self.encode("\n")
-        stops = {nl[0]} if nl else set()
+        # A turn is several "her: " lines, so the newline between messages is a
+        # scored token the model must emit, not a stop: stopping there returns
+        # only her first message. The turn-end sentinel is the stop. A model
+        # that has not learned it is bounded by --max-reply, and the reply is
+        # cut at the next user label.
+        stops = {self.turn_end_id}
         stops.update(self.sentinel_id(i) for i in range(self.n_sentinels))
         stops.update(extra)
         return stops
