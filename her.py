@@ -13,8 +13,8 @@ import torch
 from checkpoint import load_checkpoint, load_tokenizer, resolve_model
 from config import parse_args, request_cpu_fallback, resolve_block
 from data import (
-    build_corpus, configure_speakers, persona_lines, speaker_names,
-    target_char_mask,
+    build_corpus, configure_speakers, her_turn_ends, persona_lines,
+    speaker_names, target_char_mask,
 )
 from model import build_model, trainable_count, total_count
 from training import Trainer
@@ -168,23 +168,45 @@ def _split_corpus(corpus):
         return corpus[0], corpus[1]
     return corpus, ""
 def _masked_labels(tok, text, her_name):
-    ids, flags = tok.encode_masked(text, target_char_mask(text, her_name))
+    ends = her_turn_ends(text, her_name)
+    ids, flags = tok.encode_masked(text, target_char_mask(text, her_name), ends)
     label_ids = [i if f else -100 for i, f in zip(ids, flags)]
     return ids, label_ids
+
+
+def _encode_turns(tok, text, her_name):
+    """ids with a turn-end sentinel at each of her turn boundaries (all scored)."""
+    if not text:
+        return []
+    ids, _ = tok.encode_masked(text, [True] * len(text),
+                               her_turn_ends(text, her_name))
+    return ids
+
+
+def _encode_lm(tok, text, her_name, mask_on):
+    if mask_on:
+        return _masked_labels(tok, text, her_name)
+    return _encode_turns(tok, text, her_name), None
+
+
 def _encode_corpus(args, corpus, val_corpus, her_name, tok):
-    """Tokenize train/val corpora; masks make the loss completion-only."""
+    """Tokenize train/val corpora; masks make the loss completion-only.
+
+    lm injects the scored turn-end sentinel so the model can end a multi-message
+    turn; the span objective builds its own sentinel labels and is left alone.
+    """
     mask_on = bool(getattr(args, "target_only_loss", False)) \
         and args.objective == "lm"
-    if mask_on:
-        ids, label_ids = _masked_labels(tok, corpus, her_name)
-        val_ids, val_label_ids = (_masked_labels(tok, val_corpus, her_name)
-                                  if val_corpus else (None, None))
-        scored = sum(1 for x in label_ids if x != -100)
+    if args.objective == "lm":
+        ids, label_ids = _encode_lm(tok, corpus, her_name, mask_on)
+        val_ids, val_label_ids = (
+            (None, None) if not val_corpus
+            else _encode_lm(tok, val_corpus, her_name, mask_on))
     else:
-        ids = tok.encode(corpus)
-        val_ids = tok.encode(val_corpus) if val_corpus else None
-        label_ids = val_label_ids = None
-        scored = len(ids)
+        ids, label_ids = tok.encode(corpus), None
+        val_ids, val_label_ids = (
+            (tok.encode(val_corpus), None) if val_corpus else (None, None))
+    scored = (sum(1 for x in label_ids if x != -100) if mask_on else len(ids))
     return ids, label_ids, val_ids, val_label_ids, scored, mask_on
 def _persona_prefix_ids(args, her_name, tok):
     # Persona prefix: the same fact sheet that chatbot.py puts at the head of an
