@@ -10,6 +10,10 @@ import torch.nn.functional as F
 from data import speaker_names
 from tokenizer import bpe_state
 
+# Global gradient-norm clip (Playbook: pick the threshold just above the
+# typical norm; telemetry below shows whether this value is ever binding).
+GRAD_CLIP = 1.0
+
 # Causal LM loss with label smoothing (Attention Is All You Need, section 5.4 https://arxiv.org/abs/1706.03762)
 def lm_loss(logits, targets, label_smoothing):
     flat = logits[:, :-1].reshape(-1, logits.size(-1))
@@ -325,6 +329,8 @@ class Trainer:
         # how often a line prints. Bounded so it cannot grow with the run.
         self.window_n = max(16, min(args.log_every, 256))
         self.recent = deque(maxlen=self.window_n)
+        # Pre-clip gradient norms, for clip-threshold diagnosis (report only).
+        self.grad_norms = deque(maxlen=2048)
         self.run_start = time.perf_counter()
         self.window_start = self.run_start
         self.last_logged_step = start_step
@@ -598,7 +604,10 @@ class Trainer:
         # disabled fp32 path skips both calls (GradScaler no-ops them).
         if self.scaler.is_enabled():
             self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                   GRAD_CLIP)
+        if torch.isfinite(grad_norm):
+            self.grad_norms.append(float(grad_norm))
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad()
@@ -664,9 +673,16 @@ class Trainer:
         window_avg = sum(self.recent) / len(self.recent)
         cur_lr = self.optimizer.param_groups[0]["lr"]
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        gnorms = list(self.grad_norms)
+        p90 = (sorted(gnorms)[min(len(gnorms) - 1, int(len(gnorms) * 0.9))]
+               if gnorms else 0.0)
+        clip_rate = (sum(1 for g in gnorms if g > GRAD_CLIP) / len(gnorms)
+                     if gnorms else 0.0)
         print(
             f"  step {steps:,}/{self.total_steps:,} epoch {epoch}/{self.epochs} "
             f"| window {window_avg:.4f} | last {step_loss:.4f} "
+            f"| gnorm {gnorms[-1] if gnorms else 0.0:.2f} p90 {p90:.2f} "
+            f"clip {clip_rate:.0%} "
             f"| {tok_s:,.0f} tok/s | params {trainable:,} | lr {cur_lr:.2e}{eta}",
             flush=True,
         )
