@@ -373,10 +373,9 @@ class Trainer:
         return decay, no_decay
 
     def _make_optimizer(self, args):
-        # Adam with beta2 tuned for transformer training (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
-        # TODO: REVIEW: the paper's section 5.3 states beta1=0.9, beta2=0.98,
-        # eps=1e-9; this call uses beta2=0.95 and adds weight_decay=1e-2
-        # (AdamW, not in the paper). The citation is what differs, not the recipe.
+        # AdamW with an empirical recipe: betas (0.9, 0.95), eps 1e-9,
+        # weight_decay 1e-2 (Attention Is All You Need 5.3 uses 0.98 and no
+        # decay; the citation is the lineage, the values are this project's).
         decay, no_decay = self._decay_split()
         self.optimizer = torch.optim.AdamW(
             [{"params": decay, "weight_decay": 1e-2},
