@@ -26,6 +26,14 @@ WA_LINE = re.compile(
 )
 WA_NAME_BOOTSTRAP = re.compile(r"^[^:\n]+: ")
 
+# WhatsApp's time field for gap detection; the date is not needed, so only the
+# clock (and an optional a.m./p.m. marker) is captured.
+WA_TIME = re.compile(
+    r"^\d{1,2}/\d{1,2}/\d{2,4},?\s*(\d{1,2}):(\d{2})(?::\d{2})?"
+    r"\s*(?:([ap])\.?\s?m\.?)?",
+    re.I,
+)
+
 WA_NOISE = re.compile(
     r"(<media omitted>|media omitted|you deleted this message|this message was deleted)",
     re.I,
@@ -65,6 +73,65 @@ def detect_user(text: str, label: str = None):
             if name and name != label.lower():
                 counts[name] += 1
     return counts.most_common(1)[0][0] if counts else user_name
+
+
+def _line_minute(line: str):
+    """Minutes past midnight for a WhatsApp line, or None without a clock."""
+    match = WA_TIME.match(line)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    marker = (match.group(3) or "").lower()
+    if marker == "p" and hour < 12:
+        hour += 12
+    elif marker == "a" and hour == 12:
+        hour = 0
+    if hour > 23:
+        return None
+    return hour * 60 + minute
+
+
+def first_turns(text: str, label: str = None, aliases=None, gap_minutes: int = 30):
+    """Her turns that open a conversation, with the hour they were sent.
+
+    A conversation boundary is a time-of-day gap of at least `gap_minutes`
+    since the previous parsed message (wrapping midnight), so no date parsing
+    is needed. Only her turns are returned: they are the "writes first"
+    examples, e.g. messaging in the evening to ask to play.
+    """
+    _, her_name = speaker_names()
+    label = (her_name if label is None else label).lower()
+    aliases = {k.lower(): v.lower() for k, v in (aliases or {}).items()}
+    openers = []
+    previous_minute = None
+    for line in text.splitlines():
+        match = WA_LINE.match(line)
+        if not match:
+            continue
+        name = match.group(1).strip().lower()
+        name = aliases.get(name, name)
+        msg = match.group(2).strip()
+        if not msg or WA_NOISE.match(msg):
+            continue
+        minute = _line_minute(line)
+        quiet = (previous_minute is None or minute is None
+                 or (minute - previous_minute) % (24 * 60) >= gap_minutes)
+        if name == label and quiet:
+            openers.append({"hour": None if minute is None else minute // 60,
+                            "text": msg})
+        if minute is not None:
+            previous_minute = minute
+    return openers
+
+
+def openers_near_hour(openers, hour, window: int = 3):
+    """Openers sent within `window` hours of `hour` (circular); else all."""
+    if hour is None:
+        return list(openers)
+    near = [o for o in openers
+            if o["hour"] is not None
+            and min((o["hour"] - hour) % 24, (hour - o["hour"]) % 24) <= window]
+    return near or list(openers)
 def _persona_line(line: str, rename, canonical: str):
     m = WA_NAME_BOOTSTRAP.match(line)
     if m:

@@ -2,6 +2,7 @@ import argparse
 import random
 import re
 import sys
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -23,6 +24,8 @@ from data import (
     _split_turns,
     configure_speakers,
     detect_user,
+    first_turns,
+    openers_near_hour,
     parse_wa,
     persona_lines,
     speaker_names,
@@ -209,6 +212,54 @@ def generate_reply(args, state, model, tokenizer, prompt, history, corpus_text, 
     return re.split(rf"(?:\n|{re.escape(user_name)}:)", reply)[0].strip()
 
 
+def load_openers(args):
+    # Her first-of-conversation messages, straight from the raw export, so a
+    # proactive line can imitate how and when she actually opens a chat.
+    if not Path(args.data).exists():
+        return []
+    raw = Path(args.data).read_text(encoding="utf-8")
+    user_name, her_name = speaker_names()
+    user = args.user or detect_user(raw)
+    aliases = {user.lower(): user_name} if user.lower() != user_name else None
+    return first_turns(raw, label=her_name, aliases=aliases,
+                       gap_minutes=args.proactive_gap)
+
+
+def _opener_demos(candidates, args, tokenizer):
+    return [clip_msg(opener["text"], args.demo_len, tokenizer)
+            for opener in candidates[:max(0, args.shots)]]
+
+
+def generate_proactive(args, state, model, tokenizer, openers, device):
+    """One unprompted message, biased toward how she opens chats at this hour."""
+    _, her_name = speaker_names()
+    off_hour = args.proactive_hour if args.proactive_hour is not None \
+        else time.localtime().tm_hour
+    candidates = openers_near_hour(openers, off_hour, args.proactive_window)
+    demos = _opener_demos(candidates, args, tokenizer)
+    head = _read_description(args)
+    lines = ([head] if head else []) + [f"{her_name}: {d}" for d in demos]
+    max_ctx = max(1, state["cfg"]["max_len"] - args.max_reply - 1)
+    ids = _trim_prompt(tokenizer.encode("\n".join(lines) + f"\n{her_name}: "),
+                       max_ctx, tokenizer)
+    gen = model.generate(
+        torch.tensor([ids], device=device),
+        max_new=args.max_reply,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        repeat_penalty=args.repeat_penalty,
+        stop_ids=tokenizer.stop_ids(),
+    )
+    user_name, _ = speaker_names()
+    reply = re.sub(r"^[:\s]+", "", tokenizer.decode(gen).strip())
+    reply = re.split(rf"(?:\n|{re.escape(user_name)}:)", reply)[0].strip()
+    if reply:
+        return reply
+    # Sampling can return nothing (immediate stop); a real opener is faithful.
+    return candidates[0]["text"] if candidates else ""
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description="chatbot: talk to her using the memory trained by her.py")
@@ -238,6 +289,18 @@ def build_parser():
     ap.add_argument("--cpu", action="store_true",
                     help="run on CPU when CUDA is unavailable, skipping the "
                          "interactive prompt")
+    ap.add_argument("--proactive", action="store_true",
+                    help="she speaks first at startup, like her openers in the "
+                         "export")
+    ap.add_argument("--proactive-only", action="store_true",
+                    help="print one opener and exit (for an external scheduler)")
+    ap.add_argument("--proactive-hour", type=int, default=None,
+                    help="hour 0-23 to imitate; default: the current hour")
+    ap.add_argument("--proactive-window", type=int, default=3,
+                    help="hours around --proactive-hour to draw openers from")
+    ap.add_argument("--proactive-gap", type=int, default=30,
+                    help="silence in minutes that counts as her opening a "
+                         "conversation")
     ap.add_argument("--config", default=None, metavar="FILE",
                     help="JSON file of defaults; explicit flags still win "
                          f"(default: {CHAT_CONFIG.name} if it exists)")
@@ -325,6 +388,14 @@ def main(argv=None):
 
     history = []
     print(f"chatting with her as {her_name!r} - type 'exit' to quit")
+    if args.proactive or args.proactive_only:
+        opener = generate_proactive(args, state, model, tokenizer,
+                                    load_openers(args), device)
+        if opener:
+            print(f"{BOT_LABEL}: {opener}")
+            history.append(f"{her_name}: {clip_msg(opener, 15, tokenizer)}")
+        if args.proactive_only:
+            return
     _chat_loop(args, state, model, tokenizer, history, corpus_text, device,
                user_name, her_name)
 
