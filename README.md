@@ -82,6 +82,9 @@ Measured A/B (2026-10-08, ~77k tokens, 15.7M params): the validation-based
 best checkpoint is under-trained and replies are incoherent. At this corpus
 size, generalization comes from few-shot retrieval, not early stopping: chat
 with the memory model, keep retrieval on, and tune `--temperature`/`--top-p`.
+Demos are chained within one conversation (the matched pair plus the turns that
+followed it), so the in-context examples read as a single exchange instead of
+unrelated pairs stitched together.
 
 `--keep-last` is for memorization runs; a run with a validation split should
 use `--no-keep-last` (or drop the key from the config), else the final weights
