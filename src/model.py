@@ -293,6 +293,12 @@ class GPT(nn.Module):
                  repeat_penalty=1.0, stop_ids=()):
         # KV-cache sampling: prefill the prompt, then sample one token at a time
         # (Attention Is All You Need, section 5 https://arxiv.org/abs/1706.03762)
+        if idx.shape[0] != 1:
+            # Sampling, repeat penalty and stop detection all read row 0 only,
+            # and the append below assumes one row; per-row generation is a
+            # separate feature, so fail clearly instead of a size mismatch.
+            raise ValueError(
+                f"generate supports batch size 1 (got {idx.shape[0]})")
         self.reset_cache()
         device = idx.device
         # Read logits from the prefill position; re-feeding idx[:,-1:] pushes the last
