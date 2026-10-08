@@ -104,6 +104,7 @@ def build_cfg(args, tokenizer):
         "quant": "nf4" if args.qlora else "none",
         "gc": getattr(args, "gc", False),
         "tokenizer_arch": "bpe",
+        "val_fraction": float(getattr(args, "val_fraction", 0.0) or 0.0),
     }
     if size:
         _apply_size_preset(args, cfg, size)
