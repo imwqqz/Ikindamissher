@@ -4,6 +4,7 @@ from pathlib import Path
 
 from data import speaker_names
 
+
 def _find_project_root(start):
     # The pre-restructure entry scripts resolved data/ and configs/ next to
     # themselves, i.e. at the repo root. Installed console scripts run copies of
@@ -110,6 +111,15 @@ def build_cfg(args, tokenizer):
 # keys that describe the invocation rather than the run, so they are not
 # written into a generated config file
 _META_KEYS = ("help", "config", "dump_config")
+
+
+def request_cpu_fallback():
+    """Ask before running without a GPU; non-interactive input declines."""
+    try:
+        answer = input("CUDA is not available. Continue on CPU? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def load_config(path):
@@ -350,6 +360,9 @@ def parse_args(argv=None, config=None):
                     help="micro-batches per optimizer step (T5, section 3.4 "
                          "https://arxiv.org/abs/2005.14165)")
     ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"])
+    ap.add_argument("--cpu", action="store_true",
+                    help="force CPU when CUDA is unavailable, skipping the "
+                         "interactive prompt (training on CPU is slow)")
     ap.add_argument("--ema", type=float, default=0.0,
                     help="exponential moving average decay for the weights; "
                          "0 disables it. The average is saved alongside the raw "

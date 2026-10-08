@@ -16,6 +16,7 @@ from config import (
     DEFAULT_DATA,
     DEFAULT_DESC,
     PROJECT_ROOT,
+    request_cpu_fallback,
     resolve_config_args,
 )
 from data import (
@@ -226,6 +227,9 @@ def build_parser():
     ap.add_argument("--raw-weights", action="store_true",
                     help="ignore the checkpoint's EMA average and load the "
                          "raw weights instead")
+    ap.add_argument("--cpu", action="store_true",
+                    help="run on CPU when CUDA is unavailable, skipping the "
+                         "interactive prompt")
     ap.add_argument("--config", default=None, metavar="FILE",
                     help="JSON file of defaults; explicit flags still win "
                          f"(default: {CHAT_CONFIG.name} if it exists)")
@@ -241,10 +245,14 @@ def _init_stdout():
         pass
 
 
-def _setup_device():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
-        print("[Warning] CUDA is not available. Exiting.")
+def _setup_device(force_cpu=False):
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif force_cpu or request_cpu_fallback():
+        print("[Warning] CUDA is not available; running on CPU (slow).")
+        device = torch.device("cpu")
+    else:
+        print("CUDA is not available. Exiting.")
         sys.exit(1)
     print(f"device: {device}")
     return device
@@ -299,7 +307,7 @@ def main(argv=None):
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    device = _setup_device()
+    device = _setup_device(args.cpu)
 
     state, model, tokenizer = load_assets(args, device)
     cfg = state["cfg"]
