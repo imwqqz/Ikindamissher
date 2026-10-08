@@ -1,4 +1,5 @@
 import math
+import random
 import time
 from collections import deque
 from pathlib import Path
@@ -34,20 +35,19 @@ def lm_loss(logits, targets, label_smoothing):
 # T5-style span corruption on a single sequence (T5, section 3.2 https://arxiv.org/abs/2005.14165)
 def mask_spans(mask, span_gap):
     # Coalesce masked runs into (start, end) spans, merging across small gaps.
-    spans = []  # (start, end) masked runs, merged across small gaps
-    i = 0
-    while i < mask.numel():
-        if not mask[i]:
-            i += 1
-            continue
-        j = i
-        while j < mask.numel() and mask[j]:
-            j += 1
-        if spans and i - spans[-1][1] <= span_gap:
-            spans[-1] = (spans[-1][0], j)
+    # Run boundaries come from one diff instead of an element-wise Python scan;
+    # the short merge pass then touches only the runs, not the tokens.
+    flags = mask.to(torch.int8)
+    changes = torch.diff(flags, prepend=flags.new_zeros(1),
+                         append=flags.new_zeros(1))
+    starts = (changes == 1).nonzero().reshape(-1).tolist()
+    ends = (changes == -1).nonzero().reshape(-1).tolist()
+    spans = []
+    for start, end in zip(starts, ends):
+        if spans and start - spans[-1][1] <= span_gap:
+            spans[-1] = (spans[-1][0], end)
         else:
-            spans.append((i, j))
-        i = j
+            spans.append((start, end))
     return spans
 
 
@@ -122,7 +122,15 @@ class BatchSampler:
                        else torch.tensor(prefix, dtype=torch.long, device=device))
         self.n_prefix = 0 if self.prefix is None else int(self.prefix.numel())
         self.span = max(1, block - self.n_prefix)
-        self.num_windows = max(1, len(self.ids) - self.span)
+        # A window needs `span` tokens: len - span valid starts (older code kept
+        # one window at len == span). len < span has none, so clamp to zero
+        # instead of indexing past the tensor.
+        spare = len(self.ids) - self.span
+        self.num_windows = 1 if self.ids.numel() and spare == 0 else max(spare, 0)
+        if self.num_windows == 0 and self.rank == 0:
+            print(f"warning: corpus has {len(self.ids):,} tokens, shorter than "
+                  f"block {self.span}; no training windows will be produced",
+                  flush=True)
         self.offsets = torch.arange(self.span, dtype=torch.long, device=device)
         if self.n_prefix:
             self.prefix_labels = torch.full((self.n_prefix,), -100,
@@ -163,6 +171,49 @@ def _finite_or_none(value):
         return None
     value = float(value)
     return None if value == float("inf") else value
+def _capture_rng():
+    # Resume must continue the RNG stream, not replay the seed: shuffling and
+    # dropout both draw from these generators.
+    state = {"torch": torch.get_rng_state(), "python": random.getstate()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng(state):
+    rng = state.get("rng")
+    if not rng:
+        return
+    try:
+        torch.set_rng_state(rng["torch"])
+        if "cuda" in rng and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng["cuda"])
+        random.setstate(rng["python"])
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        pass
+class WeightEMA:
+    # Decay-averaged copy of the trainable weights (Polyak averaging, as used
+    # by EMA in the timm/MAE lineage). Buffers are left alone; only the raw
+    # parameters a step would move are averaged.
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.shadow = {name: param.detach().clone().float()
+                       for name, param in model.named_parameters()
+                       if param.requires_grad}
+
+    def update(self, model):
+        decay = self.decay
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in self.shadow:
+                    self.shadow[name].mul_(decay).add_(
+                        param.detach().float(), alpha=1 - decay)
+
+    def load(self, state):
+        for name, value in state.items():
+            if name in self.shadow:
+                self.shadow[name] = value.float().clone()
 class ValWindows:
     # stride == block, no shuffle, so every validation token is predicted once.
     # Yields exactly block tokens: block+1 overflows RoPE at max_len == block.
@@ -232,6 +283,10 @@ class Trainer:
         self.objective = args.objective
         self.start_step = start_step
         self.precision = getattr(args, "precision_dtype", None)
+        # fp16 gradients can underflow; GradScaler is a no-op unless fp16 on CUDA.
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.precision == torch.float16
+            and self.device.type == "cuda")
         self.sample_every_epoch = 4
         self.val_every = max(1, args.val_every)
         self.patience = max(0, args.patience)
@@ -260,6 +315,12 @@ class Trainer:
         # Adam moments are not derivable from the weights; the LR schedule is a pure
         # function of the step counter, so it needs no state.
         self._restore_optimizer(state)
+        self._restore_scaler(state)
+        _restore_rng(state)
+        self.ema_decay = max(0.0, getattr(args, "ema", 0.0))
+        self.ema = (WeightEMA(self._unwrap(), self.ema_decay)
+                    if self.ema_decay else None)
+        self._restore_ema(state)
         # True per-step window, sized independently of --log-every, which only sets
         # how often a line prints. Bounded so it cannot grow with the run.
         self.window_n = max(16, min(args.log_every, 256))
@@ -291,15 +352,30 @@ class Trainer:
         self.batches_per_epoch = self.sampler.batches_per_epoch()
         self.total_steps = self.start_step + self.epochs * self.batches_per_epoch
 
+    def _decay_split(self):
+        # Weight decay belongs on the linear maps, not on 1-D gains
+        # (RMSNorm), token embeddings, or biases. LoRA A/B are linear maps and
+        # decay like the weights they adapt.
+        decay, no_decay = [], []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.dim() < 2 or "norm" in name or "tok_emb" in name:
+                no_decay.append(param)
+            else:
+                decay.append(param)
+        return decay, no_decay
+
     def _make_optimizer(self, args):
         # Adam with beta2 tuned for transformer training (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
         # TODO: REVIEW: the paper's section 5.3 states beta1=0.9, beta2=0.98,
         # eps=1e-9; this call uses beta2=0.95 and adds weight_decay=1e-2
         # (AdamW, not in the paper). The citation is what differs, not the recipe.
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        decay, no_decay = self._decay_split()
         self.optimizer = torch.optim.AdamW(
-            trainable, lr=args.lr, betas=(0.9, 0.95), eps=1e-9,
-            weight_decay=1e-2,
+            [{"params": decay, "weight_decay": 1e-2},
+             {"params": no_decay, "weight_decay": 0.0}],
+            lr=args.lr, betas=(0.9, 0.95), eps=1e-9,
         )
         self.warmup_steps = args.warmup_steps
         self.schedule = getattr(args, "schedule", "invsqrt")
@@ -317,12 +393,45 @@ class Trainer:
     def _restore_optimizer(self, state):
         if not state.get("optim"):
             return
+        stored_groups = state.get("optim_groups")
+        if stored_groups is not None and stored_groups != len(self.optimizer.param_groups):
+            print(f"warning: checkpoint optimizer has {stored_groups} param "
+                  f"group(s), this build uses {len(self.optimizer.param_groups)}; "
+                  f"resuming with a fresh optimizer (Adam moments lost)",
+                  flush=True)
+            return
         try:
             self.optimizer.load_state_dict(state["optim"])
+        except (ValueError, KeyError) as exc:
+            print(f"warning: could not restore optimizer state ({exc}); "
+                  f"resuming with a fresh optimizer (Adam moments lost)",
+                  flush=True)
+
+    def _restore_scaler(self, state):
+        # fp16 loss-scale state; absent on fp32 checkpoints, where the scaler
+        # is disabled and load_state_dict on it would be meaningless.
+        if not state.get("scaler"):
+            return
+        try:
+            self.scaler.load_state_dict(state["scaler"])
         except (ValueError, KeyError):
-            # Param groups changed shape; a fresh optimizer is the safe
-            # fallback, so keep going rather than refusing to resume.
             pass
+
+    def _restore_ema(self, state):
+        if self.ema is None or not state.get("ema"):
+            return
+        try:
+            self.ema.load(state["ema"])
+        except (KeyError, TypeError, RuntimeError):
+            pass
+
+    def _ema_state(self, state_dict):
+        # EMA is stored as fp32; cast back to each weight's dtype so the
+        # checkpoint loads into the same model it was averaged from.
+        return {name: (self.ema.shadow[name].to(value.dtype)
+                       if name in self.ema.shadow and value.is_floating_point()
+                       else value)
+                for name, value in state_dict.items()}
 
     def _schedule_lr(self, step):
         # LR schedules after linear warmup (Attention, 5.3 https://arxiv.org/abs/1706.03762;
@@ -359,7 +468,7 @@ class Trainer:
         with torch.autocast("cuda", dtype=precision, enabled=precision is not None and self.device.type == "cuda"):
             loss = self._forward_loss(inputs, targets)
         loss = loss / self.grad_accum
-        loss.backward()
+        self.scaler.scale(loss).backward()
         return loss
 
     def evaluate(self):
@@ -485,9 +594,16 @@ class Trainer:
             self.recent.append(self.last_train_loss)
 
     def _optimizer_step(self):
+        # Unscale before clipping so the 1.0 threshold is in real units; the
+        # disabled fp32 path skips both calls (GradScaler no-ops them).
+        if self.scaler.is_enabled():
+            self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.optimizer.zero_grad()
+        if self.ema is not None:
+            self.ema.update(self._unwrap())
 
     def _abort_diverged(self, steps, epoch):
         self.diverged = True
@@ -620,7 +736,11 @@ class Trainer:
                  val_loss if val_loss is not None else self.best_val),
              "best_val": _finite_or_none(self.best_val),
              "best_step": self.best_step,
-             "optim": self.optimizer.state_dict()},
+             "optim": self.optimizer.state_dict(),
+             "optim_groups": len(self.optimizer.param_groups),
+             "scaler": self.scaler.state_dict(),
+             "rng": _capture_rng(),
+             "ema": self._ema_state(state_dict) if self.ema else None},
             self.ckpt,
         )
         return True

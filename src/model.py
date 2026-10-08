@@ -37,8 +37,10 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", torch.sin(emb).unsqueeze(0).unsqueeze(0))
 
     def apply(self, q, k, start: int, length: int):
-        cos = self.cos_cached[:, :, start:start + length]
-        sin = self.sin_cached[:, :, start:start + length]
+        # Cast the fp32 cache down once: q * cos otherwise promotes both to
+        # fp32 inside bf16/fp16 autocast, undoing the mixed-precision savings.
+        cos = self.cos_cached[:, :, start:start + length].to(q.dtype)
+        sin = self.sin_cached[:, :, start:start + length].to(q.dtype)
         return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
 # No-bias normalization used in pre-norm blocks (T5, section 2.1 https://arxiv.org/abs/2005.14165).
