@@ -1,9 +1,9 @@
 import argparse
-import json
 import sys
 from pathlib import Path
 
 from data import speaker_names
+
 
 def _find_project_root(start):
     # The pre-restructure entry scripts resolved data/ and configs/ next to
@@ -104,6 +104,7 @@ def build_cfg(args, tokenizer):
         "quant": "nf4" if args.qlora else "none",
         "gc": getattr(args, "gc", False),
         "tokenizer_arch": "bpe",
+        "val_fraction": float(getattr(args, "val_fraction", 0.0) or 0.0),
     }
     if size:
         _apply_size_preset(args, cfg, size)
@@ -111,6 +112,15 @@ def build_cfg(args, tokenizer):
 # keys that describe the invocation rather than the run, so they are not
 # written into a generated config file
 _META_KEYS = ("help", "config", "dump_config")
+
+
+def request_cpu_fallback():
+    """Ask before running without a GPU; non-interactive input declines."""
+    try:
+        answer = input("CUDA is not available. Continue on CPU? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def load_config(path):
@@ -351,6 +361,13 @@ def parse_args(argv=None, config=None):
                     help="micro-batches per optimizer step (T5, section 3.4 "
                          "https://arxiv.org/abs/2005.14165)")
     ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"])
+    ap.add_argument("--cpu", action="store_true",
+                    help="force CPU when CUDA is unavailable, skipping the "
+                         "interactive prompt (training on CPU is slow)")
+    ap.add_argument("--ema", type=float, default=0.0,
+                    help="exponential moving average decay for the weights; "
+                         "0 disables it. The average is saved alongside the raw "
+                         "weights and chatbot.py prefers it when present")
 
     ap.add_argument("--objective", default="lm", choices=["lm", "span"])
     ap.add_argument("--lora", action="store_true")

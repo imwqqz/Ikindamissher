@@ -11,7 +11,7 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 import torch
 
 from checkpoint import load_checkpoint, load_tokenizer, resolve_model
-from config import build_cfg, parse_args, resolve_block
+from config import parse_args, request_cpu_fallback, resolve_block
 from data import (
     build_corpus, configure_speakers, persona_lines, speaker_names,
     target_char_mask,
@@ -50,8 +50,10 @@ def init_process(args):
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if device.type != "cuda":
-            print("[Warning] CUDA is not available. Exiting.")
-            sys.exit(1)
+            if not (args.cpu or request_cpu_fallback()):
+                print("CUDA is not available. Exiting.")
+                sys.exit(1)
+            print("[Warning] running on CPU: training will be slow.")
     if rank == 0:
         print(f"device: {device} (world {world})")
     return device, rank, world, local
