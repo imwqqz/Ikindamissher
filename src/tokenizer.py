@@ -148,7 +148,8 @@ class BytePairEncoder:
             ids_all.extend(self._encode_piece(p))
         return ids_all
 
-    def encode_masked(self, text: str, char_mask, turn_ends=()) -> Tuple[List[int], List[bool]]:
+    def encode_masked(self, text: str, char_mask, turn_ends=(),
+                      conversation_ends=()) -> Tuple[List[int], List[bool]]:
         """ids plus a per-token copy of char_mask.
 
         A character is not a token, so the label is broadcast to every id that the
@@ -157,23 +158,30 @@ class BytePairEncoder:
         space (" pq"), and that space is the last char of the "her: " prefix, so
         reading char_mask[m.start()] unscored the first word of all 5,008 turns.
 
-        `turn_ends` are char offsets where a turn of hers ends; the turn-end
-        sentinel is emitted there (scored) so multi-message turns have a token
-        the model can generate to stop.
+        `turn_ends` are char offsets where a turn of hers ends; `conversation_ends`
+        are offsets where a whole conversation ends. Both emit a scored sentinel
+        so multi-message turns and conversation resets are learnable.
         """
-        ends = set(turn_ends)
+        turn_offsets = set(turn_ends)
+        conversation_offsets = set(conversation_ends)
         ids_all: List[int] = []
         mask_all: List[bool] = []
         for m in re.finditer(BPE_PAT, text):
-            if m.start() in ends:
+            if m.start() in turn_offsets:
                 ids_all.append(self.turn_end_id)
+                mask_all.append(True)
+            if m.start() in conversation_offsets:
+                ids_all.append(self.conversation_end_id)
                 mask_all.append(True)
             ids = self._encode_piece(m.group(0))
             ids_all.extend(ids)
             label = any(char_mask[m.start():m.end()])
             mask_all.extend([label] * len(ids))
-        if len(text) in ends:
+        if len(text) in turn_offsets:
             ids_all.append(self.turn_end_id)
+            mask_all.append(True)
+        if len(text) in conversation_offsets:
+            ids_all.append(self.conversation_end_id)
             mask_all.append(True)
         return ids_all, mask_all
 
@@ -191,8 +199,14 @@ class BytePairEncoder:
         return self.sentinel_base + self.n_sentinels
 
     @property
-    def vocab_size(self) -> int:
+    def conversation_end_id(self) -> int:
+        # One past the turn end: marks where a whole conversation stops, so a
+        # window learns the reset instead of blending unrelated days.
         return self.sentinel_base + self.n_sentinels + 1
+
+    @property
+    def vocab_size(self) -> int:
+        return self.sentinel_base + self.n_sentinels + 2
 
     def sentinel_id(self, i: int) -> int:
         assert 0 <= i < self.n_sentinels, "not enough sentinels reserved"
