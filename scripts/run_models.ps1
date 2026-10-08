@@ -14,6 +14,7 @@ param(
     [ValidateSet("both", "memory", "style")]
     [string]$Only = "both",
     [int]$Epochs = 5,
+    [double]$GradClip = 1.0,
     [switch]$SkipChecks
 )
 $ErrorActionPreference = "Stop"
@@ -34,7 +35,7 @@ if (-not $SkipChecks) {
 
 if ($Only -in @("both", "memory")) {
     Write-Host "== memory model (full corpus, no validation) =="
-    uv run her.py --fresh --epochs $Epochs `
+    uv run her.py --fresh --epochs $Epochs --grad-clip $GradClip `
         --ckpt           data\her_model_memory.pt `
         --tokenizer-file data\input\bpe_memory.json
     if ($LASTEXITCODE -ne 0) { throw "memory training failed" }
@@ -46,7 +47,7 @@ if ($Only -in @("both", "style")) {
     uv run her.py --fresh --epochs $Epochs `
         --val-fraction 0.1 --patience 8 --dropout 0.1 `
         --persona-prefix --persona-repeat 4 --lr 1.0e-4 `
-        --no-keep-last `
+        --grad-clip $GradClip --no-keep-last `
         --ckpt           data\her_model_style.pt `
         --tokenizer-file data\input\bpe_style.json
     if ($LASTEXITCODE -ne 0) { throw "style training failed" }
