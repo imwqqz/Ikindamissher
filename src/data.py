@@ -226,16 +226,46 @@ def target_char_mask(corpus: str, her_name: str) -> List[bool]:
     prefix = f"{her_name}: "
     pos = 0
     lines = corpus.split("\n")
+    previous_her = False
     for n, line in enumerate(lines):
         if line.startswith(prefix):
-            # +1 scores the newline that ends the turn: it is the only token that
-            # can follow her text, so leaving it out never taught the model to stop
-            # and replies ran on until --max-reply truncated them mid-sentence.
+            # The first line of a turn carries the prompt label, so its prefix
+            # is unscored. Later lines of the same turn repeat the prefix, and
+            # the model must emit it between messages, so those are scored.
+            start = pos if previous_her else pos + len(prefix)
+            # +1 scores the newline that ends the line: between messages it is
+            # the separator the model must generate, and after the last line it
+            # is the token that used to be the only stop signal.
             end = pos + len(line) + (1 if n < len(lines) - 1 else 0)
-            for i in range(pos + len(prefix), min(end, len(mask))):
+            for i in range(start, min(end, len(mask))):
                 mask[i] = True
+        previous_her = line.startswith(prefix)
         pos += len(line) + 1  # +1 for the newline that split removed
     return mask
+
+
+def her_turn_ends(corpus: str, her_name: str) -> List[int]:
+    """Char offsets just past each maximal run of her lines (turn ends).
+
+    A turn of hers is several consecutive `her: ` lines, so only the last line
+    of a run ends a turn. Offsets point at the start of the next line (or
+    len(corpus) at the end), which is where the tokenizer injects the turn-end
+    sentinel.
+    """
+    prefix = f"{her_name}: "
+    ends: List[int] = []
+    offset = 0
+    in_run = False
+    for line in corpus.split("\n"):
+        if line.startswith(prefix):
+            in_run = True
+        elif in_run:
+            ends.append(offset)
+            in_run = False
+        offset += len(line) + 1
+    if in_run:
+        ends.append(len(corpus))
+    return ends
 def _split_turns(conv: str, val_fraction: float):
     # Contiguous tail split on a turn boundary; windows overlap by block-1, so a
     # random split leaks nearly every validation token into training.
