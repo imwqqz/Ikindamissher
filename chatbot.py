@@ -20,6 +20,7 @@ from config import (
     resolve_config_args,
 )
 from data import (
+    _split_turns,
     configure_speakers,
     detect_user,
     parse_wa,
@@ -171,8 +172,10 @@ def load_assets(args, device):
     return state, model, tokenizer
 
 
-def load_corpus(args):
-    # Normalize the export into canonical user/persona turns for demo retrieval
+def load_corpus(args, cfg):
+    # Normalize the export into canonical user/persona turns for demo retrieval.
+    # The tail held out for validation during training is dropped here too, so a
+    # demo can never quote text the model was not asked to learn from.
     user_name, _ = speaker_names()
     if not Path(args.data).exists():
         return ""
@@ -180,6 +183,11 @@ def load_corpus(args):
     user = args.user or detect_user(raw)
     aliases = {user.lower(): user_name} if user.lower() != user_name else None
     corpus_text = parse_wa(raw, aliases=aliases)
+    val_fraction = float(cfg.get("val_fraction", 0.0) or 0.0)
+    if val_fraction > 0:
+        corpus_text, held_out = _split_turns(corpus_text, val_fraction)
+        if args.shots > 0 and held_out:
+            print("demos: holding out the validation tail from retrieval")
     if args.shots > 0:
         print(f"few-shot retrieval on {args.data} (user: {user})")
     return corpus_text
@@ -313,7 +321,7 @@ def main(argv=None):
     cfg = state["cfg"]
     user_name, her_name = _configure_from_checkpoint(args, cfg)
 
-    corpus_text = load_corpus(args)
+    corpus_text = load_corpus(args, cfg)
 
     history = []
     print(f"chatting with her as {her_name!r} - type 'exit' to quit")
