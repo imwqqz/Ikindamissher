@@ -34,20 +34,19 @@ def lm_loss(logits, targets, label_smoothing):
 # T5-style span corruption on a single sequence (T5, section 3.2 https://arxiv.org/abs/2005.14165)
 def mask_spans(mask, span_gap):
     # Coalesce masked runs into (start, end) spans, merging across small gaps.
-    spans = []  # (start, end) masked runs, merged across small gaps
-    i = 0
-    while i < mask.numel():
-        if not mask[i]:
-            i += 1
-            continue
-        j = i
-        while j < mask.numel() and mask[j]:
-            j += 1
-        if spans and i - spans[-1][1] <= span_gap:
-            spans[-1] = (spans[-1][0], j)
+    # Run boundaries come from one diff instead of an element-wise Python scan;
+    # the short merge pass then touches only the runs, not the tokens.
+    flags = mask.to(torch.int8)
+    changes = torch.diff(flags, prepend=flags.new_zeros(1),
+                         append=flags.new_zeros(1))
+    starts = (changes == 1).nonzero().reshape(-1).tolist()
+    ends = (changes == -1).nonzero().reshape(-1).tolist()
+    spans = []
+    for start, end in zip(starts, ends):
+        if spans and start - spans[-1][1] <= span_gap:
+            spans[-1] = (spans[-1][0], end)
         else:
-            spans.append((i, j))
-        i = j
+            spans.append((start, end))
     return spans
 
 
