@@ -68,6 +68,27 @@ uv run python checks.py      # self-checks on synthetic data; exit 0 required
 .\scripts\run_models.ps1
 ```
 
+## Chat recipe
+
+Two models are trained side by side (`scripts/run_models.ps1`):
+
+- `data/her_model_memory.pt` — full corpus, no validation, `--keep-last`.
+  Memorizes the transcript; this is the model to chat with.
+- `data/her_model_style.pt` — 10% held-out validation, `dropout 0.1`,
+  `--no-keep-last` (the best-val checkpoint is retained).
+
+Measured A/B (2026-10-08, ~77k tokens, 15.7M params): the validation-based
+"style" run bottomed at step 500 and rose monotonically afterwards, so its
+best checkpoint is under-trained and replies are incoherent. At this corpus
+size, generalization comes from few-shot retrieval, not early stopping: chat
+with the memory model, keep retrieval on, and tune `--temperature`/`--top-p`.
+
+`--keep-last` is for memorization runs; a run with a validation split should
+use `--no-keep-last` (or drop the key from the config), else the final weights
+replace the best-val checkpoint. A conversation boundary (a long time gap in
+the export) is a scored `conversation_end` token, so windows learn where one
+conversation stops and the next starts.
+
 ## Project structure
 
 ```

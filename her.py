@@ -13,8 +13,8 @@ import torch
 from checkpoint import load_checkpoint, load_tokenizer, resolve_model
 from config import parse_args, request_cpu_fallback, resolve_block
 from data import (
-    build_corpus, configure_speakers, her_turn_ends, persona_lines,
-    speaker_names, target_char_mask,
+    build_corpus, configure_speakers, conversation_ends, her_turn_ends,
+    persona_lines, speaker_names, target_char_mask,
 )
 from model import build_model, trainable_count, total_count
 from training import Trainer
@@ -169,17 +169,20 @@ def _split_corpus(corpus):
     return corpus, ""
 def _masked_labels(tok, text, her_name):
     ends = her_turn_ends(text, her_name)
-    ids, flags = tok.encode_masked(text, target_char_mask(text, her_name), ends)
+    scenes = conversation_ends(text)
+    ids, flags = tok.encode_masked(text, target_char_mask(text, her_name),
+                                   ends, scenes)
     label_ids = [i if f else -100 for i, f in zip(ids, flags)]
     return ids, label_ids
 
 
 def _encode_turns(tok, text, her_name):
-    """ids with a turn-end sentinel at each of her turn boundaries (all scored)."""
+    """ids with scored turn-end and conversation-end sentinels (all scored)."""
     if not text:
         return []
     ids, _ = tok.encode_masked(text, [True] * len(text),
-                               her_turn_ends(text, her_name))
+                               her_turn_ends(text, her_name),
+                               conversation_ends(text))
     return ids
 
 

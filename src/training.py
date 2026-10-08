@@ -717,7 +717,8 @@ class Trainer:
         model = self._unwrap()
         model.eval()
         user_name, her_name = speaker_names()
-        seed = self.tokenizer.encode(f"{user_name}: hola como estas\n{her_name}: ")
+        # Colon only: a trailing space is a token training never produces.
+        seed = self.tokenizer.encode(f"{user_name}: hola como estas\n{her_name}:")
         out = model.generate(
             torch.tensor([seed], device=self.device),
             max_new=32, temperature=0.8, top_k=20,
