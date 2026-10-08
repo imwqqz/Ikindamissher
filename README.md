@@ -25,6 +25,15 @@
 * Neural Machine Translation of Rare Words with
   Subword Units (BPE)                                https://arxiv.org/abs/1508.07909
     byte-pair encoding (3), the tokenizer's merge loop
+* TRL SFTTrainer (train_on_prompt=false)             https://huggingface.co/docs/trl/sft_trainer
+    completion-only loss: score the assistant's turns, not the prompt
+    (target_char_mask in data.py)
+* A Recipe for Training Neural Networks (Karpathy)   https://karpathy.github.io/2019/04/25/recipe/
+    verify loss @ init, overfit one batch, mask sanity, fix the seed, and the
+    "training fails silently" principle behind checks.py
+* Deep Learning Tuning Playbook (Google Research)    https://github.com/google-research/tuning_playbook
+    gradient-clipping threshold just above the p90 norm, unclipped grad-norm
+    logging, and the retrain/evaluation discipline behind Trainer's telemetry
 
 
 ```text
@@ -52,6 +61,8 @@ uv sync                      # one-time setup (see Installation below)
 py her.py                    # train: resumes data/her_model.pt if present
 py her.py --fresh            # first run: build tokenizer, ignore stale ckpt
 py chatbot.py                # chat REPL
+
+uv run python checks.py      # self-checks on synthetic data; exit 0 required
 ```
 
 ## Project structure
@@ -66,9 +77,11 @@ Ikindamissher/
 │   ├── training.py            # lm + span losses, windows, validation, Trainer
 │   ├── checkpoint.py          # load/save tokenizer, resume, reconcile_epochs
 │   └── config.py              # argparse + JSON config + size presets
-├── her.py                     # training entry point
+├── her.py                     # training entry point (--ema, --cpu)
 ├── chatbot.py                 # chat REPL + few-shot retrieval
+│                              #   (--proactive/--proactive-only, --raw-weights, --cpu)
 ├── export_sft.py              # WhatsApp export -> SFT jsonl
+├── checks.py                  # synthetic self-checks, exit code gate
 ├── configs/                   # *_config.example.json + your gitignored locals
 ├── data/                      # gitignored: export, description, BPE, weights
 ├── .python-version            # 3.14.5
