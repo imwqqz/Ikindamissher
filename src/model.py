@@ -13,19 +13,15 @@ NF4_LEVELS = torch.tensor([
     0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
     0.7229568362236023, 1.0,
 ])
-# 3. RoPE, Attention Is All You Need, section 3.5 (positional encoding lineage) https://arxiv.org/abs/1706.03762
-# TODO: REVIEW: RoPE is not from "Attention Is All You Need" (section 3.5 there
-# is fixed sinusoidal absolute encoding); RoPE is "RoFormer: Enhanced
-# Transformer with Rotary Position Embedding" (Su et al., 2021,
-# https://arxiv.org/abs/2104.09864). Behaviour is correct RoPE; the citation is not.
+# RoPE applied to interleaved q/k pairs (RoFormer, Su et al., 2021,
+# https://arxiv.org/abs/2104.09864) -- not from Attention Is All You Need,
+# whose section 3.5 is fixed sinusoidal absolute encoding.
 def _rotate_half(x):
     x1, x2 = x[..., 0::2], x[..., 1::2]
     return torch.stack([-x2, x1], dim=-1).flatten(-2)
 
-# Rope, Params-Free Attention Is All You Need, sections 3.4-3.5 https://arxiv.org/abs/1706.03762
-# TODO: REVIEW: same as above -- RoPE cites "Attention Is All You Need"
-# sections 3.4-3.5, but those cover embedding sqrt-scaling/weight tying and
-# sinusoidal positions. RoPE source is RoFormer, https://arxiv.org/abs/2104.09864.
+# Rotary position embedding, applied to q and k inside attention (RoFormer,
+# https://arxiv.org/abs/2104.09864).
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_len: int, base: float = 10000.0):
         super().__init__()
@@ -43,10 +39,8 @@ class RotaryEmbedding(nn.Module):
         sin = self.sin_cached[:, :, start:start + length].to(q.dtype)
         return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
-# No-bias normalization used in pre-norm blocks (T5, section 2.1 https://arxiv.org/abs/2005.14165).
-# TODO: REVIEW: T5 section 2.1 is a bias-free *LayerNorm* (mean-centred,
-# learned scale); this is RMSNorm (no mean subtraction, no bias), i.e. the
-# LLaMA-family normalisation, not T5's. Comment only; behaviour unchanged.
+# RMSNorm used in pre-norm blocks (no mean subtraction, no bias); this is the
+# LLaMA-family normalization, not T5's bias-free LayerNorm.
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -70,7 +64,8 @@ def nf4_quantize(weight: torch.Tensor, block: int = 64, scale_block: int = 256):
     norm = (blocks / scale.unsqueeze(1)).clamp(-1.0, 1.0)
     idx = (norm.unsqueeze(-1) - NF4_LEVELS).abs().argmin(-1)  # (nb, block) in 0..15
     idx = idx.view(-1)
-    # TODO: REVIEW: pair packing assumes an even element count.
+    # Padding above makes the element count a multiple of `block` (64), so the
+    # pair packing below always has an even count.
     parity = (idx[0::2] << 4) | idx[1::2]
     qweight = parity.to(torch.uint8)
 
@@ -229,9 +224,9 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.w2(F.gelu(self.w1(x)))
 
-# Pre-norm residual transformer block (T5, section 3.1 https://arxiv.org/abs/2005.14165; residual + LayerNorm, Attention Is All You Need, section 3.1 https://arxiv.org/abs/1706.03762)
-# TODO: REVIEW: "LayerNorm" here is RMSNorm (see the RMSNorm note above); the
-# pre-norm placement is as cited, the normalization is not LayerNorm.
+# Pre-norm residual transformer block (residual + normalization, Attention Is
+# All You Need, section 3.1 https://arxiv.org/abs/1706.03762; the normalization
+# is RMSNorm, see above).
 class Block(nn.Module):
 
     def __init__(self, cfg, rotary: RotaryEmbedding):
@@ -263,7 +258,7 @@ class GPT(nn.Module):
         # the embedding by sqrt(d_model), so the std must be d_model**-0.5 for
         # that product to be unit. nn.Embedding defaults to std 1, which enters
         # the blocks ~sqrt(d_model) too large and, through the tied head, gives
-        # logits of std ~20: step-0 loss 383 instead of ln(vocab) = 8.3.
+        # a step-0 loss ~128 for vocab 4096 instead of ~10.5 (see checks.py C4).
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=cfg["d_model"] ** -0.5)
         self._pos = 0
 
