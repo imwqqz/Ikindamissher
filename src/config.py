@@ -350,6 +350,10 @@ def parse_args(argv=None, config=None):
                     help="micro-batches per optimizer step (T5, section 3.4 "
                          "https://arxiv.org/abs/2005.14165)")
     ap.add_argument("--precision", default="fp32", choices=["fp32", "bf16", "fp16"])
+    ap.add_argument("--ema", type=float, default=0.0,
+                    help="exponential moving average decay for the weights; "
+                         "0 disables it. The average is saved alongside the raw "
+                         "weights and chatbot.py prefers it when present")
 
     ap.add_argument("--objective", default="lm", choices=["lm", "span"])
     ap.add_argument("--lora", action="store_true")
