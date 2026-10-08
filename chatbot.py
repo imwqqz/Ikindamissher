@@ -54,29 +54,48 @@ def clip_msg(msg, max_tokens, tokenizer):
     return text.strip()
 
 
-def chat_pairs(text):
-    # Consecutive user->persona exchanges from a normalized corpus.
+def conversations(text):
+    """Split a normalized corpus into conversations (blank-line separated)."""
     user_name, her_name = speaker_names()
     turn = re.compile(rf"^({re.escape(user_name)}|{re.escape(her_name)}): (.*)$")
-    turns = []
+    grouped = []
+    current = []
     for line in text.splitlines():
-        m = turn.match(line)
-        if m:
-            turns.append((m.group(1), m.group(2).strip()))
-    return [(turns[i - 1][1], turns[i][1]) for i in range(1, len(turns))
-            if turns[i][0] == her_name and turns[i - 1][0] == user_name]
+        if not line.strip():
+            if current:
+                grouped.append(current)
+                current = []
+            continue
+        match = turn.match(line)
+        if match:
+            current.append((match.group(1), match.group(2).strip()))
+    if current:
+        grouped.append(current)
+    return grouped
 
 
-def _idf_weights(pairs, tokenizer):
+def _demo_candidates(grouped, user_name, her_name):
+    """(question, answer, conversation index, position) for each user->her pair."""
+    candidates = []
+    for index, conversation in enumerate(grouped):
+        for position in range(len(conversation) - 1):
+            speaker, question = conversation[position]
+            next_speaker, answer = conversation[position + 1]
+            if speaker == user_name and next_speaker == her_name:
+                candidates.append((question, answer, index, position))
+    return candidates
+
+
+def _idf_weights(candidates, tokenizer):
     """Inverse document frequency per token across the demo questions.
 
     Rare tokens (a topic word) weigh more than filler, so a demo that shares
     the actual subject beats a generic greeting that matches everything.
     """
     document_counts = Counter()
-    for question, _ in pairs:
-        document_counts.update(set(tokenizer.encode(question)))
-    total = max(1, len(pairs))
+    for candidate in candidates:
+        document_counts.update(set(tokenizer.encode(candidate[0])))
+    total = max(1, len(candidates))
     return {token: math.log((total + 1) / (count + 1)) + 1.0
             for token, count in document_counts.items()}
 
@@ -97,16 +116,16 @@ def _weighted_overlap(prompt_tokens, question_tokens, weights):
     return shared / (norm_p * norm_q) if norm_p and norm_q else 0.0
 
 
-def pick_demos(pairs, prompt, shots, tokenizer):
+def pick_demos(candidates, prompt, shots, tokenizer):
     # Rank candidate demos by IDF-weighted token overlap with the prompt
     # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     prompt_tokens = tokenizer.encode(prompt) if prompt else []
     if not prompt_tokens or shots <= 0:
         return []
-    weights = _idf_weights(pairs, tokenizer)
+    weights = _idf_weights(candidates, tokenizer)
     seen = set()
     scored = []
-    for question, answer in pairs:
+    for question, answer, index, position in candidates:
         key = question.strip().lower()
         if key in seen:
             continue
@@ -115,27 +134,45 @@ def pick_demos(pairs, prompt, shots, tokenizer):
         score = _weighted_overlap(prompt_tokens, tokens, weights)
         # Ties: a question of similar length is a better-shaped demo.
         scored.append((score, -abs(len(tokens) - len(prompt_tokens)),
-                       (question, answer)))
+                       (question, answer, index, position)))
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [pair for score, _, pair in scored if score > 0][:shots]
+    return [candidate for score, _, candidate in scored if score > 0][:shots]
+
+
+def _chain_demo(conversation, position, demo_len, tokenizer, max_lines=6):
+    """A contiguous slice of one conversation, starting at the matched pair.
+
+    Consecutive turns from the *same* conversation read as a single exchange
+    instead of unrelated pairs stitched together, which is what made replies
+    drift to another conversation's topic.
+    """
+    lines = []
+    for speaker, message in conversation[position:position + max_lines]:
+        text = clip_msg(message, demo_len, tokenizer)
+        if not text:
+            break
+        lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
 
 
 def few_shot_pairs(text, shots, demo_len, tokenizer, prompt=""):
-    # Retrieve similar user1<=>her exchanges as in-context demos
-    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    # Retrieve similar user<=>her exchanges as in-context demos, each chained
+    # within its own conversation (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     user_name, her_name = speaker_names()
-    pairs = chat_pairs(text)
-    if not pairs:
+    grouped = conversations(text)
+    candidates = _demo_candidates(grouped, user_name, her_name)
+    if not candidates:
         return "", 0
-    selected = pick_demos(pairs, prompt, shots, tokenizer)
+    selected = pick_demos(candidates, prompt, shots, tokenizer)
     blocks = []
-    for question, answer in selected:
-        user_text = clip_msg(question, demo_len, tokenizer)
-        her_text = clip_msg(answer, demo_len, tokenizer)
-        # An empty half would render as a bare label ("her: "), a lone-space
-        # token the model never saw; drop such demos instead.
-        if user_text and her_text:
-            blocks.append(f"{user_name}: {user_text}\n{her_name}: {her_text}")
+    used = set()
+    for _, _, index, position in selected:
+        if index in used:
+            continue
+        used.add(index)
+        block = _chain_demo(grouped[index], position, demo_len, tokenizer)
+        if block:
+            blocks.append(block)
     return "\n".join(blocks), len(blocks)
 
 
