@@ -82,19 +82,17 @@ def span_corrupt_pair(row, p=0.15, span_gap=3, encoder=None):
 def collate_span(rows, encoder):
     """Pad corrupted sequences + labels so logits[:, :-1] aligns with labels.
 
-    Each row (ii, ll) already holds the full stream -- corrupted input then
-    targets -- and ll is that stream shifted by one (predicting the next token,
-    masked to the target positions). The fixed batch width truncates the tail of
-    rows whose stream overruns max_inp (labels lose only tokens that also left
-    the input row, so alignment is preserved).
+    Width comes from the labels themselves (and the input is widened to
+    len(labels)+1 so the shift still lines up), so a row whose label stream is
+    longer than its input can never have its target tail truncated.
     """
-    max_inp = max(r[0].numel() for r in rows)
-    max_lab = max_inp - 1
+    max_lab = max(r[1].numel() for r in rows)
+    max_inp = max(max(r[0].numel() for r in rows), max_lab + 1)
     inp = torch.zeros(len(rows), max_inp, dtype=torch.long)
     lab = torch.full((len(rows), max_lab), -100, dtype=torch.long)
     for bi, (ii, ll) in enumerate(rows):
         inp[bi, :len(ii)] = ii
-        lab[bi, :len(ll)] = ll[:max_lab]
+        lab[bi, :len(ll)] = ll
     return inp, lab
 # Cross-entropy over shifted labels, ignoring -100 (T5, section 3.2 https://arxiv.org/abs/2005.14165)
 def span_loss(logits, labels):
@@ -296,6 +294,7 @@ class Trainer:
         self.patience = max(0, args.patience)
         self.spike_factor = max(0.0, args.spike_factor)
         self.spike_patience = max(1, args.spike_patience)
+        self.grad_clip = max(0.0, float(getattr(args, "grad_clip", GRAD_CLIP)))
         self.spike_count = 0
         self.diverged = False
         # Spike reference is the best windowed mean, never the best single minibatch:
@@ -603,8 +602,11 @@ class Trainer:
         # disabled fp32 path skips both calls (GradScaler no-ops them).
         if self.scaler.is_enabled():
             self.scaler.unscale_(self.optimizer)
+        # A disabled clip still needs the norm for telemetry; a huge finite
+        # max_norm is a no-op scale that clip_grad_norm_ returns the norm for.
+        threshold = self.grad_clip if self.grad_clip > 0 else 1e9
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
-                                                   GRAD_CLIP)
+                                                   threshold)
         if torch.isfinite(grad_norm):
             self.grad_norms.append(float(grad_norm))
         self.scaler.step(self.optimizer)
@@ -675,8 +677,8 @@ class Trainer:
         gnorms = list(self.grad_norms)
         p90 = (sorted(gnorms)[min(len(gnorms) - 1, int(len(gnorms) * 0.9))]
                if gnorms else 0.0)
-        clip_rate = (sum(1 for g in gnorms if g > GRAD_CLIP) / len(gnorms)
-                     if gnorms else 0.0)
+        clip_rate = (sum(1 for g in gnorms if g > self.grad_clip) / len(gnorms)
+                     if gnorms and self.grad_clip > 0 else 0.0)
         print(
             f"  step {steps:,}/{self.total_steps:,} epoch {epoch}/{self.epochs} "
             f"| window {window_avg:.4f} | last {step_loss:.4f} "

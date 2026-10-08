@@ -320,9 +320,11 @@ def parse_args(argv=None, config=None):
                     help="stop after this many validations without improvement; "
                          "0 disables early stopping, which is what a memorization "
                          "run wants since its val loss rises as it memorizes")
-    ap.add_argument("--keep-last", action="store_true",
+    ap.add_argument("--keep-last", action=argparse.BooleanOptionalAction,
+                    default=False,
                     help="save the final weights instead of the best-val ones; "
-                         "for memorizing, the last weights are the ones you want")
+                         "for memorizing, the last weights are the ones you want "
+                         "(--no-keep-last overrides a config file's true)")
     ap.add_argument("--spike-factor", type=float, default=4.0,
                     help="abort if the train loss stays above this multiple of "
                          "its running best for --spike-patience steps; 0 "
@@ -368,6 +370,10 @@ def parse_args(argv=None, config=None):
                     help="exponential moving average decay for the weights; "
                          "0 disables it. The average is saved alongside the raw "
                          "weights and chatbot.py prefers it when present")
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                    help="gradient-norm clip threshold (Tuning Playbook: pick "
+                         "just above the p90 norm; 0 disables clipping). The "
+                         "log line reports the pre-clip norm and clip rate")
 
     ap.add_argument("--objective", default="lm", choices=["lm", "span"])
     ap.add_argument("--lora", action="store_true")

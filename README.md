@@ -63,6 +63,9 @@ py her.py --fresh            # first run: build tokenizer, ignore stale ckpt
 py chatbot.py                # chat REPL
 
 uv run python checks.py      # self-checks on synthetic data; exit 0 required
+
+# train the two side-by-side models (protected paths + pre-run backup):
+.\scripts\run_models.ps1
 ```
 
 ## Project structure
@@ -77,7 +80,7 @@ Ikindamissher/
 │   ├── training.py            # lm + span losses, windows, validation, Trainer
 │   ├── checkpoint.py          # load/save tokenizer, resume, reconcile_epochs
 │   └── config.py              # argparse + JSON config + size presets
-├── her.py                     # training entry point (--ema, --cpu)
+├── her.py                     # training entry point (--ema, --cpu, --grad-clip)
 ├── chatbot.py                 # chat REPL + few-shot retrieval
 │                              #   (--proactive/--proactive-only, --raw-weights, --cpu)
 ├── export_sft.py              # WhatsApp export -> SFT jsonl
