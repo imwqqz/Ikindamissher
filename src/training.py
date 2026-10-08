@@ -122,7 +122,15 @@ class BatchSampler:
                        else torch.tensor(prefix, dtype=torch.long, device=device))
         self.n_prefix = 0 if self.prefix is None else int(self.prefix.numel())
         self.span = max(1, block - self.n_prefix)
-        self.num_windows = max(1, len(self.ids) - self.span)
+        # A window needs `span` tokens: len - span valid starts (older code kept
+        # one window at len == span). len < span has none, so clamp to zero
+        # instead of indexing past the tensor.
+        spare = len(self.ids) - self.span
+        self.num_windows = 1 if self.ids.numel() and spare == 0 else max(spare, 0)
+        if self.num_windows == 0 and self.rank == 0:
+            print(f"warning: corpus has {len(self.ids):,} tokens, shorter than "
+                  f"block {self.span}; no training windows will be produced",
+                  flush=True)
         self.offsets = torch.arange(self.span, dtype=torch.long, device=device)
         if self.n_prefix:
             self.prefix_labels = torch.full((self.n_prefix,), -100,
