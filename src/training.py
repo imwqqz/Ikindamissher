@@ -325,15 +325,30 @@ class Trainer:
         self.batches_per_epoch = self.sampler.batches_per_epoch()
         self.total_steps = self.start_step + self.epochs * self.batches_per_epoch
 
+    def _decay_split(self):
+        # Weight decay belongs on the linear maps, not on 1-D gains
+        # (RMSNorm), token embeddings, or biases. LoRA A/B are linear maps and
+        # decay like the weights they adapt.
+        decay, no_decay = [], []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.dim() < 2 or "norm" in name or "tok_emb" in name:
+                no_decay.append(param)
+            else:
+                decay.append(param)
+        return decay, no_decay
+
     def _make_optimizer(self, args):
         # Adam with beta2 tuned for transformer training (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
         # TODO: REVIEW: the paper's section 5.3 states beta1=0.9, beta2=0.98,
         # eps=1e-9; this call uses beta2=0.95 and adds weight_decay=1e-2
         # (AdamW, not in the paper). The citation is what differs, not the recipe.
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        decay, no_decay = self._decay_split()
         self.optimizer = torch.optim.AdamW(
-            trainable, lr=args.lr, betas=(0.9, 0.95), eps=1e-9,
-            weight_decay=1e-2,
+            [{"params": decay, "weight_decay": 1e-2},
+             {"params": no_decay, "weight_decay": 0.0}],
+            lr=args.lr, betas=(0.9, 0.95), eps=1e-9,
         )
         self.warmup_steps = args.warmup_steps
         self.schedule = getattr(args, "schedule", "invsqrt")
@@ -351,12 +366,19 @@ class Trainer:
     def _restore_optimizer(self, state):
         if not state.get("optim"):
             return
+        stored_groups = state.get("optim_groups")
+        if stored_groups is not None and stored_groups != len(self.optimizer.param_groups):
+            print(f"warning: checkpoint optimizer has {stored_groups} param "
+                  f"group(s), this build uses {len(self.optimizer.param_groups)}; "
+                  f"resuming with a fresh optimizer (Adam moments lost)",
+                  flush=True)
+            return
         try:
             self.optimizer.load_state_dict(state["optim"])
-        except (ValueError, KeyError):
-            # Param groups changed shape; a fresh optimizer is the safe
-            # fallback, so keep going rather than refusing to resume.
-            pass
+        except (ValueError, KeyError) as exc:
+            print(f"warning: could not restore optimizer state ({exc}); "
+                  f"resuming with a fresh optimizer (Adam moments lost)",
+                  flush=True)
 
     def _restore_scaler(self, state):
         # fp16 loss-scale state; absent on fp32 checkpoints, where the scaler
@@ -670,6 +692,7 @@ class Trainer:
              "best_val": _finite_or_none(self.best_val),
              "best_step": self.best_step,
              "optim": self.optimizer.state_dict(),
+             "optim_groups": len(self.optimizer.param_groups),
              "scaler": self.scaler.state_dict(),
              "rng": _capture_rng()},
             self.ckpt,
