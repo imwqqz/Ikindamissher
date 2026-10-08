@@ -1,7 +1,7 @@
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # Speaker labels resolved at run time; a literal would land in git history.
 _SPEAKERS = {"user": "", "her": ""}

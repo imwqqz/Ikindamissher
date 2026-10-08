@@ -11,7 +11,7 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 import torch
 
 from checkpoint import load_checkpoint, load_tokenizer, resolve_model
-from config import build_cfg, parse_args, resolve_block
+from config import parse_args, resolve_block
 from data import (
     build_corpus, configure_speakers, persona_lines, speaker_names,
     target_char_mask,
