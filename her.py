@@ -317,6 +317,7 @@ def print_summary(args, cfg, tok, n_tokens, n_train, n_total, final_loss,
     print(f"lora:            r={cfg['lora_r']}, alpha={cfg['lora_alpha']}" if cfg['lora'] else "lora:            off")
     print(f"quant:           {cfg['quant']}")
     print(f"lr:              {args.lr}")
+    print(f"grad clip:       {getattr(args, 'grad_clip', 1.0)}")
     print(f"warmup:          {args.warmup_steps}")
     print(f"schedule:        {args.schedule}")
     print(f"dropout:         {cfg['dropout']}")

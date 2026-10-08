@@ -196,8 +196,31 @@ def load_corpus(args, cfg):
     return corpus_text
 
 
+def _clean_reply(text, user_name, her_name):
+    """Drop learned speaker labels and stop at the first user turn.
+
+    With the scored turn-end sentinel, her reply is a whole multi-message turn
+    and legitimately contains "her: " continuation labels; the REPL prints its
+    own prefix, so the inner labels are stripped for display.
+    """
+    labels = (f"{her_name}:", f"{user_name}:")
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith(f"{user_name}:"):
+            break
+        for label in labels:
+            if line.startswith(label):
+                line = line[len(label):].strip()
+                break
+        line = line.lstrip(":").strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def generate_reply(args, state, model, tokenizer, prompt, history, corpus_text, device):
-    user_name, _ = speaker_names()
+    user_name, her_name = speaker_names()
     ids, _ = build_prompt(args, state, tokenizer, prompt, history, corpus_text)
     gen = model.generate(
         torch.tensor([ids], device=device),
@@ -208,10 +231,7 @@ def generate_reply(args, state, model, tokenizer, prompt, history, corpus_text, 
         repeat_penalty=args.repeat_penalty,
         stop_ids=tokenizer.stop_ids(),
     )
-    reply = re.sub(r"^[:\s]+", "", tokenizer.decode(gen).strip())
-    # Keep the newlines inside her turn (they separate her messages); cut only
-    # if generation ran on into a user turn, which the sentinel should prevent.
-    return re.split(rf"\n{re.escape(user_name)}:", reply)[0].strip()
+    return _clean_reply(tokenizer.decode(gen), user_name, her_name)
 
 
 def load_openers(args):
@@ -253,9 +273,8 @@ def generate_proactive(args, state, model, tokenizer, openers, device):
         repeat_penalty=args.repeat_penalty,
         stop_ids=tokenizer.stop_ids(),
     )
-    user_name, _ = speaker_names()
-    reply = re.sub(r"^[:\s]+", "", tokenizer.decode(gen).strip())
-    reply = re.split(rf"\n{re.escape(user_name)}:", reply)[0].strip()
+    user_name, her_name = speaker_names()
+    reply = _clean_reply(tokenizer.decode(gen), user_name, her_name)
     if reply:
         return reply
     # Sampling can return nothing (immediate stop); a real opener is faithful.
