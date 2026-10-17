@@ -24,13 +24,7 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
         sys.path.insert(0, _p)
 
 from config import DEFAULT_DATA, DEFAULT_DESC, PROJECT_ROOT
-from data import WA_LINE, configure_speakers, detect_user, persona_lines
-
-# Media and deletions carry no text; dropped, not turned into empty turns.
-NOISE = re.compile(
-    r"(<media omitted>|media omitted|you deleted this message|this message was deleted)",
-    re.I,
-)
+from data import WA_LINE, WA_NOISE, configure_speakers, detect_user, persona_lines
 
 # These match 'name: message' only by accident, via the colon inside the
 # timestamp, so they would be appended to the previous turn.
@@ -52,7 +46,7 @@ def _new_turn(line, speakers, aliases, stats):
     if name not in speakers:
         stats["unknown_speaker"] += 1
         return True, None
-    if NOISE.match(msg):
+    if WA_NOISE.match(msg):
         stats["media_or_deleted"] += 1
         return True, None
     if not msg:

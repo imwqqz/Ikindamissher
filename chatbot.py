@@ -100,6 +100,18 @@ def _idf_weights(candidates, tokenizer):
             for token, count in document_counts.items()}
 
 
+def build_demo_index(text, tokenizer):
+    """Static retrieval state: conversations, user->her candidates, IDF weights.
+
+    All three depend only on the corpus and the tokenizer, so they are built
+    once per session instead of re-derived on every typed prompt.
+    """
+    user_name, her_name = speaker_names()
+    grouped = conversations(text)
+    candidates = _demo_candidates(grouped, user_name, her_name)
+    return grouped, candidates, _idf_weights(candidates, tokenizer)
+
+
 def _weighted_overlap(prompt_tokens, question_tokens, weights):
     """Cosine similarity over IDF-weighted token multisets."""
     if not prompt_tokens or not question_tokens:
@@ -116,13 +128,12 @@ def _weighted_overlap(prompt_tokens, question_tokens, weights):
     return shared / (norm_p * norm_q) if norm_p and norm_q else 0.0
 
 
-def pick_demos(candidates, prompt, shots, tokenizer):
+def pick_demos(candidates, weights, prompt, shots, tokenizer):
     # Rank candidate demos by IDF-weighted token overlap with the prompt
-    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    # (tf-idf retrieval, weighted by inverse document frequency)
     prompt_tokens = tokenizer.encode(prompt) if prompt else []
     if not prompt_tokens or shots <= 0:
         return []
-    weights = _idf_weights(candidates, tokenizer)
     seen = set()
     scored = []
     for question, answer, index, position in candidates:
@@ -134,9 +145,20 @@ def pick_demos(candidates, prompt, shots, tokenizer):
         score = _weighted_overlap(prompt_tokens, tokens, weights)
         # Ties: a question of similar length is a better-shaped demo.
         scored.append((score, -abs(len(tokens) - len(prompt_tokens)),
-                       (question, answer, index, position)))
+                       index, (question, answer, index, position)))
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [candidate for score, _, candidate in scored if score > 0][:shots]
+    picked = []
+    used = set()
+    for score, _, index, candidate in scored:
+        # Skip a lower-ranked duplicate rather than dropping the slot: the
+        # next conversation's best match takes it.
+        if score <= 0 or index in used:
+            continue
+        used.add(index)
+        picked.append(candidate)
+        if len(picked) == shots:
+            break
+    return picked
 
 
 def _chain_demo(conversation, position, demo_len, tokenizer, max_lines=6):
@@ -155,25 +177,18 @@ def _chain_demo(conversation, position, demo_len, tokenizer, max_lines=6):
     return "\n".join(lines)
 
 
-def few_shot_pairs(text, shots, demo_len, tokenizer, prompt=""):
+def few_shot_pairs(index, shots, demo_len, tokenizer, prompt=""):
     # Retrieve similar user<=>her exchanges as in-context demos, each chained
-    # within its own conversation (T5, section 2.1 https://arxiv.org/abs/2005.14165)
-    user_name, her_name = speaker_names()
-    grouped = conversations(text)
-    candidates = _demo_candidates(grouped, user_name, her_name)
+    # within its own conversation (T5's in-context framing, section 2.1)
+    grouped, candidates, weights = index
     if not candidates:
         return "", 0
-    selected = pick_demos(candidates, prompt, shots, tokenizer)
-    blocks = []
-    used = set()
-    for _, _, index, position in selected:
-        if index in used:
-            continue
-        used.add(index)
-        block = _chain_demo(grouped[index], position, demo_len, tokenizer)
-        if block:
-            blocks.append(block)
-    return "\n".join(blocks), len(blocks)
+    selected = pick_demos(candidates, weights, prompt, shots, tokenizer)
+    blocks = [b for b in (_chain_demo(grouped[index], position, demo_len,
+                                      tokenizer)
+                          for _, _, index, position in selected) if b]
+    # Blank line between demos: the same scene break training learned.
+    return "\n\n".join(blocks), len(blocks)
 
 
 def _read_description(args):
@@ -185,9 +200,9 @@ def _read_description(args):
     return ""
 
 
-def _select_demos(corpus_text, args, prompt, tokenizer):
-    if corpus_text and args.shots > 0:
-        return few_shot_pairs(corpus_text, args.shots,
+def _select_demos(demo_index, args, prompt, tokenizer):
+    if demo_index and demo_index[1] and args.shots > 0:
+        return few_shot_pairs(demo_index, args.shots,
                               args.demo_len, tokenizer, prompt)
     return "", 0
 
@@ -207,12 +222,12 @@ def _trim_prompt(ids, max_ctx, tokenizer):
     return ids
 
 
-def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
+def build_prompt(args, state, tokenizer, prompt, history, demo_index):
     # Text-to-text prompt: persona + demos + history + her hint
     # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     user_name, her_name = speaker_names()
     description = _read_description(args)
-    demos, n_shots = _select_demos(corpus_text, args, prompt, tokenizer)
+    demos, n_shots = _select_demos(demo_index, args, prompt, tokenizer)
 
     # Headroom must cover the reply, or RoPE overflows past max_len.
     max_ctx = state["cfg"]["max_len"] - args.max_reply - 1
@@ -220,9 +235,11 @@ def build_prompt(args, state, tokenizer, prompt, history, corpus_text):
         raise SystemExit(
             f"--max-reply {args.max_reply} leaves no room in a context of "
             f"{state['cfg']['max_len']}; lower it")
-    prefix = "\n".join(p for p in (description, demos) if p)
-    hist = "\n".join(history)
-    full = "\n".join(p for p in (prefix, hist, f"{user_name}: {prompt}") if p)
+    # Persona and demos are context, not the live conversation: a blank line
+    # separates them from the history, which stays contiguous with the prompt.
+    prefix = "\n\n".join(p for p in (description, demos) if p)
+    tail = "\n".join([*history, f"{user_name}: {prompt}"])
+    full = f"{prefix}\n\n{tail}" if prefix else tail
     # No trailing space after the label: a bare space encodes as a token that
     # never appears in training (a space always merges into the next word), so
     # the model would start from an out-of-distribution token.
@@ -298,9 +315,9 @@ def _clean_reply(text, user_name, her_name):
     return "\n".join(lines).strip()
 
 
-def generate_reply(args, state, model, tokenizer, prompt, history, corpus_text, device):
+def generate_reply(args, state, model, tokenizer, prompt, history, demo_index, device):
     user_name, her_name = speaker_names()
-    ids, _ = build_prompt(args, state, tokenizer, prompt, history, corpus_text)
+    ids, _ = build_prompt(args, state, tokenizer, prompt, history, demo_index)
     gen = model.generate(
         torch.tensor([ids], device=device),
         max_new=args.max_reply,
@@ -452,7 +469,7 @@ def _configure_from_checkpoint(args, cfg):
     return user_name, her_name
 
 
-def _chat_loop(args, state, model, tokenizer, history, corpus_text, device,
+def _chat_loop(args, state, model, tokenizer, history, demo_index, device,
                user_name, her_name):
     while True:
         try:
@@ -463,7 +480,7 @@ def _chat_loop(args, state, model, tokenizer, history, corpus_text, device,
         if not prompt or prompt.lower() in ("exit", "quit"):
             break
         reply = generate_reply(args, state, model, tokenizer, prompt,
-                               history, corpus_text, device)
+                               history, demo_index, device)
         if reply:
             print(f"{BOT_LABEL}: {reply}")
             history.append(f"{user_name}: {clip_msg(prompt, 15, tokenizer)}")
@@ -485,6 +502,7 @@ def main(argv=None):
     user_name, her_name = _configure_from_checkpoint(args, cfg)
 
     corpus_text = load_corpus(args, cfg)
+    demo_index = build_demo_index(corpus_text, tokenizer) if corpus_text else None
 
     history = []
     print(f"chatting with her as {her_name!r} - type 'exit' to quit")
@@ -496,7 +514,7 @@ def main(argv=None):
             history.append(f"{her_name}: {clip_msg(opener, 15, tokenizer)}")
         if args.proactive_only:
             return
-    _chat_loop(args, state, model, tokenizer, history, corpus_text, device,
+    _chat_loop(args, state, model, tokenizer, history, demo_index, device,
                user_name, her_name)
 
 

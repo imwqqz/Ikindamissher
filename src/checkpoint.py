@@ -1,9 +1,8 @@
-import sys
 from pathlib import Path
 
 import torch
 
-from config import build_cfg
+from config import build_cfg, cli_flags
 from model import build_model
 from tokenizer import BytePairEncoder, bpe_from_state
 
@@ -91,6 +90,9 @@ def reconcile_epochs(args, state, rank):
         return
     if stored_target and stored_spe:
         # Shortfall in steps, not epochs: the best checkpoint sits in a partial epoch.
+        # shortcut: a shortfall below one epoch rounds up to a whole one, so a
+        # resume can retrain up to stored_spe extra steps. Split fit() by steps
+        # when that starts to cost real time.
         remaining = max(0, stored_target * stored_spe - stored_step)
         args.epochs = max(1, remaining // stored_spe)
         _report_remaining_epochs(args, rank, stored_target, stored_spe,
@@ -100,17 +102,12 @@ def reconcile_epochs(args, state, rank):
         # Legacy checkpoint: epochs recorded the request, not completed work.
         args.epochs = stored_done
         _report_legacy_epochs(args, rank, stored_done)
-def _flag_given(argv, name):
-    return name in (sys.argv[1:] if argv is None else argv)
-
-
 def _setting_given(args, argv, flag, key):
     """True when a setting was asked for, on the command line or in a config.
 
     A config value is as explicit a request as the same flag.
     """
-    return (flag in (sys.argv[1:] if argv is None else argv)
-            or key in getattr(args, "_from_config", ()))
+    return flag in cli_flags(argv) or key in getattr(args, "_from_config", ())
 def resolve_model(args, state, tok, rank, argv=None):
     # Reuse the checkpoint's architecture when possible; otherwise build from flags.
     if state is None:

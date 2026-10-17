@@ -266,15 +266,50 @@ def check_grad_norm_telemetry():
     cfg = tiny_cfg()
     model = build_model(cfg)
     ids = torch.randperm(cfg["vocab_size"]).tolist() * 2
-    ckpt = Path(tempfile.gettempdir()) / "opencode" / "checks_gnorm.pt"
-    trainer = Trainer(trainer_args(), cfg, model, ids, torch.device("cpu"),
-                      BytePairEncoder(), ckpt)
-    trainer.fit()
-    norms = list(trainer.grad_norms)
+    with tempfile.TemporaryDirectory() as tmp:
+        # The gate runs on any machine, so the checkpoint lands in a fresh
+        # temp dir instead of a path that may not exist.
+        ckpt = Path(tmp) / "checks_gnorm.pt"
+        trainer = Trainer(trainer_args(), cfg, model, ids, torch.device("cpu"),
+                          BytePairEncoder(), ckpt)
+        trainer.fit()
+        norms = list(trainer.grad_norms)
     ok = bool(norms) and all(math.isfinite(g) for g in norms)
-    if ckpt.exists():
-        ckpt.unlink()
     return ok, f"{len(norms)} norms recorded"
+
+
+def check_cli_flags():
+    # A flag must count as 'asked for' in both spellings, or a --size preset
+    # silently overwrites an explicit --d-model=512.
+    from config import cli_flags, parse_args
+    args = parse_args(["--size", "small", "--d-model=512"], config={})
+    seen = "--d-model" in cli_flags(["--d-model=512"])
+    checks = {
+        "equals-form": seen,
+        "space-form": "--d-model" in cli_flags(["--d-model", "512"]),
+        "arch-source": args.arch_src.get("d_model") == "cli",
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    return not failed, "ok" if not failed else f"failed: {failed}"
+
+
+def check_demo_retrieval():
+    # Two best-matching exchanges in one conversation must still yield two
+    # demos (the second from another conversation), separated by a blank line.
+    import chatbot
+    encoder = toy_encoder()
+    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
+    corpus = (f"{SPEAKER_USER}: gato lindo\n{SPEAKER_HER}: miau\n"
+              f"{SPEAKER_USER}: gato feo\n{SPEAKER_HER}: miau dos\n\n"
+              f"{SPEAKER_USER}: gato otro\n{SPEAKER_HER}: miau tres\n")
+    index = chatbot.build_demo_index(corpus, encoder)
+    text, blocks = chatbot.few_shot_pairs(index, 2, 20, encoder, "gato")
+    checks = {
+        "backfilled": blocks == 2,
+        "seam": "\n\n" in text,
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    return not failed, f"{blocks} demos" if not failed else f"failed: {failed}"
 
 
 CHECKS = [
@@ -288,6 +323,8 @@ CHECKS = [
     ("conversation-end", check_conversation_end),
     ("turn-generation", check_turn_generation),
     ("reply-shape", check_reply_shape),
+    ("demo-retrieval", check_demo_retrieval),
+    ("cli-flags", check_cli_flags),
     ("gnorm", check_grad_norm_telemetry),
 ]
 

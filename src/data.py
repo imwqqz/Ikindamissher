@@ -20,7 +20,7 @@ def configure_speakers(user: Optional[str] = None, her: Optional[str] = None):
         _SPEAKERS["her"] = her.strip().lower()
     return speaker_names()
 
-# 2. Convert a WhatsApp export into `speaker: message` turns. (T5, section 2.1 https://arxiv.org/abs/2005.14165).
+# 2. Convert a WhatsApp export into `speaker: message` turns.
 WA_LINE = re.compile(
     r"^\d{1,2}/\d{1,2}/\d{2,4},?.*?- ([^:]+): (.*)$"
 )
@@ -58,7 +58,6 @@ def parse_wa(text: str, speakers=None, aliases=None,
              gap_minutes: int = CONVERSATION_GAP_MINUTES):
     # Normalize the exporter's speaker names to canonical turns. A silence of
     # `gap_minutes` or more becomes a blank line, i.e. a conversation boundary.
-    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
     if speakers is None:
         speakers = speaker_names()
     speakers = tuple(s.lower() for s in speakers)
@@ -78,7 +77,7 @@ def parse_wa(text: str, speakers=None, aliases=None,
             previous_minute = minute
     return "\n".join(lines) + "\n"
 def detect_user(text: str, label: str = None):
-    # Pick the most frequent non-her speaker so any WhatsApp contact works. (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    # Pick the most frequent non-her speaker so any WhatsApp contact works.
     user_name, her_name = speaker_names()
     if label is None:
         label = her_name
@@ -163,7 +162,7 @@ def _persona_line(line: str, rename, canonical: str):
 
 
 def persona_lines(text: str, label: str = None, alias: str = None):
-    # Persona description as `name: line` turns (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+    # Persona description as `name: line` turns
     user_name, her_name = speaker_names()
     label = her_name if label is None else label
     # Lowercased to match parse_wa, else one person gets two leading tokens.
@@ -346,7 +345,6 @@ def _persona_qa_lines(qa_path, label):
     return persona_qa_turns(Path(qa_path).read_text(encoding="utf-8"),
                             alias=label)
 
-# (T5, section 2.1 https://arxiv.org/abs/2005.14165).
 def build_corpus(data_path: Path, desc_path: Path, label: str = None,
                  user: Optional[str] = None, val_fraction: float = 0.0,
                  qa_path: Optional[Path] = None, persona_repeat: int = 0):

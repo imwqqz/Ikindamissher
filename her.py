@@ -11,7 +11,7 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 import torch
 
 from checkpoint import load_checkpoint, load_tokenizer, resolve_model
-from config import parse_args, request_cpu_fallback, resolve_block
+from config import cli_flags, parse_args, request_cpu_fallback, resolve_block
 from data import (
     build_corpus, configure_speakers, conversation_ends, her_turn_ends,
     persona_lines, speaker_names, target_char_mask,
@@ -160,7 +160,7 @@ def _init_stdout():
         pass
 def _epochs_explicit(args, argv):
     # was --epochs passed on the CLI? resume must not silently override it
-    return ("--epochs" in (sys.argv[1:] if argv is None else argv)
+    return ("--epochs" in cli_flags(argv)
             # A config-supplied epochs means the same as the flag.
             or "epochs" in getattr(args, "_from_config", ()))
 def _split_corpus(corpus):

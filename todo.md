@@ -6,11 +6,11 @@
 - [ ] [Feature] Memory implementation chatbot — WQQ-47
 - [ ] [Test] Add a regression test for greeting replies — WQQ-79
 - [ ] [Feature] Restore the data extraction tooling — WQQ-76
-- [ ] [Bug] Reconcile speaker labels across config, corpus, and REPL — WQQ-74
+- [x] [Bug] Reconcile speaker labels across config, corpus, and REPL — WQQ-74
 - [ ] [Bug] Diagnose why chatbot replies read out-of-distribution — WQQ-73
-- [ ] [Bug] Stop truncating target tail tokens in batch collation — WQQ-72
-- [ ] [Bug] Handle odd element counts in NF4 parity packing — WQQ-71
-- [ ] [Bug] Guard the BPE pair key above vocab size 4096 — WQQ-70
+- [x] [Bug] Stop truncating target tail tokens in batch collation — WQQ-72
+- [x] [Bug] Handle odd element counts in NF4 parity packing — WQQ-71
+- [x] [Bug] Guard the BPE pair key above vocab size 4096 — WQQ-70
 
 ## Ideas
 

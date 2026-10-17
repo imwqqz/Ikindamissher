@@ -22,6 +22,9 @@
     nucleus (top-p) sampling (3.1) and the repetition/presence penalty (5)
 * SGDR: Stochastic Gradient Descent with Warm Restarts https://arxiv.org/abs/1608.03983
     cosine annealing (2.1), the --schedule cosine option
+* Language Models are Unsupervised Multitask Learners
+  (GPT-2)                                            https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+    the byte-level BPE pretokenizer regex (tokenizer.py's BPE_PAT)
 * Neural Machine Translation of Rare Words with
   Subword Units (BPE)                                https://arxiv.org/abs/1508.07909
     byte-pair encoding (3), the tokenizer's merge loop
@@ -73,7 +76,8 @@ uv run python checks.py      # self-checks on synthetic data; exit 0 required
 Two models are trained side by side (`scripts/run_models.ps1`):
 
 - `data/her_model_memory.pt` — full corpus, no validation, `--keep-last`.
-  Memorizes the transcript; this is the model to chat with.
+  Memorizes the transcript; this is the model to chat with
+  (`py chatbot.py --ckpt data\her_model_memory.pt`).
 - `data/her_model_style.pt` — 10% held-out validation, `dropout 0.1`,
   `--no-keep-last` (the best-val checkpoint is retained).
 
@@ -110,7 +114,10 @@ Ikindamissher/
 ├── export_sft.py              # WhatsApp export -> SFT jsonl
 ├── checks.py                  # synthetic self-checks, exit code gate
 ├── configs/                   # *_config.example.json + your gitignored locals
-├── data/                      # gitignored: export, description, BPE, weights
+├── data/                      # gitignored: export, description, persona Q&A,
+│                              #   BPE, weights, SFT export
+├── docs/                      # report, blog draft, publish article
+├── scripts/                   # run_models.ps1: guarded memory + style runbook
 ├── .python-version            # 3.14.5
 ├── pyproject.toml
 └── uv.lock

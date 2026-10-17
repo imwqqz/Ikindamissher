@@ -189,6 +189,16 @@ def _config_path_from_argv(argv):
     return None
 
 
+def cli_flags(argv=None):
+    """The set of flag names on a command line, e.g. {"--epochs"}.
+
+    Normalizes --flag=value to --flag, so 'was this option asked for?' sees
+    both spellings. Non-flag tokens are kept as they are.
+    """
+    tokens = sys.argv[1:] if argv is None else argv
+    return {t.split("=", 1)[0] if t.startswith("--") else t for t in tokens}
+
+
 def _bootstrap_config(ap, argv, default_path):
     # Shared by her.py and chatbot.py: an explicit --config wins, else the
     # script's own config file is auto-discovered, else built-in defaults.
@@ -209,10 +219,7 @@ def resolve_config_args(ap, argv=None, default_path=None):
     builtin_defaults = {a.dest: a.default for a in ap._actions}
     apply_config(ap, _bootstrap_config(ap, argv, default_path))
     args = ap.parse_args(argv)
-    if args.dump_config:
-        written = dump_config(ap, args.dump_config, builtin_defaults)
-        print(f"wrote {len(written)} options to {args.dump_config}")
-        raise SystemExit(0)
+    _maybe_dump_config(ap, args, builtin_defaults)
     return args
 
 
@@ -253,7 +260,7 @@ def dump_config(ap, path, defaults=None):
 def _arch_sources(args, argv):
     """flag > config > --size preset, and each key records which of the three
     it came from."""
-    tokens = set(sys.argv[1:] if argv is None else argv)
+    tokens = cli_flags(argv)
     return {
         k: ("cli" if f"--{k.replace('_', '-')}" in tokens else "config")
         for k in ARCH_KEYS

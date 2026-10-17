@@ -6,7 +6,8 @@ from typing import List, Tuple
 
 import torch
 
-# GPT-2 style pretokenizer (T5, section 2.1 https://arxiv.org/abs/2005.14165)
+# GPT-2 byte-level BPE pretokenizer (Radford et al., 2019,
+# https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
 BPE_PAT = re.compile(
     r"""'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z\u00C0-\u1FFF]+| ?\d+| ?[^\sA-Za-z0-9\u00C0-\u1FFF]+|\s+(?!\S)|\s+"""
 )
@@ -224,22 +225,11 @@ class BytePairEncoder:
         return stops
 
     def save(self, path: Path):
-        path = Path(path)
-        payload = {
-            "merges": [[int(a), int(b)] for (a, b) in self.merges],
-            "tokens_hex": [t.hex() for t in self.tokens],
-            "n_sentinels": self.n_sentinels,
-        }
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        Path(path).write_text(json.dumps(bpe_state(self)), encoding="utf-8")
 
     @classmethod
     def load(cls, path: Path) -> "BytePairEncoder":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        enc = cls(n_sentinels=payload["n_sentinels"])
-        enc.tokens = [bytes.fromhex(t) for t in payload["tokens_hex"]]
-        enc.merges = {tuple(pair): 257 + i for i, pair in enumerate(payload["merges"])}
-        enc.n_merges = len(enc.merges)
-        return enc
+        return bpe_from_state(json.loads(Path(path).read_text(encoding="utf-8")))
 def bpe_state(enc: BytePairEncoder):
     return {"merges": [[int(a), int(b)] for (a, b) in enc.merges],
             "tokens_hex": [t.hex() for t in enc.tokens],

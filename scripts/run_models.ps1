@@ -38,6 +38,7 @@ if (-not $SkipChecks) {
 if ($Only -in @("both", "memory")) {
     Write-Host "== memory model (full corpus, no validation) =="
     uv run her.py --fresh --epochs $Epochs --grad-clip $GradClip `
+        --val-fraction 0 --patience 0 --dropout 0 --keep-last `
         --ckpt           data\her_model_memory.pt `
         --tokenizer-file data\input\bpe_memory.json
     if ($LASTEXITCODE -ne 0) { throw "memory training failed" }
