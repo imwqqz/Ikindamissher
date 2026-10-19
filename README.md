@@ -129,4 +129,4 @@ to `GPT` (model.py), which trains them into `data/her_model.pt`; `chatbot.py`
 reads that checkpoint back and generates replies.
 
 <!-- TODO: choose a license -->
-Contributions, acknowledgments, and a formal license are TBD.
+Contributions, acknowledgments, this project is under [LICENCE](https://github.com/imwqqz/Ikindamissher/blob/master/LICENSE)
