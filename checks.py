@@ -386,6 +386,34 @@ def check_qwen_strip_think():
         if qwen_lm.strip_think(raw) != want:
             return False, f"strip_think({raw!r}) != {want!r}"
     return True, "strip ok"
+def check_qa_rows():
+    """_qa_rows folds q:/a: lines into user->her rows and drops answer-less
+    tails (added with the --qa '' disable crash fix, export_sft)."""
+    import export_sft
+    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
+    with tempfile.TemporaryDirectory() as tmp:
+        qa = Path(tmp) / "qa.txt"
+        qa.write_text("# comment\n"
+                      "a: stray first answer\n"
+                      "q: color favorito\na: amarillo\n"
+                      "q: dos en fila\na: una\na: dos\n"
+                      "q: final sin respuesta\n", encoding="utf-8")
+        rows = export_sft._qa_rows(qa, SPEAKER_USER, SPEAKER_HER)
+    expected = [
+        [{"role": "user", "content": "color favorito"},
+         {"role": "assistant", "content": "amarillo"}],
+        [{"role": "user", "content": "dos en fila"},
+         {"role": "assistant", "content": "una"},
+         {"role": "assistant", "content": "dos"}],
+    ]
+    checks = {
+        "stray answer / unanswered tail dropped": len(rows) == 2,
+        "q/a pairs kept": rows == expected,
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    return not failed, "rows ok" if not failed else f"failed: {failed}"
+
+
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
@@ -403,9 +431,8 @@ CHECKS = [
     ("qwen-template", check_qwen_template),
     ("qwen-mask", check_qwen_mask),
     ("qwen-strip", check_qwen_strip_think),
+    ("qa-rows", check_qa_rows),
 ]
-
-
 
 
 def main(argv=None):

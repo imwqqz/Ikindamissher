@@ -275,20 +275,25 @@ def load_assets(args, device):
 
 
 def _load_qwen(args, device):
-    """Qwen engine assets: HF model (+ her adapter) + the legacy BPE for
-    retrieval/clip. No .pt checkpoint is needed; speakers come from the
-    chatbot config, not from a checkpoint."""
+    """Qwen engine assets: HF model + her adapter + the legacy BPE."""
     import qwen_lm
     adapter = Path(args.adapter) if args.adapter else qwen_lm.ADAPTER_DIR
-    hf_tok, qmodel = qwen_lm.load_engine(
-        adapter=adapter if adapter.exists() else None, device=device)
     if not adapter.exists():
-        print(f"[Warning] adapter not found at {adapter}; base model only")
-    else:
-        print(f"qwen engine: adapter {adapter.name}")
+        print(f"adapter not found at {adapter}")
+        print("train the qwen engine first with: uv run python src/qwen_lm.py")
+        raise SystemExit(1)
+    hf_tok, qmodel = qwen_lm.load_engine(adapter=adapter, device=device)
+    print(f"qwen engine: adapter {adapter.name}")
     legacy_tok = BytePairEncoder.load(Path(DEFAULT_BPE))
     print("few-shot retrieval on the legacy tokenizer (bpe.json)")
     return {"cfg": {}, "qwen": (hf_tok, qmodel)}, qmodel, legacy_tok
+
+
+def resolve_max_reply(args):
+    # One bump per engine lives here so chatbot/service/eval share it.
+    if args.engine == "qwen" and args.max_reply == 40:
+        args.max_reply = 80   # the qwen tokenizer packs fewer chars per token
+    return args
 
 
 def load_corpus(args, cfg):
@@ -585,9 +590,7 @@ def main(argv=None):
     _init_stdout()
 
     args = resolve_config_args(build_parser(), argv, CHAT_CONFIG)
-
-    if args.engine == "qwen" and args.max_reply == 40:
-        args.max_reply = 80   # the qwen tokenizer packs fewer chars per token
+    args = resolve_max_reply(args)
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)

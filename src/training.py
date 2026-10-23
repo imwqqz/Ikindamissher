@@ -10,19 +10,17 @@ import torch.nn.functional as F
 from data import speaker_names
 from tokenizer import bpe_state
 
-# Global gradient-norm clip (Playbook: pick the threshold just above the
-# typical norm; telemetry below shows whether this value is ever binding).
+# Grad-norm clamp preset above the typical p90 norm; telemetry logs the rest (Playbook)
 GRAD_CLIP = 1.0
 
-# Causal LM loss with label smoothing (Attention Is All You Need, section 5.4 https://arxiv.org/abs/1706.03762)
+# Next-token loss, optional label smoothing (Attention 5.4)
 def lm_loss(logits, targets, label_smoothing):
     flat = logits[:, :-1].reshape(-1, logits.size(-1))
     tgt = targets[:, 1:].reshape(-1)
-    # -100 = excluded from the loss. Dropped before reducing, else the gradient
-    # is rescaled by the scored fraction.
+    # -100 rows dropped before reduce, else the gradient rescales by the scored fraction
     keep = tgt.ne(-100)
     if not bool(keep.any()):
-        # An all-one-speaker window has no valid target; cross_entropy returns NaN.
+        # an all-one-speaker window has no valid target; cross_entropy returns NaN
         return logits.sum() * 0.0
     if not bool(keep.all()):
         flat = flat[keep]
@@ -36,11 +34,9 @@ def lm_loss(logits, targets, label_smoothing):
     share = label_smoothing / vocab * spread
     return ((1 - label_smoothing) * correct + share).mean()
 
-# T5-style span corruption on a single sequence (T5, section 3.2 https://arxiv.org/abs/2005.14165)
+# T5-style span corruption on one sequence (T5 3.2)
 def mask_spans(mask, span_gap):
-    # Coalesce masked runs into (start, end) spans, merging across small gaps.
-    # Run boundaries come from one diff instead of an element-wise Python scan;
-    # the short merge pass then touches only the runs, not the tokens.
+    # coalesce masked runs into (start, end) spans, merging small gaps (vectorized diff)
     flags = mask.to(torch.int8)
     changes = torch.diff(flags, prepend=flags.new_zeros(1),
                          append=flags.new_zeros(1))
@@ -80,12 +76,9 @@ def span_corrupt_pair(row, p=0.15, span_gap=3, encoder=None):
     labels = torch.cat([torch.full((inp.numel() - 1,), -100, dtype=torch.long), tgt])
     return full, labels
 def collate_span(rows, encoder):
-    """Pad corrupted sequences + labels so logits[:, :-1] aligns with labels.
-
-    Width comes from the labels themselves (and the input is widened to
-    len(labels)+1 so the shift still lines up), so a row whose label stream is
-    longer than its input can never have its target tail truncated.
-    """
+    """Pad corrupted rows so logits[:, :-1] aligns with labels; width comes
+    from the labels themselves, so a target tail is never truncated
+    (REPORT.md N15)."""
     max_lab = max(r[1].numel() for r in rows)
     max_inp = max(max(r[0].numel() for r in rows), max_lab + 1)
     inp = torch.zeros(len(rows), max_inp, dtype=torch.long)
@@ -94,13 +87,13 @@ def collate_span(rows, encoder):
         inp[bi, :len(ii)] = ii
         lab[bi, :len(ll)] = ll
     return inp, lab
-# Cross-entropy over shifted labels, ignoring -100 (T5, section 3.2 https://arxiv.org/abs/2005.14165)
+# Cross-entropy over shifted labels, ignoring -100 (T5 3.2)
 def span_loss(logits, labels):
     B, T, V = logits.shape
     flat = logits[:, :-1].reshape(-1, V)
     tgt = labels.reshape(-1)
     return F.cross_entropy(flat, tgt, ignore_index=-100)
-# Sliding-window batches shuffled every epoch (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
+# Sliding-window batches shuffled every epoch (Attention 5.1)
 class BatchSampler:
 
     def __init__(self, ids, block, batch_size, device, rank=0, world=1,
@@ -111,22 +104,16 @@ class BatchSampler:
         self.rank = rank
         self.world = world
         self.ids = torch.tensor(ids, dtype=torch.long, device=device)
-        # Optional per-token labels, -100 where excluded, sliced at the same offsets
-        # as ids.
+        # per-token labels, -100 where excluded, sliced at the ids' offsets
         self.labels = (None if labels is None
                        else torch.tensor(labels, dtype=torch.long, device=device))
-        # Persona as a fixed per-window prefix, so every example is conditioned
-        # on the fact sheet instead of only the ~0.15% of windows that reach
-        # it at the corpus end. Masked out of the loss: it is context the model
-        # must read, not text it should emit. Sourced from the corpus, so no
-        # token crosses the block boundary and RoPE stays within max_len.
+        # persona prefix on every window, masked from the loss (REPL mirrors
+        # it; sourced from the corpus, so RoPE stays within max_len)
         self.prefix = (None if not prefix
                        else torch.tensor(prefix, dtype=torch.long, device=device))
         self.n_prefix = 0 if self.prefix is None else int(self.prefix.numel())
         self.span = max(1, block - self.n_prefix)
-        # A window needs `span` tokens: len - span valid starts (older code kept
-        # one window at len == span). len < span has none, so clamp to zero
-        # instead of indexing past the tensor.
+        # len - span valid starts; a corpus shorter than span yields zero windows
         spare = len(self.ids) - self.span
         self.num_windows = 1 if self.ids.numel() and spare == 0 else max(spare, 0)
         if self.num_windows == 0 and self.rank == 0:

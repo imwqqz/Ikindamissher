@@ -214,3 +214,67 @@ uv run chatbot.py --ckpt data\her_model_memory.pt
 
 Model artifacts live under `data/` (gitignored). No chat content and no speaker
 names are committed anywhere in the repository.
+
+---
+
+## 6. Implementation notes (comment refs)
+Comments in the code cite these by number and stay one line. The full
+reasoning lives here instead of in the code.
+
+- **N1 QLoRA VRAM budget** — the fp32 cross-entropy upcast over the ~152k vocab
+  is the sink, not batch size; a 3×718 batch measured 8.19 GB reserved, the
+  8 GB card's edge. `--token-budget` caps padded tokens per micro-batch.
+- **N2 Gradient checkpointing** — a plain `gradient_checkpointing_enable()`
+  before `get_peft_model()` silently disables the real thing; one non-reentrant
+  enable with kwargs measured 2.4 GB vs 5.9+ GB without.
+- **N3 Windows WDDM spill** — WDDM spills VRAM into system RAM and the run
+  drops to ~1/60 speed (observed after one fp32-logits OOM tripped it).
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` plus `empty_cache()`
+  per optimizer step keeps the reserved pool away from that edge.
+- **N4 qwen mask regression** — a mask/labels mix-up trained silently to loss
+  0; the `qwen-mask` decode-as-ids check exists so it can again.
+- **N5 Qwen3 non-thinking mode** — a generation prompt with
+  `enable_thinking=False` pre-fills one EMPTY, closed think block: the
+  documented mechanism. SFT rows score that empty block on purpose (the model
+  learns to emit one; inference provides it, `strip_think` backstops).
+- **N6 No scene break in the chat template** — a chat template never emits the
+  blank line the legacy prompt used between roles, so persona text and few-shot
+  demos must live inside the system block only; a demo leaked into the message
+  list made her answer to a demo.
+- **N7 Runtime think markers** — the think markers are recovered by probing a
+  rendered assistant row, never written as literals, so no console or tooling
+  pass can mangle them.
+- **N8 Embedding init** — `forward()` multiplies the embedding by
+  `sqrt(d_model)`, so init std must be `d_model**-0.5`; plain std 1 inflates
+  the step-0 loss to ~128 for vocab 4096 instead of ~10.5.
+- **N9 Weight-decay split** — decay belongs on linear maps (≥2-D); norm gains,
+  token embeddings and biases are excluded. LoRA A/B decay like the weights
+  they adapt.
+- **N10 RoPE dtype** — the rotary cos/sin caches are cast to the query dtype
+  once at apply time; inside autocast a cast-less cache promotes `q*cos` to
+  fp32 and undoes the mixed-precision savings.
+- **N11 KV-cache causality** — `is_causal` only when the query covers the whole
+  key range (a fresh prefill); setting it False unconditionally let every
+  prompt token see its future and corrupted all sampled steps after it.
+- **N12 BPE pair ranking** — `_best_pair` keys pairs as `a*base + b` with
+  `base ≥ max id`: collision-free, sort-stable, reproducible merging. The
+  word-boundary id 256 is masked from ranking because encode() can never apply
+  a merge through it.
+- **N13 BPE merge scan** — `_merge_vec` is greedy left-to-right with no
+  overlapping merges: candidate starts are accepted parity-wise within runs.
+- **N14 Mask broadcast** — `encode_masked` labels every id a pretokenizer piece
+  produced, and a piece's label comes from any scored character it contains
+  (reading only `m.start()` once unscored the first word of 5,008 turns). Turn
+  and conversation sentinels inject at piece starts.
+- **N15 Span collate width** — the padded label width comes from the labels
+  themselves, so a row whose target stream outgrows its input never gets its
+  tail truncated.
+- **N16 AdamW recipe** — betas (0.9, 0.95), eps 1e-9, weight decay 1e-2 are
+  this project's measured values; Attention 5.3 is the lineage, not the source.
+- **N17 Content trust boundary** — `encode_row`/`strip_think` treat message content as
+  chat text: a literal `<|im_end|>` or think marker inside content would shift
+  a span or strip visible text. Accepted for chat-style content; escalate if
+  the role of the content ever changes.
+
+Model artifacts live under `data/` (gitignored). No chat content and no speaker
+names are committed anywhere in the repository.

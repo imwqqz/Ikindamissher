@@ -144,6 +144,14 @@ def _tick(S):
             S["device"])
     if text:
         _queue_push(text, now)
+        # the opener belongs in the session history too, or the model never
+        # remembers she spoke first (REPL records it in chatbot.main)
+        with S["session_lock"]:
+            _, her_name = speaker_names()
+            history = list(load_session().get("history", []))
+            history.append(f"{her_name}: "
+                           f"{chat.clip_msg(text, 15, S['tokenizer'])}")
+            save_session({"history": history[-16:], "updated": now})
         S["last_proactive"] = now
         print(f"[scheduler] queued proactive: {text!r}")
     else:
@@ -181,8 +189,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._json(400, {"error": "since must be an integer"})
         try:
-            return self._json(200, {"messages": _queue_since(since),
-                                    "since": since})
+            msgs = _queue_since(since)
+            return self._json(200, {"messages": msgs,
+                                    "since": max((m["id"] for m in msgs),
+                                                 default=since)})
         except Exception:
             traceback.print_exc()
             return self._json(500, {"error": "poll failed"})
@@ -227,8 +237,7 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = resolve_config_args(parser, argv, chat.CHAT_CONFIG)
-    if args.engine == "qwen" and args.max_reply == 40:
-        args.max_reply = 80   # the qwen tokenizer packs fewer chars per token
+    args = chat.resolve_max_reply(args)
 
     device = chat._setup_device(args.cpu)
     state, model, tokenizer = chat.load_assets(args, device)

@@ -101,8 +101,7 @@ def main(argv=None):
     for engine in ("legacy", "qwen"):
         args = resolve_config_args(chat.build_parser(),
                                    ["--engine", engine], chat.CHAT_CONFIG)
-        if engine == "qwen" and args.max_reply == 40:
-            args.max_reply = 80
+        args = chat.resolve_max_reply(args)
         print(f"\n=== engine: {engine} ({len(prompts)} prompts) ===")
         results[engine] = run_engine(args, engine, prompts)
 

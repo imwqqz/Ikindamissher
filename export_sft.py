@@ -290,7 +290,7 @@ def main(argv=None):
     )
     ap.add_argument("--description", type=Path, default=DEFAULT_DESC)
     ap.add_argument(
-        "--qa", type=Path, default=DEFAULT_QA,
+        "--qa", default=str(DEFAULT_QA),
         help="persona Q&A file (q:/a:) exported as extra user->her rows; "
              "pass an empty string to disable"
     )
@@ -320,7 +320,8 @@ def main(argv=None):
 
     convs, orphans = group_conversations(turns, user, her_name)
     convs, too_long = _drop_long_conversations(convs, args.max_chars)
-    qa_convs = _qa_rows(args.qa if str(args.qa or "") else None,
+    # Path("") resolves to ".", which exists: an unset --qa must stay unset.
+    qa_convs = _qa_rows(Path(args.qa) if args.qa else None,
                         user, her_name)
     convs = convs + qa_convs
     persona = _persona_block(args, her_name)
