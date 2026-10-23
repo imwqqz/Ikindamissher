@@ -82,6 +82,12 @@ reply, why it won, the exact context she replied from (persona, memory demos,
 history) and the thought. Read it with `uv run python tools/read_log.py --tail
 10 --full` (or `--json`). Nothing in the audit path slows the reply.
 
+The same feed prints live in the console: the incoming message, every sampled
+candidate with its score (`*` marks the chosen one), the reason it won, and the
+thought if enabled. `--no-turn-log` quiets it. The daemon also prints one line
+per HTTP request (`POST /message` with status, duration and the message text;
+`GET /poll` only under `--verbose`, so the client's polling stays quiet).
+
 `--think` enables Qwen3 reasoning: the thought is logged, never spoken. It adds
 generation time, and the adapter was trained with thinking off, so use it for
 inspection rather than daily chat.

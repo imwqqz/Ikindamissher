@@ -203,37 +203,56 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _access(self, method, status, started, text=None):
+        # One line per request; polls stay quiet unless --verbose, or the
+        # client's few-second polling would bury the conversation.
+        if method == "GET" and not self.server.verbose:
+            return
+        detail = f"  {text[:60]!r}" if text else ""
+        print(f"[{time.strftime('%H:%M:%S')}] http {method} {self.path} "
+              f"{status} {time.perf_counter() - started:.1f}s{detail}")
+
     def do_GET(self):
+        started = time.perf_counter()
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path != "/poll":
+            self._access("GET", 404, started)
             return self._json(404, {"error": "unknown endpoint"})
         q = urllib.parse.parse_qs(parsed.query)
         try:
             since = int(q.get("since", ["0"])[0] or 0)
         except ValueError:
+            self._access("GET", 400, started)
             return self._json(400, {"error": "since must be an integer"})
         try:
             msgs = _queue_since(since)
+            self._access("GET", 200, started)
             return self._json(200, {"messages": msgs,
                                     "since": max((m["id"] for m in msgs),
                                                  default=since)})
         except Exception:
             traceback.print_exc()
+            self._access("GET", 500, started)
             return self._json(500, {"error": "poll failed"})
 
     def do_POST(self):
+        started = time.perf_counter()
         if urllib.parse.urlparse(self.path).path != "/message":
+            self._access("POST", 404, started)
             return self._json(404, {"error": "unknown endpoint"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
             text = str(json.loads(self.rfile.read(n) or b"{}").get("text", ""))
             text = text.strip()
             if not text:
+                self._access("POST", 400, started)
                 return self._json(400, {"error": "text must not be empty"})
             reply = handle_message(text, self.server.S)
+            self._access("POST", 200, started, text)
             return self._json(200, {"reply": reply})
         except Exception:
             traceback.print_exc()
+            self._access("POST", 500, started)
             return self._json(500, {"error": "generation failed"})
 
     def log_message(self, fmt, *argv):  # quiet default access log

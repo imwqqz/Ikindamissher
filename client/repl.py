@@ -59,6 +59,10 @@ def build_parser():
     ap.add_argument("--think", action="store_true",
                     help="enable Qwen3 reasoning: slower, and the thought is "
                          "logged only (never spoken)")
+    ap.add_argument("--turn-log", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="print every turn: incoming message, sampled "
+                         "candidates with scores, chosen reply")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--repeat-penalty", type=float, default=1.15)

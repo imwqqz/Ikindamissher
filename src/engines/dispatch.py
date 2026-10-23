@@ -247,7 +247,17 @@ def _choose(candidates, reference, tokenizer, weights):
     return chosen, why, scored
 
 
-def _audit(source, user_text, scored, chosen, why, context, thought):
+def _log_turn(args, source, user_text, scored, chosen, why, context, thought):
+    """The live feed (console) and the permanent record (SQLite) in one place."""
+    if getattr(args, "turn_log", True):
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {source} in: {user_text or '(proactive)'}")
+        for text, score in scored:
+            mark = "*" if text == chosen else " "
+            print(f"     {mark} {score:.3f}  {text!r}")
+        print(f"     -> {chosen or '(silence)'} ({why})")
+        if thought:
+            print(f"     thought: {thought}")
     try:
         turnlog.record(source, user_text, scored, chosen, why, context,
                        thought)
@@ -266,9 +276,9 @@ def generate_reply(args, state, model, tokenizer, prompt, history, demo_index,
     reference = " ".join(_demo_answers(demo_index, prompt, tokenizer))
     weights = demo_index[2] if demo_index else {}
     chosen, why, scored = _choose(candidates, reference, tokenizer, weights)
-    _audit(source, prompt, scored, chosen, why,
-           {"persona": description, "demos": demos, "history": list(history)},
-           thought)
+    _log_turn(args, source, prompt, scored, chosen, why,
+              {"persona": description, "demos": demos,
+               "history": list(history)}, thought)
     return chosen
 
 
@@ -361,7 +371,7 @@ def generate_proactive(args, state, model, tokenizer, openers, device,
                                   user_name, her_name)
     chosen, why, scored = _choose(candidates, " ".join(demos), tokenizer, {})
     reply = chosen or (pool[0]["text"] if pool else "")
-    _audit(source, "", scored, reply, why,
-           {"persona": head, "demos": "\n".join(demos), "history": []},
-           thought)
+    _log_turn(args, source, "", scored, reply, why,
+              {"persona": head, "demos": "\n".join(demos), "history": []},
+              thought)
     return reply
