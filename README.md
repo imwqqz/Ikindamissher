@@ -95,6 +95,14 @@ Demos are chained within one conversation (the matched pair plus the turns that
 followed it), so the in-context examples read as a single exchange instead of
 unrelated pairs stitched together.
 
+Re-confirmed 2026-10-23 via the per-run `log.csv` (`data/runs/her_model_style/`,
+now written automatically): best val 4.7392 at step 500 -- exactly the warmup
+end -- then a monotonic rise every check to 6.89, while train loss fell 30x
+(2.98 -> 0.09). Not the LR schedule (cosine was still at 93% of peak when the
+rise began): a straight memorization crossover at ~450 params per scored token.
+Rerun the style probe only when the corpus grows substantially; until then
+`-Only memory` is the recipe.
+
 `--keep-last` is for memorization runs; a run with a validation split should
 use `--no-keep-last` (or drop the key from the config), else the final weights
 replace the best-val checkpoint. A conversation boundary (a long time gap in
