@@ -1,16 +1,7 @@
 """Qwen3 QLoRA: load, train, and serve "her" voice on top of Qwen3-1.7B.
 
-Plan phase 2 (training) and phase 3 engine pieces live here. The from-scratch
-stack in model.py/training.py stays untouched and continues to run via her.py.
-
-Layout decisions (plan audit fixes baked in):
-- one template helper (apply_template) is the ONLY place the chat template is
-  applied, with thinking disabled through training AND inference;
-- completion-only loss is computed by incremental prefix rendering, because
-  Qwen3's bundled template has no {% generation %} marker for the mask API;
-- a generation prompt with enable_thinking=False pre-fills an empty, closed
-  thinking block: that is the documented Qwen3 mechanism to force no reasoning,
-  and visible replies must carry none of the markers (stripped and asserted).
+The from-scratch stack (model.py/training.py) stays untouched and keeps
+running via her.py. Design rationale: docs/REPORT.md section 6 (N1-N17).
 """
 import argparse
 import json
@@ -20,18 +11,16 @@ import random
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[3]
 for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Windows console: same utf-8 handling as her.py/chatbot.py
+# Windows console: same utf-8 handling as her.py/client-repl.py
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# Read at CUDA-allocator init, so it must sit before import torch. Measured
-# no-op on torch 2.14 (identical 8.43/8.48 GB peaks with and without); kept
-# as belt-and-braces in case the allocator default changes.
+# read before import torch at allocator init; measured no-op on torch 2.14, belt-and-braces
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
 
 import torch
@@ -51,9 +40,8 @@ def get_tokenizer(base: str = BASE) -> AutoTokenizer:
 
 
 def apply_template(messages, tokenizer=None, add_generation_prompt=False):
-    """Render Qwen3's chat template. Thinking is always disabled, everywhere:
-    training rows get an EMPTY thinking block, generation prompts get it
-    pre-closed (the documented way to force non-reasoning)."""
+    """One place renders the chat template, thinking disabled everywhere
+    (REPORT.md N5)."""
     tok = tokenizer or get_tokenizer()
     return tok.apply_chat_template(messages, tokenize=False,
                                    add_generation_prompt=add_generation_prompt,
@@ -64,9 +52,8 @@ _markers_cache = {}
 
 
 def think_markers(tokenizer=None):
-    """(open, close) markers of the empty thinking block, recovered at runtime
-    from a probe render of an assistant row. Kept out of the source as
-    literals so no console/tooling pass can mangle them."""
+    """(open, close) of the empty thinking block, probed at runtime so no
+    literal lands in source (REPORT.md N7)."""
     if "m" not in _markers_cache:
         probe = apply_template(
             [{"role": "user", "content": "x"},
@@ -84,13 +71,13 @@ IM_END = "<|im_end|>"
 
 
 def encode_row(messages, tokenizer=None):
-    """(input_ids, labels) for one SFT row: completion-only loss.
+    """(input_ids, labels) for one SFT row, completion-only loss.
 
     Assistant spans (empty thinking block + reply + <|im_end|>) are scored;
-    system/user text and the message headers are -100. Spans come from char
-    offsets of the single full render, so no prefix/merge ambiguity exists.
-    shortcut: an assistant message containing a literal '<|im_end|>' inside its
-    text would split into a second span; content is chat text, not tokens.
+    everything else gets -100. Spans come from char offsets of one full
+    render.
+    shortcut: literal <|im_end|> inside content splits a span; content is
+    chat text, not tokens (REPORT.md N17).
     """
     tok = tokenizer or get_tokenizer()
     text = apply_template(messages, tok)
@@ -110,10 +97,7 @@ def encode_row(messages, tokenizer=None):
 
 
 def _selfcheck_examples(rows, tok, n=3):
-    # assert-based self-check: the mask must keep assistant text and drop
-    # system/user text; labels must be REAL token ids (decode-as-ids check
-    # catches a mask leaking in where ids were expected — trained silently
-    # wrong at loss 0 otherwise)
+    # decode-as-ids proof: labels must be real token ids of the assistant turn (a mask/ids mix-up once trained to loss 0, REPORT.md N4)
     for row in rows[:n]:
         ids, labels = encode_row(row, tok)
         scored = tok.decode([i for i, l in zip(ids, labels) if l != -100],
@@ -151,8 +135,8 @@ def load_engine(base: str = BASE, adapter=None, device="cuda"):
 
 def reply(tok, model, messages, max_new_tokens=80, temperature=0.7, top_p=0.9,
           repeat_penalty=1.0):
-    """One assistant turn: template -> sample -> visible text. Leaked thinking
-    tokens are stripped, not shown (plan finding 2)."""
+    """One assistant turn: template -> sample -> visible text (leaked think
+    blocks stripped, REPORT.md N5)."""
     prompt = apply_template(messages, tok, add_generation_prompt=True)
     ids = tok(prompt, return_tensors="pt").to(model.device)
     gen_kwargs = dict(max_new_tokens=max_new_tokens, do_sample=True,
@@ -166,11 +150,8 @@ def reply(tok, model, messages, max_new_tokens=80, temperature=0.7, top_p=0.9,
 
 
 def strip_think(text, tokenizer=None):
-    """Remove any thinking block from generated text.
-
-    A reply whose block never closes is a truncated leak: the open marker is
-    the last visible thing before nothing, so everything from it on is
-    invisible reasoning."""
+    """Remove any thinking block; a block that never closed is a truncated
+    leak, so nothing after the open marker is visible text."""
     open_m, close_m = think_markers(tokenizer)
     if open_m in text:
         head, _, tail = text.partition(open_m)
@@ -196,8 +177,7 @@ def train(args):
     print(f"device: {device}")
     model = AutoModelForCausalLM.from_pretrained(
         args.base, quantization_config=build_bnb(), device_map=device)
-    # non-reentrant checkpointing, ONE call: a first plain enable() silently
-    # disables the real thing (measured: 2.4 GB with vs 5.9+ GB without/cli)
+    # non-reentrant checkpointing once, before the PEFT wrap (REPORT.md N2)
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False})
     lora = LoraConfig(
@@ -227,9 +207,7 @@ def train(args):
     opt = torch.optim.AdamW(trainables, lr=args.lr)
 
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
-    # Token-budget micro-batching: the memory sink is the fp32 CE upcast over
-    # a ~152k vocab, so a batch's padded-token total, not its row count, is
-    # what must be capped. Length-sorted packing keeps rows near-equal.
+    # token-budget micro-batching: padded tokens, not row count, caps VRAM (REPORT.md N1)
     examples.sort(key=lambda e: e[0])
     batches = []
     i = 0
@@ -283,9 +261,7 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(trainables, 1.0)
             opt.step()
             opt.zero_grad()
-            # fragmentation guard: without it the reserved pool creeps to the
-            # 8 GB edge, one fp32-logits OOM trips WDDM spillover and every
-            # step after runs through shared memory (~100x slower)
+            # empty_cache keeps the reserved pool off the WDDM spill edge (REPORT.md N3)
             torch.cuda.empty_cache()
             step += 1
             if step % 25 == 0:
@@ -316,9 +292,8 @@ def build_parser():
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--token-budget", type=int, default=800,
                     help="max padded tokens per micro-batch; the fp32 CE "
-                         "upcast over a ~152k vocab is what eats VRAM, and a "
-                         "3x718 batch measured 8.19 GB reserved - the 8 GB "
-                         "card's edge")
+                         "upcast over the ~152k vocab is what eats VRAM "
+                         "(REPORT.md N1)")
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--lora-r", type=int, default=16)
@@ -335,3 +310,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+

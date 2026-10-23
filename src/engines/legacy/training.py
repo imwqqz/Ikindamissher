@@ -107,8 +107,7 @@ class BatchSampler:
         # per-token labels, -100 where excluded, sliced at the ids' offsets
         self.labels = (None if labels is None
                        else torch.tensor(labels, dtype=torch.long, device=device))
-        # persona prefix on every window, masked from the loss (REPL mirrors
-        # it; sourced from the corpus, so RoPE stays within max_len)
+        # persona prefix on every window, masked from the loss (REPL mirrors it; corpus-sourced, RoPE stays in max_len)
         self.prefix = (None if not prefix
                        else torch.tensor(prefix, dtype=torch.long, device=device))
         self.n_prefix = 0 if self.prefix is None else int(self.prefix.numel())
@@ -136,8 +135,7 @@ class BatchSampler:
             if picks.numel() == 0:
                 continue
             idx = picks.unsqueeze(1) + self.offsets.unsqueeze(0)
-            # Unshifted window: lm_loss applies the one-ahead shift itself
-            # (Attention Is All You Need, section 5.1 https://arxiv.org/abs/1706.03762)
+            # unshifted window: lm_loss applies the one-ahead shift itself
             if self.n_prefix:
                 wid = torch.cat([self.prefix.expand(idx.size(0), -1),
                                  self.ids[idx]], dim=1)
@@ -149,20 +147,18 @@ class BatchSampler:
                 yield self.ids[idx], (self.ids[idx] if self.labels is None
                                       else self.labels[idx])
 def _opt_float(value, default):
-    # Checkpoints store None for metrics a given run never produced.
+    # checkpoints store None for metrics a run never produced
     return default if value is None else float(value)
 
 
 def _finite_or_none(value):
-    # The train-loss "best" stays inf forever under validation gating, which
-    # torch.save would otherwise persist as a bare inf.
+    # torch.save chokes on a bare inf for the train-loss "best" under val gating
     if value is None:
         return None
     value = float(value)
     return None if value == float("inf") else value
 def _capture_rng():
-    # Resume must continue the RNG stream, not replay the seed: shuffling and
-    # dropout both draw from these generators.
+    # resume continues the RNG stream instead of replaying the seed
     state = {"torch": torch.get_rng_state(), "python": random.getstate()}
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
@@ -181,9 +177,7 @@ def _restore_rng(state):
     except (KeyError, TypeError, ValueError, RuntimeError):
         pass
 class WeightEMA:
-    # Decay-averaged copy of the trainable weights (Polyak averaging, as used
-    # by EMA in the timm/MAE lineage). Buffers are left alone; only the raw
-    # parameters a step would move are averaged.
+    # Polyak-averaged trainable weights, buffers untouched (timm/MAE-style EMA)
 
     def __init__(self, model, decay):
         self.decay = decay
@@ -204,11 +198,9 @@ class WeightEMA:
             if name in self.shadow:
                 self.shadow[name] = value.float().clone()
 class ValWindows:
-    # stride == block, no shuffle, so every validation token is predicted once.
-    # Yields exactly block tokens: block+1 overflows RoPE at max_len == block.
+    # stride == block, unshuffled: every val token predicted once exactly
     def __init__(self, ids, block, device, batch_size=8, labels=None):
-        # detach().clone() rather than torch.tensor(): ids is already a tensor
-        # and torch.tensor() re-wraps it through __array__, which warns
+        # as_tensor+clone, not torch.tensor: ids is a tensor already
         self.ids = torch.as_tensor(ids, dtype=torch.long).detach().clone().to(device)
         self.labels = (None if labels is None else
                        torch.as_tensor(labels, dtype=torch.long).detach().clone().to(device))
@@ -229,9 +221,7 @@ class ValWindows:
             yield chunk
 
     def __iter__(self):
-        # Grouped into batches: one (batch, block) pass beats block interleaved ones.
-        # start tracks the global window index: _pack needs it, because labels are
-        # sliced at absolute offsets and every batch but the first is non-zero.
+        # batched; start tracks the global window index for absolute label slices
         pending = []
         start = 0
         for chunk in self._windows():
@@ -247,8 +237,7 @@ class ValWindows:
         ids = torch.stack([c for c, _ in chunks])
         if self.labels is None:
             return ids, ids
-        # Contiguous slices at stride == block: the n-th window uses the n-th
-        # absolute offset, not its position inside this batch.
+        # contiguous slices at stride == block: window n uses absolute offset n
         labels = torch.stack([self.labels[s:s + self.block] for _, s in chunks])
         return ids, labels
 
@@ -272,7 +261,7 @@ class Trainer:
         self.objective = args.objective
         self.start_step = start_step
         self.precision = getattr(args, "precision_dtype", None)
-        # fp16 gradients can underflow; GradScaler is a no-op unless fp16 on CUDA.
+        # fp16 gradients underflow; the scaler is a no-op unless fp16 on CUDA
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=self.precision == torch.float16
             and self.device.type == "cuda")
@@ -284,8 +273,7 @@ class Trainer:
         self.grad_clip = max(0.0, float(getattr(args, "grad_clip", GRAD_CLIP)))
         self.spike_count = 0
         self.diverged = False
-        # Spike reference is the best windowed mean, never the best single minibatch:
-        # the loss distribution has a long left tail that one lucky batch sets.
+        # spike reference is the best windowed mean, never one lucky minibatch
         self.best_window = float("inf")
         self.val_windows = self._make_val_windows(args, device, val_ids,
                                                   val_label_ids)
@@ -293,17 +281,15 @@ class Trainer:
         self.stopped_early = False
         self.last_train_loss = float("inf")
 
-        # The span objective builds its own sentinel labels, so the completion
-        # mask only applies to plain language modelling.
+        # the span objective builds its own sentinel labels; the mask only applies to lm
         self._make_sampler(args, device, rank, world, ids, label_ids,
                            prefix_ids)
         self._make_optimizer(args)
 
-        # Restored across resumes so 'best' is not scoped to this process.
+        # restored across resumes so 'best' is not scoped to this process
         state = state or {}
         self._restore_best(state)
-        # Adam moments are not derivable from the weights; the LR schedule is a pure
-        # function of the step counter, so it needs no state.
+        # adam moments are saved; the LR schedule is a pure function of step
         self._restore_optimizer(state)
         self._restore_scaler(state)
         _restore_rng(state)
@@ -311,11 +297,10 @@ class Trainer:
         self.ema = (WeightEMA(self._unwrap(), self.ema_decay)
                     if self.ema_decay else None)
         self._restore_ema(state)
-        # True per-step window, sized independently of --log-every, which only sets
-        # how often a line prints. Bounded so it cannot grow with the run.
+        # per-step loss window, bounded so it cannot grow with the run
         self.window_n = max(16, min(args.log_every, 256))
         self.recent = deque(maxlen=self.window_n)
-        # Pre-clip gradient norms, for clip-threshold diagnosis (report only).
+        # pre-clip grad norms, for the clip-threshold diagnosis (report only)
         self.grad_norms = deque(maxlen=2048)
         self.run_start = time.perf_counter()
         self.window_start = self.run_start
@@ -323,8 +308,7 @@ class Trainer:
 
     @staticmethod
     def _resolve_epochs_target(args, state):
-        # args.epochs means 'to run now'; writing it back as the target shrinks the
-        # goal on every resume.
+        # args.epochs means 'run now'; storing it as the target would shrink every resume
         _stored_target = (state or {}).get("epochs_target")
         return int(_stored_target) if _stored_target else int(args.epochs)
 
@@ -345,9 +329,7 @@ class Trainer:
         self.total_steps = self.start_step + self.epochs * self.batches_per_epoch
 
     def _decay_split(self):
-        # Weight decay belongs on the linear maps, not on 1-D gains
-        # (RMSNorm), token embeddings, or biases. LoRA A/B are linear maps and
-        # decay like the weights they adapt.
+        # decay only on linear maps; norms, embeddings, biases excluded (REPORT.md N9)
         decay, no_decay = [], []
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -359,9 +341,7 @@ class Trainer:
         return decay, no_decay
 
     def _make_optimizer(self, args):
-        # AdamW with an empirical recipe: betas (0.9, 0.95), eps 1e-9,
-        # weight_decay 1e-2 (Attention Is All You Need 5.3 uses 0.98 and no
-        # decay; the citation is the lineage, the values are this project's).
+        # betas, eps, decay: this project's measured values (REPORT.md N16)
         decay, no_decay = self._decay_split()
         self.optimizer = torch.optim.AdamW(
             [{"params": decay, "weight_decay": 1e-2},
@@ -378,7 +358,7 @@ class Trainer:
         self.best = _opt_float(state.get("best"), float("inf"))
         self.best_step = int(state.get("best_step") or 0)
         self.best_val = _opt_float(state.get("best_val"), float("inf"))
-        # Kept for the summary; best and last drifting apart is the expected signal.
+        # kept for the summary; best and last drifting apart is the signal
         self.last_val = float("nan")
 
     def _restore_optimizer(self, state):
@@ -399,8 +379,7 @@ class Trainer:
                   flush=True)
 
     def _restore_scaler(self, state):
-        # fp16 loss-scale state; absent on fp32 checkpoints, where the scaler
-        # is disabled and load_state_dict on it would be meaningless.
+        # fp16 loss-scale state; absent on fp32 checkpoints
         if not state.get("scaler"):
             return
         try:
@@ -417,32 +396,28 @@ class Trainer:
             pass
 
     def _ema_state(self, state_dict):
-        # EMA is stored as fp32; cast back to each weight's dtype so the
-        # checkpoint loads into the same model it was averaged from.
+        # EMA is saved fp32, cast back per weight so the checkpoint reloads
         return {name: (self.ema.shadow[name].to(value.dtype)
                        if name in self.ema.shadow and value.is_floating_point()
                        else value)
                 for name, value in state_dict.items()}
 
     def _schedule_lr(self, step):
-        # LR schedules after linear warmup (Attention, 5.3 https://arxiv.org/abs/1706.03762;
-        # T5, 3.4 https://arxiv.org/abs/2005.14165; SGDR, 2.1 https://arxiv.org/abs/1608.03983)
+        # linear warmup, then invsqrt / cosine / constant (Attention 5.3; T5 3.4; SGDR 2.1)
         if self.warmup_steps <= 0:
             return
-        # linear warmup ramp applies to every schedule (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
         if step < self.warmup_steps:
             lr = self.lr * step / self.warmup_steps
         elif self.schedule == "cosine":
-            # lr(t) = lr_min + 0.5*(lr_max - lr_min)*(1 + cos(pi*t/T)), t = step - warmup,
-            # T_total = total_steps - warmup (SGDR, 2.1 https://arxiv.org/abs/1608.03983)
+            # lr(t) = 0.5*lr*(1+cos(pi*t/T)) from the warmup end (SGDR 2.1)
             t = step - self.warmup_steps
             total_sched = max(self.total_steps - self.warmup_steps, 1)
             lr = self.lr * 0.5 * (1.0 + math.cos(math.pi * t / total_sched))
         elif self.schedule == "constant":
-            # flat LR at args.lr after warmup (T5, section 3.4 https://arxiv.org/abs/2005.14165)
+            # flat LR after warmup (T5 3.4)
             lr = self.lr
         else:
-            # inverse-square-root decay after warmup peak base_lr (Attention Is All You Need, section 5.3 https://arxiv.org/abs/1706.03762)
+            # invsqrt decay from base_lr = lr*sqrt(warmup) (Attention 5.3)
             lr = self.base_lr * min(step ** -0.5, step * self.warmup_steps ** -1.5)
         for group in self.optimizer.param_groups:
             group["lr"] = lr
@@ -454,7 +429,7 @@ class Trainer:
         return lm_loss(logits, targets, self.label_smoothing)
 
     def _train_step(self, inputs, targets):
-        # mixed-precision autocast for bf16/fp16 with frozen NF4 base (QLoRA, section 3.4 https://arxiv.org/abs/2305.18290)
+        # bf16/fp16 autocast with the frozen NF4 base (QLoRA 3.4)
         precision = self.precision
         with torch.autocast("cuda", dtype=precision, enabled=precision is not None and self.device.type == "cuda"):
             loss = self._forward_loss(inputs, targets)
@@ -463,8 +438,7 @@ class Trainer:
         return loss
 
     def evaluate(self):
-        # Held-out loss with dropout off and no shuffling. Returns None when no
-        # validation split was built.
+        # held-out loss, dropout off, unshuffled; None when no val split exists
         if self.val_windows is None:
             return None
         model = self._unwrap()
@@ -478,8 +452,7 @@ class Trainer:
                                     enabled=self.precision is not None
                                     and self.device.type == "cuda"):
                     loss = self._forward_loss(batch, targets)
-                # weight by batch size so a trailing partial batch is not
-                # counted as heavily as a full one
+                # weight by batch size so a trailing partial batch counts less
                 n = batch.shape[0]
                 total += loss.item() * n
                 count += n
@@ -487,8 +460,7 @@ class Trainer:
         return total / count if count else None
 
     def _maybe_validate(self, steps, epoch):
-        # Only rank 0 stops, but the flag must reach every rank or the others keep
-        # entering all-reduce with a peer that left, and hang.
+        # the stop flag broadcasts to every rank; peers would hang in all-reduce
         stop = self._validate_on_rank0(steps, epoch)
         if self.world > 1:
             import torch.distributed as dist
@@ -500,7 +472,7 @@ class Trainer:
         return stop
 
     def _validate_on_rank0(self, steps, epoch):
-        # Gate retention on val loss: with dropout off, train loss can only fall.
+        # retention gated on val loss; with dropout off train loss only falls
         if self.val_windows is None or self.rank != 0:
             return False
         val = self.evaluate()
@@ -554,8 +526,7 @@ class Trainer:
                 inputs, targets = self._corrupt_span(inputs)
             loss = self._train_step(inputs, targets)
             self._record_loss(loss)
-            # Runaway guard: clip_grad_norm_ bounds gradient size but cannot un-NaN the
-            # weights, and --keep-last would then save an all-NaN checkpoint.
+            # clip bounds gradients but cannot un-NaN weights, and --keep-last would save all-NaN
             if self._diverged(self.last_train_loss, steps, epoch):
                 self._abort_diverged(steps, epoch)
                 return None
@@ -568,9 +539,9 @@ class Trainer:
                 opt_steps += 1
                 stepped = True
             self._maybe_log(steps, epoch, loss.item())
-            # --val-every counts optimizer steps; steps counts micro-batches.
+            # --val-every counts optimizer steps; steps counts micro-batches
             if self._stop_after_validate(steps, epoch, stepped, opt_steps):
-                # last_train_loss, not self.best: best is only set at an epoch boundary.
+                # last_train_loss, not self.best: best only sets at an epoch end
                 return None
         return total, batches, accum, steps, opt_steps
 
@@ -585,12 +556,10 @@ class Trainer:
             self.recent.append(self.last_train_loss)
 
     def _optimizer_step(self):
-        # Unscale before clipping so the 1.0 threshold is in real units; the
-        # disabled fp32 path skips both calls (GradScaler no-ops them).
+        # unscale before clipping so the 1.0 threshold is in real units; fp32 skips both
         if self.scaler.is_enabled():
             self.scaler.unscale_(self.optimizer)
-        # A disabled clip still needs the norm for telemetry; a huge finite
-        # max_norm is a no-op scale that clip_grad_norm_ returns the norm for.
+        # a disabled clip still reports the norm via a huge no-op max_norm
         threshold = self.grad_clip if self.grad_clip > 0 else 1e9
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
                                                    threshold)
@@ -620,11 +589,9 @@ class Trainer:
         return False
 
     def _diverged(self, loss, steps, epoch):
-        # Non-finite is a hard stop; the spike check only counts, so one bad
-        # minibatch does not end the run.
+        # non-finite is a hard stop; the spike check only counts after a full reference window
         if not math.isfinite(loss):
             return True
-        # Needs a full window before it has a reference to compare against.
         if len(self.recent) < self.window_n:
             self.spike_count = 0
             return False
@@ -688,8 +655,7 @@ class Trainer:
         self.save_if_best(avg, steps)
 
     def save_if_best(self, avg, steps):
-        # Only used when there is no validation split; with one, _maybe_validate
-        # owns which checkpoint gets retained.
+        # train-loss retention only without a val split; with one, _maybe_validate owns retention
         if self.rank != 0 or self.val_windows is not None or avg >= self.best:
             return
         self.best = avg
@@ -704,7 +670,7 @@ class Trainer:
         model = self._unwrap()
         model.eval()
         user_name, her_name = speaker_names()
-        # Colon only: a trailing space is a token training never produces.
+        # colon only: a trailing space is a token training never produces
         seed = self.tokenizer.encode(f"{user_name}: hola como estas\n{her_name}:")
         out = model.generate(
             torch.tensor([seed], device=self.device),
@@ -715,15 +681,14 @@ class Trainer:
         print(f"  sample: {self.tokenizer.decode(out)}", flush=True)
 
     def epochs_done(self, steps):
-        # Epochs completed, not requested: an interrupted run stored 20 after 1.9.
+        # epochs completed, not requested: an interrupted run stored 20 at 1.9
         per = max(1, self.batches_per_epoch)
         return int(steps) // per
 
     def save(self, loss, steps, val_loss=None):
-        # loss and step are a matched pair: the train loss at exactly this step.
-        # best_val/best_step travel separately so a resume restores them.
+        # loss and step are a matched pair; best_val/best_step travel separately
         state_dict = self._unwrap().state_dict()
-        # Never persist non-finite weights over a good checkpoint.
+        # never persist non-finite weights over the retained checkpoint
         if not math.isfinite(loss) or any(
                 not torch.isfinite(v).all() for v in state_dict.values()
                 if v.is_floating_point()):

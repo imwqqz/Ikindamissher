@@ -1,8 +1,7 @@
 """Export a WhatsApp chat to the JSONL that LLaMA-Factory / Unsloth / TRL read.
 
-Reuses her.py's parsing rules, then regroups the flat turn list into
-conversations. Unlike her.py's parse_wa: continuation lines are kept, and
-unanswered messages are dropped (an SFT example needs both halves).
+Reuses her.py's parsing rules, regrouped into conversations; continuation
+lines kept, unanswered messages dropped (an SFT row needs both halves).
 
 """
 
@@ -23,8 +22,7 @@ from config import DEFAULT_DATA, DEFAULT_DESC, DEFAULT_QA, PROJECT_ROOT
 from data import (WA_LINE, WA_NOISE, configure_speakers, detect_user,
                   persona_lines, persona_qa_turns, speaker_names)
 
-# These match 'name: message' only by accident, via the colon inside the
-# timestamp, so they would be appended to the previous turn.
+# match 'name: message' only by accident, via the colon inside the timestamp
 SYSTEM = re.compile(
     r"^(\d{1,2}/\d{1,2}/\d{2,4},[^-\n]*- )?"
     r"(messages and calls are end-to-end encrypted|"

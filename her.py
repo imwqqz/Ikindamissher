@@ -10,14 +10,14 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 
 import torch
 
-from checkpoint import load_checkpoint, load_tokenizer, resolve_model
+from engines.legacy.checkpoint import load_checkpoint, load_tokenizer, resolve_model
 from config import cli_flags, parse_args, request_cpu_fallback, resolve_block
 from data import (
     build_corpus, configure_speakers, conversation_ends, her_turn_ends,
     persona_lines, speaker_names, target_char_mask,
 )
-from model import build_model, trainable_count, total_count
-from training import Trainer
+from engines.legacy.model import build_model, trainable_count, total_count
+from engines.legacy.training import Trainer
 
 def load_corpus(args):
     data = Path(args.data)

@@ -1,21 +1,13 @@
-"""24/7 HTTP daemon around the chatbot engine (plan phase 4).
+"""24/7 HTTP daemon around the chatbot engine.
 
-Endpoints (poll transport only: a phone-less local client with a scheduler,
-no SSE):
+Run: uv run python server\\service.py --engine qwen (or --engine legacy)
+Endpoints (poll transport only):
 - POST /message  {"text": "..."}  -> {"reply": "..."}
 - GET  /poll?since=N             -> {"messages": [{id, text, ts}], "since": N}
 
-Durability (plan audit fixes baked in):
-- the session history is written atomically (tmp file -> os.replace) after
-  every turn, so a crash mid-write never truncates the file;
-- proactive messages go straight into SQLite, so nothing is queued in memory
-  to lose on restart;
-- the scheduler tick runs in try/except and reschedules in finally: one bad
-  tick logs and the daemon lives on.
-
-Run:  uv run python src\\service.py --engine qwen [--host 127.0.0.1 --port 8777]
+Durability: atomic session writes every turn, proactive messages in SQLite,
+one bad scheduler tick logs without stopping the daemon.
 """
-import argparse
 import json
 import os
 import sqlite3
@@ -35,7 +27,8 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-import chatbot as chat
+import engines.dispatch as engine
+import client.repl as cli
 from config import resolve_config_args
 from data import speaker_names
 
@@ -51,8 +44,7 @@ def load_session(path=SESSION_PATH):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        # a corrupt session must not take the daemon down; keep the bad file
-        # aside instead of overwriting it
+        # a corrupt session moves aside instead of overwriting (REPORT.md)
         bad = Path(path).with_suffix(".corrupt.json")
         try:
             os.replace(path, bad)
@@ -71,7 +63,6 @@ def save_session(sess, path=SESSION_PATH):
     tmp.write_text(json.dumps(sess, ensure_ascii=False, indent=1),
                    encoding="utf-8")
     os.replace(tmp, path)  # atomic on Windows (same volume)
-
 
 def _init_queue(path=QUEUE_PATH):
     with sqlite3.connect(path) as con:
@@ -103,18 +94,17 @@ def handle_message(text, S):
     with S["session_lock"]:
         history = list(load_session().get("history", []))
         with S["engine_lock"]:
-            reply = chat.generate_reply(
+            reply = engine.generate_reply(
                 args, S["state"], S["model"], S["tokenizer"], text, history,
                 S["demo_index"], S["device"])
             if not isinstance(reply, str):  # never trust the engine blindly
                 reply = ""
-            # remember the user's turn even when the engine stayed silent,
-            # otherwise she loses the question from her context
+            # remember the user's turn even on a silent reply
             history.append(f"{user_name}: "
-                           f"{chat.clip_msg(text, 15, S['tokenizer'])}")
+                           f"{engine.clip_msg(text, 15, S['tokenizer'])}")
             if reply:
                 history.append(f"{her_name}: "
-                               f"{chat.clip_msg(reply, 15, S['tokenizer'])}")
+                               f"{engine.clip_msg(reply, 15, S['tokenizer'])}")
             history = history[-16:]
             save_session({"history": history, "updated": time.time()})
     return reply
@@ -139,18 +129,17 @@ def _tick(S):
                        args.quiet_end):
         return
     with S["engine_lock"]:
-        text = chat.generate_proactive(
+        text = engine.generate_proactive(
             args, S["state"], S["model"], S["tokenizer"], S["openers"],
             S["device"])
     if text:
         _queue_push(text, now)
-        # the opener belongs in the session history too, or the model never
-        # remembers she spoke first (REPL records it in chatbot.main)
+        # the opener joins the session history too, like the REPL records it
         with S["session_lock"]:
             _, her_name = speaker_names()
             history = list(load_session().get("history", []))
             history.append(f"{her_name}: "
-                           f"{chat.clip_msg(text, 15, S['tokenizer'])}")
+                           f"{engine.clip_msg(text, 15, S['tokenizer'])}")
             save_session({"history": history[-16:], "updated": now})
         S["last_proactive"] = now
         print(f"[scheduler] queued proactive: {text!r}")
@@ -218,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def build_parser():
-    ap = chat.build_parser()
+    ap = cli.build_parser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--interval", type=int, default=60,
@@ -236,18 +225,18 @@ def build_parser():
 
 def main(argv=None):
     parser = build_parser()
-    args = resolve_config_args(parser, argv, chat.CHAT_CONFIG)
-    args = chat.resolve_max_reply(args)
+    args = resolve_config_args(parser, argv, cli.CHAT_CONFIG)
+    args = engine.resolve_max_reply(args)
 
-    device = chat._setup_device(args.cpu)
-    state, model, tokenizer = chat.load_assets(args, device)
+    device = cli._setup_device(args.cpu)
+    state, model, tokenizer = engine.load_assets(args, device)
     cfg = state["cfg"]
-    chat._configure_from_checkpoint(args, cfg)
+    cli._configure_from_checkpoint(args, cfg)
 
-    corpus_text = chat.load_corpus(args, cfg)
-    demo_index = chat.build_demo_index(corpus_text, tokenizer) \
+    corpus_text = engine.load_corpus(args, cfg)
+    demo_index = engine.build_demo_index(corpus_text, tokenizer) \
         if corpus_text else None
-    openers = chat.load_openers(args)
+    openers = engine.load_openers(args)
 
     _init_queue()
     S = {
@@ -283,3 +272,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+

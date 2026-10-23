@@ -1,11 +1,7 @@
 """Phase 5 gate: legacy vs qwen side-by-side on fixed prompts.
 
-Run:
-    uv run python eval_qwen.py            # print both engines side by side
-    uv run python eval_qwen.py --gate     # + exit 0 only if qwen passes gates
-
-Gates (qwen column): no thinking markers leak into any reply, latency under
-the ceiling after the first reply (kernel warmup), and no empty replies.
+Gates (qwen column): no thinking-marker leak in any reply, latency under the
+ceiling after warmup, no empty replies. --gate exits non-zero on failure.
 Nothing here hardcodes speaker names; labels come from the runtime config.
 """
 
@@ -24,7 +20,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import torch
 
-import chatbot as chat
+import engines.dispatch as engine
+import client.repl as cli
 from config import resolve_config_args
 from data import speaker_names
 
@@ -61,22 +58,22 @@ WARMUP_REPLIES = 1
 
 def run_engine(args, engine_name, prompts):
     """[(prompt, reply, seconds)] for one engine; skips if it cannot load."""
-    device = chat._setup_device(args.cpu)
+    device = cli._setup_device(args.cpu)
     try:
-        state, model, tokenizer = chat.load_assets(args, device)
+        state, model, tokenizer = engine.load_assets(args, device)
     except SystemExit as exc:
         print(f"skipping engine {engine_name}: {exc}")
         return None
     cfg = state["cfg"]
-    chat._configure_from_checkpoint(args, cfg)
-    corpus_text = chat.load_corpus(args, cfg)
-    demo_index = chat.build_demo_index(corpus_text, tokenizer) \
+    cli._configure_from_checkpoint(args, cfg)
+    corpus_text = engine.load_corpus(args, cfg)
+    demo_index = engine.build_demo_index(corpus_text, tokenizer) \
         if corpus_text else None
     rows = []
     for i, prompt in enumerate(prompts):
         torch.manual_seed(args.seed + i)
         t0 = time.perf_counter()
-        reply = chat.generate_reply(args, state, model, tokenizer, prompt,
+        reply = engine.generate_reply(args, state, model, tokenizer, prompt,
                                     [], demo_index, device)
         rows.append((prompt, reply, time.perf_counter() - t0))
     del model
@@ -99,9 +96,9 @@ def main(argv=None):
     user_name, her_name = speaker_names()
     results = {}
     for engine in ("legacy", "qwen"):
-        args = resolve_config_args(chat.build_parser(),
-                                   ["--engine", engine], chat.CHAT_CONFIG)
-        args = chat.resolve_max_reply(args)
+        args = resolve_config_args(cli.build_parser(),
+                                   ["--engine", engine], cli.CHAT_CONFIG)
+        args = engine.resolve_max_reply(args)
         print(f"\n=== engine: {engine} ({len(prompts)} prompts) ===")
         results[engine] = run_engine(args, engine, prompts)
 
@@ -140,9 +137,10 @@ def main(argv=None):
 
 
 def _think_markers():
-    import qwen_lm
+    import engines.qwen.qwen_lm as qwen_lm
     return qwen_lm.think_markers()
 
 
 if __name__ == "__main__":
     main()
+

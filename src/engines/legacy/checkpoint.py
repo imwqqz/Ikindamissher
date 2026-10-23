@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 
 from config import build_cfg, cli_flags
-from model import build_model
+from engines.legacy.model import build_model
 from tokenizer import BytePairEncoder, bpe_from_state
 
 def load_checkpoint(args, rank, world):

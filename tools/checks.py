@@ -15,14 +15,15 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
 import data
-from model import build_model
+from engines.legacy.model import build_model
 from tokenizer import BytePairEncoder
-from training import Trainer, lm_loss
+from engines.legacy.training import Trainer, lm_loss
 from config import parse_args
 
 CORPUS = ("hola como estas gracias buenos dias que tal nos vemos luego "
@@ -97,10 +98,7 @@ def check_boundary():
 
 
 def check_loss_at_init():
-    # Band, not equality: at init the loss sits above ln(V) by the residual
-    # stack's logit spread (measured ~+2.2 nats, stable across sizes). The band
-    # still catches the documented catastrophic misinit: embedding std=1 gives
-    # ~128 vs ~10.5 for vocab 4096.
+    # band, not equality: residual logit spread sits ~+2.2 nats above ln(V); catches the std=1 misinit (~128 vs ~10.5, REPORT.md N8)
     torch.manual_seed(0)
     cfg = tiny_cfg()
     model = build_model(cfg)
@@ -179,9 +177,7 @@ def check_turn_end_invariants():
 
 
 def check_turn_generation():
-    # Overfit a synthetic corpus with a two-message turn, then generate: the
-    # reply must contain the intra-turn newline and must not bleed into the
-    # user's turn. This is the end-to-end proof that the sentinel stops a turn.
+    # end-to-end sentinel proof: overfit a two-message turn, generate; the reply keeps the intra-turn newline without bleeding into the user's turn
     encoder = toy_encoder()
     if not hasattr(encoder, "turn_end_id"):
         return True, "skipped (turn-end sentinel not implemented yet)"
@@ -245,7 +241,7 @@ def check_conversation_end():
 
 
 def check_reply_shape():
-    import chatbot
+    import engines.dispatch as chatbot
     user, her = SPEAKER_USER, SPEAKER_HER
     raw = (f": hola que tal\n{her}: como estas\n{her}: nos vemos\n"
            f"{user}: y vos\n")
@@ -267,8 +263,7 @@ def check_grad_norm_telemetry():
     model = build_model(cfg)
     ids = torch.randperm(cfg["vocab_size"]).tolist() * 2
     with tempfile.TemporaryDirectory() as tmp:
-        # The gate runs on any machine, so the checkpoint lands in a fresh
-        # temp dir instead of a path that may not exist.
+        # checkpoint in a fresh temp dir so the gate runs on any machine
         ckpt = Path(tmp) / "checks_gnorm.pt"
         trainer = Trainer(trainer_args(), cfg, model, ids, torch.device("cpu"),
                           BytePairEncoder(), ckpt)
@@ -279,8 +274,7 @@ def check_grad_norm_telemetry():
 
 
 def check_cli_flags():
-    # A flag must count as 'asked for' in both spellings, or a --size preset
-    # silently overwrites an explicit --d-model=512.
+    # --d-model=512 must count as asked-for in both spellings, else a --size preset silently overwrites it
     from config import cli_flags, parse_args
     args = parse_args(["--size", "small", "--d-model=512"], config={})
     seen = "--d-model" in cli_flags(["--d-model=512"])
@@ -294,9 +288,8 @@ def check_cli_flags():
 
 
 def check_demo_retrieval():
-    # Two best-matching exchanges in one conversation must still yield two
-    # demos (the second from another conversation), separated by a blank line.
-    import chatbot
+    # one conversation must still yield two demos, the second from another, on separate lines
+    import engines.dispatch as chatbot
     encoder = toy_encoder()
     data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
     corpus = (f"{SPEAKER_USER}: gato lindo\n{SPEAKER_HER}: miau\n"
@@ -317,7 +310,7 @@ def check_qwen_template():
     EMPTY thinking block, texts survive encode->decode, and a generation
     prompt pre-closes the block (documented force-non-thinking mechanism)."""
     try:
-        import qwen_lm
+        import engines.qwen.qwen_lm as qwen_lm
     except ImportError as exc:
         return False, f"qwen stack missing: {exc}"
     tok = qwen_lm.get_tokenizer()
@@ -348,7 +341,7 @@ def check_qwen_mask():
     user/system text get -100. Decode-as-ids must equal the assistant turn
     (this test exists because a mask/ids mix-up trained silently to loss 0)."""
     try:
-        import qwen_lm
+        import engines.qwen.qwen_lm as qwen_lm
     except ImportError as exc:
         return False, f"qwen stack missing: {exc}"
     tok = qwen_lm.get_tokenizer()
@@ -375,7 +368,7 @@ def check_qwen_strip_think():
     """strip_think: closed blocks removed with the visible text kept; an
     unclosed block (truncation) shows nothing after the open marker."""
     try:
-        import qwen_lm
+        import engines.qwen.qwen_lm as qwen_lm
     except ImportError as exc:
         return False, f"qwen stack missing: {exc}"
     open_m, close_m = qwen_lm.think_markers()
@@ -459,3 +452,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

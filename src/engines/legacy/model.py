@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# NF4 lookup table (normalized to [-1, 1]) (https://arxiv.org/abs/2305.18290)
+# NF4 lookup table, normalized to [-1, 1] (QLoRA 3.1)
 NF4_LEVELS = torch.tensor([
     -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
     -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
@@ -13,15 +13,12 @@ NF4_LEVELS = torch.tensor([
     0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
     0.7229568362236023, 1.0,
 ])
-# RoPE applied to interleaved q/k pairs (RoFormer, Su et al., 2021,
-# https://arxiv.org/abs/2104.09864) -- not from Attention Is All You Need,
-# whose section 3.5 is fixed sinusoidal absolute encoding.
+# Rotary position embedding on interleaved q/k pairs (RoFormer)
 def _rotate_half(x):
     x1, x2 = x[..., 0::2], x[..., 1::2]
     return torch.stack([-x2, x1], dim=-1).flatten(-2)
 
-# Rotary position embedding, applied to q and k inside attention (RoFormer,
-# https://arxiv.org/abs/2104.09864).
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_len: int, base: float = 10000.0):
         super().__init__()
@@ -33,14 +30,12 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", torch.sin(emb).unsqueeze(0).unsqueeze(0))
 
     def apply(self, q, k, start: int, length: int):
-        # Cast the fp32 cache down once: q * cos otherwise promotes both to
-        # fp32 inside bf16/fp16 autocast, undoing the mixed-precision savings.
+        # cast the fp32 cache down once or autocast promotes q*cos to fp32 (REPORT.md N10)
         cos = self.cos_cached[:, :, start:start + length].to(q.dtype)
         sin = self.sin_cached[:, :, start:start + length].to(q.dtype)
         return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
-# RMSNorm used in pre-norm blocks (no mean subtraction, no bias); this is the
-# LLaMA-family normalization, not T5's bias-free LayerNorm.
+# RMSNorm: pre-norm, no mean subtraction, no bias (LLaMA family)
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -50,7 +45,8 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return x * rms * self.weight
-    #Block-wise 4-bit NormalFloat quantization with double quantization of the scale constants (QLoRA sections 3.1-3.2 https://arxiv.org/abs/2305.18290).
+
+# Block-wise NF4 quantization with double-quantized scales (QLoRA 3.1-3.2)
 def nf4_quantize(weight: torch.Tensor, block: int = 64, scale_block: int = 256):
     weight = weight.float().contiguous().view(-1)
     n = weight.numel()
@@ -64,12 +60,11 @@ def nf4_quantize(weight: torch.Tensor, block: int = 64, scale_block: int = 256):
     norm = (blocks / scale.unsqueeze(1)).clamp(-1.0, 1.0)
     idx = (norm.unsqueeze(-1) - NF4_LEVELS).abs().argmin(-1)  # (nb, block) in 0..15
     idx = idx.view(-1)
-    # Padding above makes the element count a multiple of `block` (64), so the
-    # pair packing below always has an even count.
+    # pad right so the element count is even for the byte packing below
     parity = (idx[0::2] << 4) | idx[1::2]
     qweight = parity.to(torch.uint8)
 
-    # double quantization (QLoRA, section 3.2 https://arxiv.org/abs/2305.18290):
+    # double quantization of the scale constants (QLoRA 3.2):
     nb = scale.numel()
     pads = (scale_block - nb % scale_block) % scale_block
     sext = F.pad(scale, (0, pads)) if pads else scale
@@ -79,7 +74,7 @@ def nf4_quantize(weight: torch.Tensor, block: int = 64, scale_block: int = 256):
     scode = torch.round(sg / s_scale * 127).to(torch.int8)
     return qweight, scode, s_scale
 
-#Inverse of nf4_quantize (QLoRA, section 3.1, Algorithm 1).
+# Inverse of nf4_quantize (QLoRA 3.1, Algorithm 1)
 def nf4_dequantize(qweight: torch.Tensor, scode: torch.Tensor,
                    s_scale: torch.Tensor, shape: Tuple[int, int],
                    block: int = 64, scale_block: int = 256):
@@ -91,7 +86,7 @@ def nf4_dequantize(qweight: torch.Tensor, scode: torch.Tensor,
     n = shape[0] * shape[1]
     return flat[:n].reshape(shape)
 
-# Linear layer: frozen base, optional NF4 + LoRA adapter (QLoRA, section 3.4 https://arxiv.org/abs/2305.18290; LoRA, sections 4.1-4.2 https://arxiv.org/abs/2106.09685)
+# Linear layer: frozen base, optional NF4 + LoRA adapter (QLoRA 3.4; LoRA 4.1)
 class ParameterEfficientLinear(nn.Module):
 
     # output = W0 x + (alpha / r) * (x A) B
@@ -118,10 +113,7 @@ class ParameterEfficientLinear(nn.Module):
             self.qweight = self.qweight.contiguous()
         else:
             base = nn.Linear(in_features, out_features, bias=False)
-            # Freeze only when a frozen base is the point. Unconditionally
-            # freezing here left wq/wk/wv/wo with no gradient at lora=False,
-            # qlora=False: 4,718,592 of 15,735,168 params frozen (30%), all of
-            # it attention, while FeedForward used plain nn.Linear and trained.
+            # freeze only when a frozen base is the point; unconditional freezing once stripped every attention gradient at lora=False
             if lora:
                 base.weight.requires_grad_(False)
             self.base = base
@@ -134,7 +126,7 @@ class ParameterEfficientLinear(nn.Module):
             nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
     def set_weight(self, w: torch.Tensor):
-        # (Re)quantize fp32 weights into the NF4 buffers (QLoRA, section 3.1 https://arxiv.org/abs/2305.18290)
+        # (re)quantize fp32 weights into the NF4 buffers
         assert self.quant == "nf4"
         qweight, scode, s_scale = nf4_quantize(w, block=self.block)
         self.qweight = qweight.contiguous()
@@ -152,13 +144,12 @@ class ParameterEfficientLinear(nn.Module):
         w = self.get_weight()
         out = F.linear(x, w)
         if self.lora_enabled:
-            # W = W0 + (alpha / r) * BA (LoRA, section 4.1
-            # https://arxiv.org/abs/2106.09685)
+            # W = W0 + (alpha/r) * BA (LoRA 4.1)
             scale = self.alpha / max(self.lora_r, 1)
             out = out + scale * (self.lora_dropout(x) @ self.lora_a @ self.lora_b)
         return out
 
-# Multi-head causal attention over scaled dot products (Attention Is All You Need, sections 3.2.1-3.2.2 https://arxiv.org/abs/1706.03762)
+# Multi-head causal attention over scaled dot products (Attention 3.2)
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, cfg, rotary: RotaryEmbedding):
@@ -198,10 +189,7 @@ class CausalSelfAttention(nn.Module):
             self._k = torch.cat([self._k, k], dim=2)
             self._v = torch.cat([self._v, v], dim=2)
             k, v = self._k, self._v
-            # Causal only when the query covers the whole key range, i.e. a fresh
-            # prefill. Setting this False unconditionally let every prompt token
-            # attend to its own future, so the first sampled token came from a
-            # non-causal forward and the poisoned cache corrupted all later steps.
+            # causal only when the query covers the whole key range; unconditional False once poisoned the cache (REPORT.md N11)
             is_causal = q.shape[2] == k.shape[2]
         else:
             is_causal = True
@@ -210,7 +198,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.wo(y)
 
-# Position-wise FFN with GELU (T5, section 3.1 https://arxiv.org/abs/2005.14165; 4x d_ff, Attention Is All You Need, section 3.3 https://arxiv.org/abs/1706.03762)
+# Position-wise FFN with GELU (T5 3.1; Attention 3.3)
 class FeedForward(nn.Module):
 
     def __init__(self, cfg):
@@ -222,9 +210,7 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.w2(F.gelu(self.w1(x)))
 
-# Pre-norm residual transformer block (residual + normalization, Attention Is
-# All You Need, section 3.1 https://arxiv.org/abs/1706.03762; the normalization
-# is RMSNorm, see above).
+# Pre-norm residual block (Attention 3.1; RMSNorm, see above)
 class Block(nn.Module):
 
     def __init__(self, cfg, rotary: RotaryEmbedding):
@@ -239,7 +225,7 @@ class Block(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x
 
-# Decoder-only transformer: sqrt(d_model)-scaled embeddings + tied head (Attention Is All You Need, section 3.4 https://arxiv.org/abs/1706.03762)
+# Decoder-only transformer: scaled embeddings + tied head (Attention 3.4)
 class GPT(nn.Module):
 
     def __init__(self, cfg):
@@ -252,11 +238,7 @@ class GPT(nn.Module):
         self.drop = nn.Dropout(cfg["dropout"])
         self.blocks = nn.ModuleList(Block(cfg, self.rotary) for _ in range(cfg["n_layers"]))
         self.norm = RMSNorm(cfg["d_model"])
-        # Variance scaling (Attention, 3.4): N(0, 1/d_model). forward() multiplies
-        # the embedding by sqrt(d_model), so the std must be d_model**-0.5 for
-        # that product to be unit. nn.Embedding defaults to std 1, which enters
-        # the blocks ~sqrt(d_model) too large and, through the tied head, gives
-        # a step-0 loss ~128 for vocab 4096 instead of ~10.5 (see checks.py C4).
+        # init std must offset the sqrt(d_model) forward scale, else step-0 loss ~128 (REPORT.md N8)
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=cfg["d_model"] ** -0.5)
         self._pos = 0
 
@@ -272,7 +254,7 @@ class GPT(nn.Module):
         x = self.drop(x)
         for b in self.blocks:
             if self.cfg.get("gc", False) and self.training and not use_cache:
-                # gradient checkpointing: trade recompute for memory
+                # recompute per block to save memory
                 x = torch.utils.checkpoint.checkpoint(
                     lambda t, s, u: b(t, s, u), x, start, use_cache, use_reentrant=False)
             else:
@@ -284,26 +266,21 @@ class GPT(nn.Module):
 
     def generate(self, idx, max_new=64, temperature=0.8, top_k=0, top_p=0.0,
                  repeat_penalty=1.0, stop_ids=()):
-        # KV-cache sampling: prefill the prompt, then sample one token at a time
-        # (Attention Is All You Need, section 5 https://arxiv.org/abs/1706.03762)
+        # KV-cache sampling: prefill once, sample one token per forward pass
         if idx.shape[0] != 1:
-            # Sampling, repeat penalty and stop detection all read row 0 only,
-            # and the append below assumes one row; per-row generation is a
-            # separate feature, so fail clearly instead of a size mismatch.
+            # sampling/stop-detection read row 0 only; fail clearly over a silent mismatch
             raise ValueError(
                 f"generate supports batch size 1 (got {idx.shape[0]})")
         self.reset_cache()
         device = idx.device
-        # Read logits from the prefill position; re-feeding idx[:,-1:] pushes the last
-        # prompt token through twice and shifts every later position by one.
+        # read logits from the prefill position, else the last prompt token passes twice
         logits = self(idx, use_cache=True)[0, -1] / max(temperature, 1e-8)
         gen = []
-        # RoPE allocates positions for max_len only, so a prompt at max_len leaves
-        # no room to answer.
+        # RoPE allocates max_len positions, so a prompt at max_len leaves no room
         budget = max(0, self.max_len - idx.shape[1])
         for _ in range(min(max_new, budget)):
             if repeat_penalty != 1.0 and gen:
-                # Penalize already-generated tokens (presence penalty) (The Curious Case of Neural Text Degeneration, section 5 https://arxiv.org/abs/1904.09751)
+                # presence penalty on already-generated tokens (Holtzman 5)
                 for token_id in set(gen):
                     token_logit = logits[token_id]
                     logits[token_id] = (token_logit / repeat_penalty
@@ -320,7 +297,7 @@ class GPT(nn.Module):
         self.reset_cache()
         return gen
 
-# Nucleus/top-k sampling distribution over the next token from raw logits (The Curious Case of Neural Text Degeneration, section 3.1 https://arxiv.org/abs/1904.09751)
+# Nucleus / top-k next-token distribution over raw logits (Holtzman 3.1)
 def sample_probs(logits, top_k, top_p):
     probs = F.softmax(logits, dim=-1)
     if top_k:
@@ -330,7 +307,7 @@ def sample_probs(logits, top_k, top_p):
         probs = probs.clone()
         probs[probs < threshold] = 0.0
     if top_p and top_p < 1.0:
-        # nucleus: smallest set with cumulative prob >= top_p (The Curious Case of Neural Text Degeneration, section 3.1 https://arxiv.org/abs/1904.09751)
+        # nucleus: smallest set with cumulative prob >= top_p (Holtzman 3.1)
         sorted_probs, _ = probs.sort(descending=True)
         cum = sorted_probs.cumsum(0)
         n = int((cum <= top_p).sum()) + 1
@@ -342,7 +319,7 @@ def sample_probs(logits, top_k, top_p):
         probs = F.softmax(logits, dim=-1)
     return probs / probs.sum()
 
-# Frozen base + trainable LoRA adapters (LoRA, section 4.1 https://arxiv.org/abs/2106.09685; QLoRA, section 3.4 https://arxiv.org/abs/2305.18290)
+# Frozen base + trainable LoRA adapters (LoRA 4.1; QLoRA 3.4)
 def build_model(cfg):
     model = GPT(cfg)
     if cfg.get("lora", False):
