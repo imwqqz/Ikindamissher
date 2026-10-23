@@ -7,13 +7,19 @@ name = "ikindamissher"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "accelerate>=1.15.0",
+    "bitsandbytes>=0.50.2",
+    "peft>=0.21.2",
     "torch==2.14.0",
+    "transformers>=5.20.2",
+    "trl>=1.16.0",
 ]
 
 [project.scripts]
 her-train = "her:main"
 her-chat = "chatbot:main"
 her-export-sft = "export_sft:main"
+her-service = "service:main"
 
 [tool.hatch.build.targets.wheel]
 packages = []
@@ -25,6 +31,8 @@ packages = []
 "src/training.py" = "training.py"
 "src/checkpoint.py" = "checkpoint.py"
 "src/config.py" = "config.py"
+"src/qwen_lm.py" = "qwen_lm.py"
+"src/service.py" = "service.py"
 "her.py" = "her.py"
 "chatbot.py" = "chatbot.py"
 "export_sft.py" = "export_sft.py"

@@ -4,10 +4,6 @@ Reuses her.py's parsing rules, then regroups the flat turn list into
 conversations. Unlike her.py's parse_wa: continuation lines are kept, and
 unanswered messages are dropped (an SFT example needs both halves).
 
-Usage:
-    py export_sft.py --out data/sft.json
-    py export_sft.py --out data/sft.json --format sharegpt
-    py export_sft.py --out data/sft.json --persona
 """
 
 import argparse
@@ -23,8 +19,9 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from config import DEFAULT_DATA, DEFAULT_DESC, PROJECT_ROOT
-from data import WA_LINE, WA_NOISE, configure_speakers, detect_user, persona_lines
+from config import DEFAULT_DATA, DEFAULT_DESC, DEFAULT_QA, PROJECT_ROOT
+from data import (WA_LINE, WA_NOISE, configure_speakers, detect_user,
+                  persona_lines, persona_qa_turns, speaker_names)
 
 # These match 'name: message' only by accident, via the colon inside the
 # timestamp, so they would be appended to the previous turn.
@@ -184,6 +181,32 @@ def _persona_block(args, her_name):
     return re.sub(rf"^{her_name}:\s*", "", persona, flags=re.M).strip()
 
 
+def _qa_rows(qa_path, user, her_name):
+    """Answer-shaped persona facts as user->her SFT rows.
+
+    Reuses data.py's q:/a: parser; a trailing user turn with no her reply
+    carries no completion and is dropped.
+    """
+    if not (qa_path and Path(qa_path).exists()):
+        return []
+    lines = persona_qa_turns(Path(qa_path).read_text(encoding="utf-8"),
+                             alias=her_name)
+    rows, current = [], []
+    for line in lines:
+        name, _, msg = line.partition(": ")
+        role = "user" if name.lower() == user else "assistant"
+        if role == "user":
+            if len(current) >= 2:
+                rows.append([{"role": r, "content": c}
+                             for r, c in current])
+            current = [("user", msg)]
+        else:
+            current.append(("assistant", msg))
+    if len(current) >= 2:
+        rows.append([{"role": r, "content": c} for r, c in current])
+    return rows
+
+
 def _build_rows(convs, fmt, persona):
     if fmt == "sharegpt":
         rows = to_sharegpt(convs)
@@ -220,8 +243,9 @@ def _tally(convs):
 
 def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
             train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
-            parsed_total, persona, her_name):
+            parsed_total, persona, her_name, qa_convs):
     print(f"wrote {len(rows)} conversations to {out}  ({fmt} format)")
+    print(f"  persona Q&A rows    {qa_convs}")
     print(f"  turns parsed        {len(turns):,}")
     print(f"  continuation kept   {stats['continuation']} lines (her.py drops these)")
     print(f"  system notice       {stats['system_notice']}")
@@ -266,6 +290,11 @@ def main(argv=None):
     )
     ap.add_argument("--description", type=Path, default=DEFAULT_DESC)
     ap.add_argument(
+        "--qa", type=Path, default=DEFAULT_QA,
+        help="persona Q&A file (q:/a:) exported as extra user->her rows; "
+             "pass an empty string to disable"
+    )
+    ap.add_argument(
         "--max-chars",
         type=int,
         default=2000,
@@ -291,6 +320,9 @@ def main(argv=None):
 
     convs, orphans = group_conversations(turns, user, her_name)
     convs, too_long = _drop_long_conversations(convs, args.max_chars)
+    qa_convs = _qa_rows(args.qa if str(args.qa or "") else None,
+                        user, her_name)
+    convs = convs + qa_convs
     persona = _persona_block(args, her_name)
     rows = _build_rows(convs, args.format, persona)
     _write_rows(rows, args.out)
@@ -298,7 +330,7 @@ def main(argv=None):
     train_chars, kept_chars, turns_per, msg_chars = _tally(convs)
     _report(args, rows, args.out, args.format, stats, turns, orphans, too_long,
             train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
-            parsed_total, persona, her_name)
+            parsed_total, persona, her_name, len(qa_convs))
 
 
 if __name__ == "__main__":
