@@ -286,6 +286,21 @@ def check_turnlog():
     return not failed, "audit ok" if not failed else f"failed: {failed}"
 
 
+def check_daemon_guard():
+    """The startup probe sees a listening socket, and a just-closed port reads
+    free again (so Ctrl+C + restart stays instant)."""
+    import socket
+    import server.service as service
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        busy = service._listening("127.0.0.1", port, timeout=0.5)
+    free = service._listening("127.0.0.1", port, timeout=0.2)
+    ok = busy and not free
+    return ok, f"busy={busy} free_after_close={not free}"
+
+
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
@@ -301,6 +316,7 @@ CHECKS = [
     ("queue-roundtrip", check_queue_roundtrip),
     ("chatlog", check_chatlog),
     ("turnlog", check_turnlog),
+    ("daemon-guard", check_daemon_guard),
 ]
 
 

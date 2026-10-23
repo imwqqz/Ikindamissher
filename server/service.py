@@ -7,9 +7,13 @@ Endpoints (poll transport only):
 
 Durability: atomic session writes every turn, proactive messages in SQLite,
 one bad scheduler tick logs without stopping the daemon.
+
+Startup: refuses to start when the port already has a listener, so two daemons
+can never share a port (and data) by accident.
 """
 import json
 import os
+import socket
 import sqlite3
 import sys
 import threading
@@ -277,10 +281,29 @@ def build_parser():
     return ap
 
 
+def _listening(host, port, timeout=1.0):
+    """True when something already accepts connections on host:port."""
+    probe = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    try:
+        with socket.create_connection((probe, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def main(argv=None):
     parser = build_parser()
     args = resolve_config_args(parser, argv, cli.CHAT_CONFIG)
     args = engine.resolve_max_reply(args)
+
+    # Before the model load: a second daemon must fail in a second, not after
+    # 30 seconds of loading weights only to bind the same port.
+    if _listening(args.host, args.port):
+        print(f"error: something is already listening on "
+              f"http://{args.host}:{args.port}")
+        print("stop that server first (Ctrl+C in its terminal), or pass "
+              "--port <other>")
+        return 1
 
     device = cli._setup_device(args.cpu)
     state, model, tokenizer = engine.load_assets(args, device)
@@ -309,7 +332,15 @@ def main(argv=None):
     stop = threading.Event()
     threading.Thread(target=_scheduler_loop, args=(S, stop), daemon=True).start()
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = None
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        # the probe is advisory; this catches the race and bad ports
+        stop.set()
+        print(f"error: could not bind {args.host}:{args.port}: {exc}")
+        print("stop the other server or pass --port <other>")
+        return 1
     server.S = S
     server.verbose = args.verbose
     print(f"serving on http://{args.host}:{args.port} "
@@ -322,8 +353,9 @@ def main(argv=None):
     finally:
         stop.set()
         server.server_close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 
