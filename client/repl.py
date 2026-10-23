@@ -53,6 +53,12 @@ def build_parser():
     ap.add_argument("--demo-len", type=int, default=20,
                     help="max tokens per demo message")
     ap.add_argument("--max-reply", type=int, default=40)
+    ap.add_argument("--candidates", type=int, default=3,
+                    help="sample this many replies and keep the one that best "
+                         "matches her retrieved turns (all are logged)")
+    ap.add_argument("--think", action="store_true",
+                    help="enable Qwen3 reasoning: slower, and the thought is "
+                         "logged only (never spoken)")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--repeat-penalty", type=float, default=1.15)
@@ -124,7 +130,7 @@ def _chat_loop(args, state, model, tokenizer, history, demo_index, device,
         if not prompt or prompt.lower() in ("exit", "quit"):
             break
         reply = generate_reply(args, state, model, tokenizer, prompt,
-                               history, demo_index, device)
+                               history, demo_index, device, source="repl")
         if reply:
             print(f"{BOT_LABEL}: {reply}")
             history.append(f"{user_name}: {clip_msg(prompt, 15, tokenizer)}")
@@ -153,7 +159,7 @@ def main(argv=None):
     print(f"chatting with her as {her_name!r} - type 'exit' to quit")
     if args.proactive or args.proactive_only:
         opener = generate_proactive(args, state, model, tokenizer,
-                                    load_openers(args), device)
+                                    load_openers(args), device, source="repl")
         if opener:
             print(f"{BOT_LABEL}: {opener}")
             history.append(f"{her_name}: {clip_msg(opener, 15, tokenizer)}")

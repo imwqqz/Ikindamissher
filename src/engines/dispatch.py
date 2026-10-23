@@ -30,6 +30,7 @@ from tokenizer import BytePairEncoder
 
 from chatlog import LOG_PATH
 import engines.qwen.chat as qwen_chat
+import turnlog
 
 
 def clip_msg(msg, max_tokens, tokenizer):
@@ -199,11 +200,76 @@ def _select_demos(demo_index, args, prompt, tokenizer):
     return "", 0
 
 
-def _system_block(args, prompt, demo_index, tokenizer):
-    """Persona description + retrieved demos, the qwen system text."""
+def _context(args, prompt, demo_index, tokenizer):
+    """(persona, demos, system): what she replies from, kept for the audit log."""
     description = _read_description(args)
     demos, _ = _select_demos(demo_index, args, prompt, tokenizer)
-    return "\n\n".join(p for p in (description, demos) if p)
+    system = "\n\n".join(p for p in (description, demos) if p)
+    return description, demos, system
+
+
+def _demo_answers(demo_index, prompt, tokenizer, shots=2):
+    """Her own turns from the demos retrieved for this prompt."""
+    if not demo_index or not demo_index[1]:
+        return []
+    picked = pick_demos(demo_index[1], demo_index[2], prompt, shots, tokenizer)
+    return [answer for _, answer, _, _ in picked]
+
+
+def _sample(args, hf_tok, hf_model, messages, user_name, her_name):
+    """N cleaned candidate replies plus the first thought (audit material)."""
+    candidates, thought = [], ""
+    for _ in range(max(1, getattr(args, "candidates", 1))):
+        visible, think = qwen_chat.generate(hf_tok, hf_model, messages, args)
+        candidates.append(qwen_chat.clean_reply(visible, user_name, her_name))
+        thought = thought or think
+    return candidates, thought
+
+
+def _choose(candidates, reference, tokenizer, weights):
+    """Pick the sample that best matches how she actually talks.
+
+    The reference is her own retrieved turns; the IDF-weighted overlap is the
+    same scorer retrieval uses, so the pick is explainable in the log.
+    """
+    if reference:
+        ref_tokens = tokenizer.encode(reference)
+        scored = [(text, _weighted_overlap(tokenizer.encode(text), ref_tokens,
+                                           weights))
+                  for text in candidates]
+    else:
+        scored = [(text, 0.0) for text in candidates]
+    if not any(text for text, _ in scored):
+        return "", "all candidates empty", scored
+    chosen, score = max(scored, key=lambda item: (bool(item[0]), item[1]))
+    why = (f"overlap {score:.3f} vs her retrieved turns" if reference
+           else "first non-empty sample (no reference turns)")
+    return chosen, why, scored
+
+
+def _audit(source, user_text, scored, chosen, why, context, thought):
+    try:
+        turnlog.record(source, user_text, scored, chosen, why, context,
+                       thought)
+    except Exception as exc:  # telemetry must never take the chat down
+        print(f"[telemetry] {exc}")
+
+
+def generate_reply(args, state, model, tokenizer, prompt, history, demo_index,
+                   device, source="unknown"):
+    hf_tok, hf_model = state["qwen"]
+    description, demos, system = _context(args, prompt, demo_index, tokenizer)
+    messages = qwen_chat.build_messages(system, prompt, history)
+    user_name, her_name = speaker_names()
+    candidates, thought = _sample(args, hf_tok, hf_model, messages,
+                                  user_name, her_name)
+    reference = " ".join(_demo_answers(demo_index, prompt, tokenizer))
+    weights = demo_index[2] if demo_index else {}
+    chosen, why, scored = _choose(candidates, reference, tokenizer, weights)
+    _audit(source, prompt, scored, chosen, why,
+           {"persona": description, "demos": demos, "history": list(history)},
+           thought)
+    return chosen
 
 
 def load_assets(args, device):
@@ -257,16 +323,6 @@ def load_corpus(args):
     return corpus_text
 
 
-def generate_reply(args, state, model, tokenizer, prompt, history, demo_index,
-                   device):
-    hf_tok, hf_model = state["qwen"]
-    system = _system_block(args, prompt, demo_index, tokenizer)
-    messages = qwen_chat.build_messages(system, prompt, history)
-    text = qwen_chat.generate(hf_tok, hf_model, messages, args)
-    user_name, her_name = speaker_names()
-    return qwen_chat.clean_reply(text, user_name, her_name)
-
-
 def load_openers(args):
     # Her first-of-conversation messages, straight from the raw export, so a
     # proactive line can imitate how and when she actually opens a chat.
@@ -285,21 +341,27 @@ def _opener_demos(candidates, args, tokenizer):
             for opener in candidates[:max(0, args.shots)]]
 
 
-def generate_proactive(args, state, model, tokenizer, openers, device):
+def generate_proactive(args, state, model, tokenizer, openers, device,
+                       source="daemon"):
     """One unprompted message, biased toward how she opens chats at this hour."""
     hf_tok, hf_model = state["qwen"]
     _, her_name = speaker_names()
     off_hour = args.proactive_hour if args.proactive_hour is not None \
         else time.localtime().tm_hour
-    candidates = openers_near_hour(openers, off_hour, args.proactive_window)
+    pool = openers_near_hour(openers, off_hour, args.proactive_window)
     # opener demos live inside the system text, same rule as the REPL
-    demos = _opener_demos(candidates, args, tokenizer)
+    demos = _opener_demos(pool, args, tokenizer)
     head = _read_description(args)
     lines = ([head] if head else []) + [f"{her_name}: {d}" for d in demos]
     # the empty user turn is a synthetic "she speaks first" cue; a reply that
     # comes back empty falls back to a real opener
     messages = qwen_chat.build_messages("\n\n".join(lines), "", [])
-    text = qwen_chat.generate(hf_tok, hf_model, messages, args)
     user_name, her_name = speaker_names()
-    reply = qwen_chat.clean_reply(text, user_name, her_name)
-    return reply or (candidates[0]["text"] if candidates else "")
+    candidates, thought = _sample(args, hf_tok, hf_model, messages,
+                                  user_name, her_name)
+    chosen, why, scored = _choose(candidates, " ".join(demos), tokenizer, {})
+    reply = chosen or (pool[0]["text"] if pool else "")
+    _audit(source, "", scored, reply, why,
+           {"persona": head, "demos": "\n".join(demos), "history": []},
+           thought)
+    return reply

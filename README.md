@@ -40,8 +40,13 @@ uv run python tools/export_sft.py --out data/sft.json --persona
 uv run python src/engines/qwen/qwen_lm.py  # fine-tune Qwen3 + the her adapter
 uv run python tools/train_from_chats.py    # fold live chats in (manual, later)
 
-uv run python client/repl.py   # chat REPL
+uv run python client/repl.py   # chat REPL (loads the model in-process)
 uv run python tools/checks.py  # self-checks on synthetic data; exit 0 required
+
+# or chat through the 24/7 daemon (the client loads no model):
+uv run python server\service.py
+uv run python client\chat.py
+uv run python tools\read_log.py --tail 10 --full
 ```
 
 ## Chat recipe
@@ -70,6 +75,17 @@ chats with no training. To teach the weights, run
 writes `data/sft_combined.json` (export rows + live rows, deduplicated), runs a
 short QLoRA train, and prints the restart reminder.
 
+**Every reply is audited.** Both clients sample `--candidates` replies
+(default 3), keep the one that best overlaps her retrieved turns, and write a
+row to `data/telemetry.sqlite3`: the candidates with their scores, the chosen
+reply, why it won, the exact context she replied from (persona, memory demos,
+history) and the thought. Read it with `uv run python tools/read_log.py --tail
+10 --full` (or `--json`). Nothing in the audit path slows the reply.
+
+`--think` enables Qwen3 reasoning: the thought is logged, never spoken. It adds
+generation time, and the adapter was trained with thinking off, so use it for
+inspection rather than daily chat.
+
 ## Project structure
 
 ```
@@ -78,16 +94,18 @@ Ikindamissher/
 │   ├── tokenizer.py           # byte-level BPE for demo retrieval
 │   ├── data.py                # WhatsApp export -> user/persona turns, persona
 │   ├── chatlog.py             # live turns -> data/live_chats.txt (corpus format)
+│   ├── turnlog.py             # turn audit log -> data/telemetry.sqlite3
 │   ├── config.py              # JSON config files + argparse plumbing
 │   └── engines/
 │       ├── dispatch.py        # engine door: assets, prompts, replies
 │       └── qwen/
 │           ├── qwen_lm.py     # Qwen3 + her QLoRA: train, load, generate
 │           └── chat.py        # chat rows, message building, reply cleanup
-├── client/repl.py             # chat REPL + few-shot retrieval
+├── client/repl.py             # chat REPL that loads the model
+├── client/chat.py             # thin REPL over the daemon's HTTP API
 ├── server/service.py          # 24/7 HTTP daemon (poll transport, proactive)
 ├── tools/                     # checks.py, train_tokenizer.py, export_sft.py,
-│                              #   train_from_chats.py
+│                              #   train_from_chats.py, read_log.py
 ├── configs/                   # chatbot.config.example.json + gitignored locals
 ├── data/                      # gitignored: export, persona, BPE, adapter, sft
 ├── .python-version            # 3.14.5

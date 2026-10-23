@@ -260,6 +260,32 @@ def check_chatlog():
                               else f"unexpected log: {text!r}")
 
 
+def check_turnlog():
+    """One audited turn round-trips: candidates, chosen reply, why, thought."""
+    import turnlog
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "telemetry.sqlite3"
+        turnlog.record("repl", "hola",
+                       [("hey", 0.5), ("otra cosa", 0.1)], "hey",
+                       "overlap 0.500 vs her retrieved turns",
+                       {"persona": "p", "demos": "d", "history": ["u: hola"]},
+                       "porque si", path=path, now=1000.0)
+        rows = turnlog.rows(path=path, limit=5)
+        other = turnlog.rows(path=path, limit=5, source="daemon")
+    checks = {
+        "row stored": len(rows) == 1,
+        "candidates kept": [c["text"] for c in rows[0]["candidates"]]
+                           == ["hey", "otra cosa"],
+        "scores kept": [c["score"] for c in rows[0]["candidates"]]
+                       == [0.5, 0.1],
+        "chosen/thought kept": rows[0]["chosen"] == "hey"
+                               and rows[0]["thought"] == "porque si",
+        "source filter": other == [],
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    return not failed, "audit ok" if not failed else f"failed: {failed}"
+
+
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
@@ -274,6 +300,7 @@ CHECKS = [
     ("session-corrupt", check_session_corrupt),
     ("queue-roundtrip", check_queue_roundtrip),
     ("chatlog", check_chatlog),
+    ("turnlog", check_turnlog),
 ]
 
 

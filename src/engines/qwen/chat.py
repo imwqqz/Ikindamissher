@@ -47,4 +47,5 @@ def generate(hf_tok, hf_model, messages, args):
     return qwen_lm.reply(
         hf_tok, hf_model, messages,
         max_new_tokens=args.max_reply, temperature=args.temperature,
-        top_p=args.top_p, repeat_penalty=args.repeat_penalty)
+        top_p=args.top_p, repeat_penalty=args.repeat_penalty,
+        think=getattr(args, "think", False))

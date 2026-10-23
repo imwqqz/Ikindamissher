@@ -29,7 +29,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import engines.dispatch as engine
 import client.repl as cli
-from chatlog import append_turn
+from chatlog import LOG_PATH, append_turn
 from config import resolve_config_args
 from data import speaker_names
 
@@ -108,7 +108,7 @@ def handle_message(text, S):
         with S["engine_lock"]:
             reply = engine.generate_reply(
                 args, S["state"], S["model"], S["tokenizer"], text, history,
-                S["demo_index"], S["device"])
+                S["demo_index"], S["device"], source="daemon")
             if not isinstance(reply, str):  # never trust the engine blindly
                 reply = ""
             # remember the user's turn even on a silent reply
@@ -130,6 +130,21 @@ def _in_quiet_hours(hour, start, end):
     if start < end:
         return start <= hour < end
     return hour >= start or hour < end  # window wraps midnight
+
+
+def _refresh_memory(S):
+    """Rebuild retrieval when live_chats.txt changed, so today's chats count."""
+    live = Path(LOG_PATH)
+    if not live.exists():
+        return
+    mtime = live.stat().st_mtime
+    if mtime <= S["live_mtime"]:
+        return
+    corpus_text = engine.load_corpus(S["args"])
+    S["demo_index"] = engine.build_demo_index(corpus_text, S["tokenizer"]) \
+        if corpus_text else None
+    S["live_mtime"] = mtime
+    print(f"[memory] retrieval refreshed ({mtime:.0f})")
 
 
 def _tick(S):
@@ -167,6 +182,7 @@ def _scheduler_loop(S, stop):
     while not stop.is_set():
         deadline = time.monotonic() + S["args"].interval
         try:
+            _refresh_memory(S)
             _tick(S)
         except Exception:
             traceback.print_exc()  # a bad tick must never stop the daemon
@@ -264,6 +280,7 @@ def main(argv=None):
         "engine_lock": threading.Lock(),   # one model, one generation at a time
         "session_lock": threading.Lock(),
         "last_proactive": 0.0,             # tick 1 fires if hours allow
+        "live_mtime": 0.0,
         "interval": args.interval,
     }
     stop = threading.Event()

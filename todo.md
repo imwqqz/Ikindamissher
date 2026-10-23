@@ -15,3 +15,6 @@
 - [ ] Console UX: optional `/new`, `/save`, streaming output (its own branch).
 - [ ] Voice: human-like TTS (XTTS local vs ElevenLabs) + STT.
 - [ ] Avatar: three.js + VRM page served by the daemon.
+- [ ] WhatsApp bridge (own branch): unofficial automation risks a ban; the
+  official path is the WhatsApp Business API. The daemon's HTTP API is the
+  integration point, so no daemon surgery should be needed.

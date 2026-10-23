@@ -38,12 +38,13 @@ def get_tokenizer(base: str = BASE) -> AutoTokenizer:
     return _tok_cache[base]
 
 
-def apply_template(messages, tokenizer=None, add_generation_prompt=False):
-    """One place renders the chat template, thinking disabled everywhere."""
+def apply_template(messages, tokenizer=None, add_generation_prompt=False,
+                   think=False):
+    """One place renders the chat template; thinking is off unless asked."""
     tok = tokenizer or get_tokenizer()
     return tok.apply_chat_template(messages, tokenize=False,
                                    add_generation_prompt=add_generation_prompt,
-                                   enable_thinking=False)
+                                   enable_thinking=think)
 
 
 _markers_cache = {}
@@ -132,10 +133,14 @@ def load_engine(base: str = BASE, adapter=None, device="cuda"):
 
 
 def reply(tok, model, messages, max_new_tokens=80, temperature=0.7, top_p=0.9,
-          repeat_penalty=1.0):
-    """One assistant turn: template -> sample -> visible text (leaked think
-    blocks stripped)."""
-    prompt = apply_template(messages, tok, add_generation_prompt=True)
+          repeat_penalty=1.0, think=False):
+    """One assistant turn -> (visible text, thought).
+
+    The thought is audit material (empty when thinking is off) and never
+    reaches the user-facing reply.
+    """
+    prompt = apply_template(messages, tok, add_generation_prompt=True,
+                            think=think)
     ids = tok(prompt, return_tensors="pt").to(model.device)
     gen_kwargs = dict(max_new_tokens=max_new_tokens, do_sample=True,
                       temperature=max(temperature, 1e-8), top_p=top_p)
@@ -144,7 +149,25 @@ def reply(tok, model, messages, max_new_tokens=80, temperature=0.7, top_p=0.9,
     out = model.generate(**ids, **gen_kwargs)
     text = tok.decode(out[0][ids["input_ids"].shape[1]:],
                       skip_special_tokens=True).strip()
-    return strip_think(text, tok)
+    return extract_think(text, tok)
+
+
+def extract_think(text, tokenizer=None):
+    """(visible, thought): a closed think block is audit only; an unclosed
+    block is a truncated leak, so nothing after the open marker is visible."""
+    open_m, close_m = think_markers(tokenizer)
+    if open_m in text:
+        head, _, tail = text.partition(open_m)
+        if close_m in tail:
+            block, _, rest = tail.partition(close_m)
+            return (head + rest).strip(), block.strip()
+        visible = head.strip().rstrip(" ...") if head.strip() else ""
+        return visible, tail.strip()
+    return text.strip(), ""
+
+
+def strip_think(text, tokenizer=None):
+    return extract_think(text, tokenizer)[0]
 
 
 def strip_think(text, tokenizer=None):
