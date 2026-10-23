@@ -28,3 +28,15 @@
 
 [^1]: If kept, move them under `scripts/plan/` and note in the header which plan
 phase they gate.
+
+## Coming up
+
+- [ ] S2 retrain: `uv run python src\engines\qwen\qwen_lm.py --epochs 6` →
+  gate with `uv run python tools\eval_qwen.py --gate` (exit 0) + a REPL eyeball.
+- [ ] After ~2 stable weeks of 24/7 qwen: retire the fire escape — delete
+  `src/engines/her/` + `her.py` in one commit (git history keeps it forever).
+- [ ] README run lines still name pre-restructure paths (`py chatbot.py`,
+  `src/service.py`, `src/qwen_lm.py`); update to `uv run python client/repl.py`,
+  `server/service.py`, `tools/*`, `src/engines/qwen/qwen_lm.py`.
+- [ ] `--engine legacy` was renamed to `--engine her`; remember it when hand-
+  typing REPL flags.
