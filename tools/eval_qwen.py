@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parents[1]
 for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -26,7 +26,7 @@ from config import resolve_config_args
 from data import speaker_names
 
 # fixed prompts, sorted roughly from small talk to needy; \n = multi-message
-PROMPT_FILE = Path(__file__).resolve().parent / "configs" / "eval_prompts.txt"
+PROMPT_FILE = Path(__file__).resolve().parents[1] / "configs" / "eval_prompts.txt"
 PROMPTS = [
     "hola como andas",
     "que hiciste hoy",
@@ -95,12 +95,12 @@ def main(argv=None):
 
     user_name, her_name = speaker_names()
     results = {}
-    for engine in ("legacy", "qwen"):
+    for brain in ("legacy", "qwen"):
         args = resolve_config_args(cli.build_parser(),
-                                   ["--engine", engine], cli.CHAT_CONFIG)
+                                   ["--engine", brain], cli.CHAT_CONFIG)
         args = engine.resolve_max_reply(args)
-        print(f"\n=== engine: {engine} ({len(prompts)} prompts) ===")
-        results[engine] = run_engine(args, engine, prompts)
+        print(f"\n=== engine: {brain} ({len(prompts)} prompts) ===")
+        results[brain] = run_engine(args, brain, prompts)
 
     qwen_rows = results["qwen"] or []
     legacy_rows = results["legacy"] or []
