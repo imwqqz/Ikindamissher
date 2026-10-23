@@ -12,10 +12,10 @@ for _p in (str(_ROOT / "src"), str(_ROOT), str(_TOOLS)):
         sys.path.insert(0, _p)
 
 import export_sft
-from config import CHAT_CONFIG, PROJECT_ROOT, load_config
+from config import CHAT_CONFIG, LIVE_DIR, PROJECT_ROOT, load_config
 from data import configure_speakers, speaker_names
 
-LIVE = PROJECT_ROOT / "data" / "live_chats.txt"
+LIVE = LIVE_DIR / "live_chats.txt"
 SFT = PROJECT_ROOT / "data" / "sft.json"
 COMBINED = PROJECT_ROOT / "data" / "sft_combined.json"
 

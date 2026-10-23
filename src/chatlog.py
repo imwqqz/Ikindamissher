@@ -9,10 +9,11 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from config import PROJECT_ROOT
+from config import LIVE_DIR, PROJECT_ROOT, move_legacy
 from data import CONVERSATION_GAP_MINUTES, speaker_names
 
-LOG_PATH = PROJECT_ROOT / "data" / "live_chats.txt"
+LOG_PATH = LIVE_DIR / "live_chats.txt"
+move_legacy(PROJECT_ROOT / "data" / "live_chats.txt", LOG_PATH)
 
 _lock = threading.Lock()
 # shortcut: the lock is per-process; the REPL and the daemon could in theory

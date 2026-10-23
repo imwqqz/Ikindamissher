@@ -68,7 +68,7 @@ messages are dropped by `--max-chars`: a pasted essay is not conversation and
 teaches the model to write essays.
 
 **Live memory.** Every console/daemon exchange is appended to
-`data/live_chats.txt` in the same corpus format (a silent hour starts a new
+`data/live/live_chats.txt` in the same corpus format (a silent hour starts a new
 conversation). `load_corpus` reads that file too, so retrieval remembers past
 chats with no training. To teach the weights, run
 `uv run python tools/train_from_chats.py --epochs 1`: it backs up the adapter,
@@ -77,7 +77,7 @@ short QLoRA train, and prints the restart reminder.
 
 **Every reply is audited.** Both clients sample `--candidates` replies
 (default 3), keep the one that best overlaps her retrieved turns, and write a
-row to `data/telemetry.sqlite3`: the candidates with their scores, the chosen
+row to `data/live/telemetry.sqlite3`: the candidates with their scores, the chosen
 reply, why it won, the exact context she replied from (persona, memory demos,
 history) and the thought. Read it with `uv run python tools/read_log.py --tail
 10 --full` (or `--json`). Nothing in the audit path slows the reply.
@@ -91,23 +91,25 @@ inspection rather than daily chat.
 ```
 Ikindamissher/
 ├── src/                       # library modules (imported from the source tree)
-│   ├── tokenizer.py           # byte-level BPE for demo retrieval
-│   ├── data.py                # WhatsApp export -> user/persona turns, persona
-│   ├── chatlog.py             # live turns -> data/live_chats.txt (corpus format)
-│   ├── turnlog.py             # turn audit log -> data/telemetry.sqlite3
-│   ├── config.py              # JSON config files + argparse plumbing
-│   └── engines/
-│       ├── dispatch.py        # engine door: assets, prompts, replies
-│       └── qwen/
-│           ├── qwen_lm.py     # Qwen3 + her QLoRA: train, load, generate
-│           └── chat.py        # chat rows, message building, reply cleanup
+�?  ├── tokenizer.py           # byte-level BPE for demo retrieval
+�?  ├── data.py                # WhatsApp export -> user/persona turns, persona
+�?  ├── chatlog.py             # live turns -> data/live/live_chats.txt (corpus format)
+�?  ├── turnlog.py             # turn audit log -> data/live/telemetry.sqlite3
+�?  ├── config.py              # JSON config files + argparse plumbing
+�?  └── engines/
+�?      ├── dispatch.py        # engine door: assets, prompts, replies
+�?      └── qwen/
+�?          ├── qwen_lm.py     # Qwen3 + her QLoRA: train, load, generate
+�?          └── chat.py        # chat rows, message building, reply cleanup
 ├── client/repl.py             # chat REPL that loads the model
 ├── client/chat.py             # thin REPL over the daemon's HTTP API
 ├── server/service.py          # 24/7 HTTP daemon (poll transport, proactive)
 ├── tools/                     # checks.py, train_tokenizer.py, export_sft.py,
-│                              #   train_from_chats.py, read_log.py
+�?                             #   train_from_chats.py, read_log.py
 ├── configs/                   # chatbot.config.example.json + gitignored locals
 ├── data/                      # gitignored: export, persona, BPE, adapter, sft
+│   └── live/                  #   live_chats.txt, chat_session.json,
+│                              #   proactive.sqlite3, telemetry.sqlite3
 ├── .python-version            # 3.14.5
 ├── pyproject.toml
 └── uv.lock

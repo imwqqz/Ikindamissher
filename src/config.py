@@ -27,6 +27,27 @@ DEFAULT_BPE = PROJECT_ROOT / "data" / "input" / "bpe.json"
 
 CHAT_CONFIG = PROJECT_ROOT / "configs" / "chatbot.config.json"
 
+# Live state (chat log, session, proactive queue, audit) lives here, separate
+# from the training data.
+LIVE_DIR = PROJECT_ROOT / "data" / "live"
+
+
+def move_legacy(old, new):
+    """One-time relocation of a live-state file into LIVE_DIR.
+
+    A running daemon on the old code may hold the file; the move is retried on
+    the next start instead of taking the process down.
+    """
+    import shutil
+    old, new = Path(old), Path(new)
+    if not old.exists() or new.exists():
+        return
+    new.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(old), str(new))
+    except OSError as exc:
+        print(f"[live] could not move {old} -> {new}: {exc}")
+
 # keys that describe the invocation rather than the run, so they are not
 # written into a generated config file
 _META_KEYS = ("help", "config", "dump_config")

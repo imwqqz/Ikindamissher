@@ -9,9 +9,10 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from config import PROJECT_ROOT
+from config import LIVE_DIR, PROJECT_ROOT, move_legacy
 
-DB_PATH = PROJECT_ROOT / "data" / "telemetry.sqlite3"
+DB_PATH = LIVE_DIR / "telemetry.sqlite3"
+move_legacy(PROJECT_ROOT / "data" / "telemetry.sqlite3", DB_PATH)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS turns (
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS turns (
 
 
 def _connect(path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     con.execute(_SCHEMA)
     return con

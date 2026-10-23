@@ -30,11 +30,13 @@ if hasattr(sys.stdout, "reconfigure"):
 import engines.dispatch as engine
 import client.repl as cli
 from chatlog import LOG_PATH, append_turn
-from config import resolve_config_args
+from config import LIVE_DIR, PROJECT_ROOT, move_legacy, resolve_config_args
 from data import speaker_names
 
-SESSION_PATH = _ROOT / "data" / "chat_session.json"
-QUEUE_PATH = _ROOT / "data" / "proactive.sqlite3"
+SESSION_PATH = LIVE_DIR / "chat_session.json"
+QUEUE_PATH = LIVE_DIR / "proactive.sqlite3"
+move_legacy(PROJECT_ROOT / "data" / "chat_session.json", SESSION_PATH)
+move_legacy(PROJECT_ROOT / "data" / "proactive.sqlite3", QUEUE_PATH)
 
 _MAX_POLL = 50
 
@@ -60,12 +62,14 @@ def load_session(path=SESSION_PATH):
 
 def save_session(sess, path=SESSION_PATH):
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(sess, ensure_ascii=False, indent=1),
                    encoding="utf-8")
     os.replace(tmp, path)  # atomic on Windows (same volume)
 
 def _init_queue(path=QUEUE_PATH):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path)
     try:
         with con:
