@@ -83,7 +83,7 @@ def _apply_size_preset(args, cfg, size):
 def build_cfg(args, tokenizer):
     size = SIZE_PRESETS.get(args.size)
     # Persist the turn labels: the checkpoint is the only record of how its turns
-    # were labelled, and chatbot.py reads them from here.
+    # were labelled, and the REPL reads them from here.
     user_name, her_name = speaker_names()
     cfg = {
         "user_speaker": user_name,
@@ -200,7 +200,7 @@ def cli_flags(argv=None):
 
 
 def _bootstrap_config(ap, argv, default_path):
-    # Shared by her.py and chatbot.py: an explicit --config wins, else the
+    # Shared by her.py and the REPL: an explicit --config wins, else the
     # script's own config file is auto-discovered, else built-in defaults.
     raw = list(argv) if argv is not None else sys.argv[1:]
     explicit = _config_path_from_argv(raw)
@@ -376,7 +376,7 @@ def parse_args(argv=None, config=None):
     ap.add_argument("--ema", type=float, default=0.0,
                     help="exponential moving average decay for the weights; "
                          "0 disables it. The average is saved alongside the raw "
-                         "weights and chatbot.py prefers it when present")
+                         "weights and the REPL prefers it when present")
     ap.add_argument("--grad-clip", type=float, default=1.0,
                     help="gradient-norm clip threshold (Tuning Playbook: pick "
                          "just above the p90 norm; 0 disables clipping). The "

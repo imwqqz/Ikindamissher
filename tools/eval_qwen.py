@@ -1,4 +1,4 @@
-"""Phase 5 gate: legacy vs qwen side-by-side on fixed prompts.
+"""Phase 5 gate: her vs qwen side-by-side on fixed prompts.
 
 Gates (qwen column): no thinking-marker leak in any reply, latency under the
 ceiling after warmup, no empty replies. --gate exits non-zero on failure.
@@ -95,7 +95,7 @@ def main(argv=None):
 
     user_name, her_name = speaker_names()
     results = {}
-    for brain in ("legacy", "qwen"):
+    for brain in ("her", "qwen"):
         args = resolve_config_args(cli.build_parser(),
                                    ["--engine", brain], cli.CHAT_CONFIG)
         args = engine.resolve_max_reply(args)
@@ -103,11 +103,11 @@ def main(argv=None):
         results[brain] = run_engine(args, brain, prompts)
 
     qwen_rows = results["qwen"] or []
-    legacy_rows = results["legacy"] or []
-    print(f"\n{'prompt':<40} | {'legacy':<38} | {'qwen'}")
+    her_rows = results["her"] or []
+    print(f"\n{'prompt':<40} | {'her':<38} | {'qwen'}")
     print("-" * 122)
     for i, p in enumerate(prompts):
-        leg = legacy_rows[i][1] if i < len(legacy_rows) else "-"
+        leg = her_rows[i][1] if i < len(her_rows) else "-"
         qwn = qwen_rows[i][1] if i < len(qwen_rows) else "-"
         one = lambda s: s.replace("\n", " / ")[:38]  # noqa: E731
         print(f"{p[:40]:<40} | {one(leg):<38} | {one(qwn)}")

@@ -2,14 +2,14 @@
 # clobber the other's checkpoint or tokenizer (the default data/her_model.pt
 # and data/input/bpe.json are the clobber attractors).
 #
-#   uv run python checks.py            # gate
-#   .\scripts\run_models.ps1           # memory model, then style model
+#   uv run python tools/checks.py       # gate
+#   .\scripts\run_models.ps1            # memory model, then style model
 #   .\scripts\run_models.ps1 -Only memory
 #   .\scripts\run_models.ps1 -SkipChecks
 #
 # Chat afterwards:
-#   uv run chatbot.py --ckpt data\her_model_memory.pt
-#   uv run chatbot.py --ckpt data\her_model_style.pt
+#   uv run her-chat --ckpt data\her_model_memory.pt
+#   uv run her-chat --ckpt data\her_model_style.pt
 param(
     [ValidateSet("both", "memory", "style")]
     [string]$Only = "both",
@@ -31,8 +31,8 @@ foreach ($file in @("data\her_model.pt", "data\input\bpe.json",
 }
 
 if (-not $SkipChecks) {
-    uv run python checks.py
-    if ($LASTEXITCODE -ne 0) { throw "checks.py failed; not training" }
+    uv run python tools/checks.py
+    if ($LASTEXITCODE -ne 0) { throw "tools/checks.py failed; not training" }
 }
 
 if ($Only -in @("both", "memory")) {
@@ -58,5 +58,5 @@ if ($Only -in @("both", "style")) {
 
 Write-Host ""
 Write-Host "done. compare on novel prompts:"
-Write-Host "  uv run chatbot.py --ckpt data\her_model_memory.pt"
-Write-Host "  uv run chatbot.py --ckpt data\her_model_style.pt"
+Write-Host "  uv run her-chat --ckpt data\her_model_memory.pt"
+Write-Host "  uv run her-chat --ckpt data\her_model_style.pt"

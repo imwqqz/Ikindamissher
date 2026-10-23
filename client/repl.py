@@ -49,8 +49,8 @@ def build_parser():
     ap.add_argument("--her-speaker", default=None,
                     help="canonical name for the persona; must match training, "
                          "and is kept out of the source on purpose")
-    ap.add_argument("--engine", choices=["legacy", "qwen"], default="legacy",
-                    help="legacy: the from-scratch her model; qwen: Qwen3 + "
+    ap.add_argument("--engine", choices=["her", "qwen"], default="her",
+                    help="her: the from-scratch her model; qwen: Qwen3 + "
                          "the her QLoRA adapter")
     ap.add_argument("--adapter", default=None,
                     help="adapter dir for --engine qwen (default: "

@@ -1,6 +1,6 @@
 """24/7 HTTP daemon around the chatbot engine.
 
-Run: uv run python server\\service.py --engine qwen (or --engine legacy)
+Run: uv run python server\\service.py --engine qwen (or --engine her)
 Endpoints (poll transport only):
 - POST /message  {"text": "..."}  -> {"reply": "..."}
 - GET  /poll?since=N             -> {"messages": [{id, text, ts}], "since": N}

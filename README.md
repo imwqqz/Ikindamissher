@@ -40,13 +40,11 @@
 
 
 ```text
-$ py chatbot.py
+$ uv run her-chat
 device: cuda
 loaded checkpoint: data\her_model.pt (loss 0.0532, trained 12,995 steps)
-objective: lm | lora: False | quant: none
 few-shot retrieval on data/input/wa_out.txt
 chatting with her - type 'exit' to quit
-<you>: holus
 her: holis
 <you>: tqm
 her: y eso te hace mal
@@ -63,22 +61,29 @@ uv sync                      # one-time setup (see Installation below)
 
 py her.py                    # train: resumes data/her_model.pt if present
 py her.py --fresh            # first run: build tokenizer, ignore stale ckpt
-py chatbot.py                # chat REPL
+uv run her-chat              # chat REPL (client/repl.py)
 
-uv run python checks.py      # self-checks on synthetic data; exit 0 required
+uv run python tools/checks.py  # self-checks on synthetic data; exit 0 required
 
 # train the two side-by-side models (protected paths + pre-run backup):
 .\scripts\run_models.ps1
+
+# Qwen engine (fine-tunes Qwen3 + the her QLoRA adapter):
+uv run python src/engines/qwen/qwen_lm.py   # train the adapter
+uv run python tools/eval_qwen.py            # her vs qwen side-by-side gate
 ```
+
+Each run also writes `data/runs/<checkpoint-name>/`: `config.json` (the exact
+resolved invocation) and `log.csv` (step, losses, lr, grad-norm per step/validation/save).
 
 ## Chat recipe
 
 Two models are trained side by side (`scripts/run_models.ps1`):
 
-- `data/her_model_memory.pt` — full corpus, no validation, `--keep-last`.
+- `data/her_model_memory.pt` �?full corpus, no validation, `--keep-last`.
   Memorizes the transcript; this is the model to chat with
-  (`py chatbot.py --ckpt data\her_model_memory.pt`).
-- `data/her_model_style.pt` — 10% held-out validation, `dropout 0.1`,
+  (`uv run her-chat --ckpt data\her_model_memory.pt`).
+- `data/her_model_style.pt` �?10% held-out validation, `dropout 0.1`,
   `--no-keep-last` (the best-val checkpoint is retained).
 
 Measured A/B (2026-10-08, ~77k tokens, 15.7M params): the validation-based
@@ -101,21 +106,29 @@ conversation stops and the next starts.
 ```
 Ikindamissher/
 ├── src/                       # library modules (installed as top-level modules)
-│   ├── tokenizer.py           # byte-level BPE + 100 reserved sentinel ids
-│   ├── data.py                # WhatsApp export -> corpus; speaker labels,
-│   │                          #   persona, target_char_mask, build_corpus
-│   ├── model.py               # GPT, RoPE, pre-norm blocks, KV cache, NF4/LoRA
-│   ├── training.py            # lm + span losses, windows, validation, Trainer
-│   ├── checkpoint.py          # load/save tokenizer, resume, reconcile_epochs
-│   └── config.py              # argparse + JSON config + size presets
+�?  ├── tokenizer.py           # byte-level BPE + 100 reserved sentinel ids
+�?  ├── data.py                # WhatsApp export -> corpus; speaker labels,
+�?  �?                         #   persona, target_char_mask, build_corpus
+�?  ├── config.py              # argparse + JSON config + size presets
+�?  └── engines/
+�?      ├── dispatch.py        # engine door: load_assets, prompts, replies
+�?      ├── her/               # the from-scratch GPT engine
+�?      �?  ├── model.py       #   GPT, RoPE, pre-norm blocks, KV cache,
+�?      �?  �?                 #   NF4/LoRA
+�?      �?  ├── training.py    #   lm + span losses, windows, validation,
+�?      �?  �?                 #   Trainer (+ per-run config.json/log.csv)
+�?      �?  └── checkpoint.py  #   load/save tokenizer, resume, reconcile_epochs
+�?      └── qwen/
+�?          └── qwen_lm.py     # Qwen3 + her QLoRA adapter engine
 ├── her.py                     # training entry point (--ema, --cpu, --grad-clip)
-├── chatbot.py                 # chat REPL + few-shot retrieval
-│                              #   (--proactive/--proactive-only, --raw-weights, --cpu)
-├── export_sft.py              # WhatsApp export -> SFT jsonl
-├── checks.py                  # synthetic self-checks, exit code gate
+├── client/repl.py             # chat REPL + few-shot retrieval
+�?                             #   (--proactive/--proactive-only, --raw-weights, --cpu)
+├── server/service.py          # 24/7 HTTP daemon (poll transport, proactive SQLite)
+├── tools/                     # checks.py self-checks, export_sft.py SFT export,
+�?                             #   eval_qwen.py her-vs-qwen gate
 ├── configs/                   # *_config.example.json + your gitignored locals
 ├── data/                      # gitignored: export, description, persona Q&A,
-│                              #   BPE, weights, SFT export
+�?                             #   BPE, weights, runs/<name>/ config.json+log.csv
 ├── docs/                      # report, blog draft, publish article
 ├── scripts/                   # run_models.ps1: guarded memory + style runbook
 ├── .python-version            # 3.14.5
@@ -125,8 +138,10 @@ Ikindamissher/
 
 Data flow: `parse_wa` (data.py) turns the export into a corpus,
 `target_char_mask` marks the persona's characters, windows are scored and fed
-to `GPT` (model.py), which trains them into `data/her_model.pt`; `chatbot.py`
-reads that checkpoint back and generates replies.
+to `GPT` (engines/her/model.py), which trains them into `data/her_model.pt`;
+`client/repl.py` (or `server/service.py`) reads that checkpoint back and
+generates replies -- through `engines/dispatch.py`, which picks the her or
+qwen engine.
 
 <!-- TODO: choose a license -->
 Contributions, acknowledgments, this project is under [LICENCE](https://github.com/imwqqz/Ikindamissher/blob/master/LICENSE)

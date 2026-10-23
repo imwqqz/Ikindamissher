@@ -21,9 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 import data
-from engines.legacy.model import build_model
+from engines.her.model import build_model
 from tokenizer import BytePairEncoder
-from engines.legacy.training import Trainer, lm_loss
+from engines.her.training import Trainer, lm_loss
 from config import parse_args
 
 CORPUS = ("hola como estas gracias buenos dias que tal nos vemos luego "

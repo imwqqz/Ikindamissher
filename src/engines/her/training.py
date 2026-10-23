@@ -176,6 +176,30 @@ def _restore_rng(state):
         random.setstate(rng["python"])
     except (KeyError, TypeError, ValueError, RuntimeError):
         pass
+
+
+# machine-readable twin of the step/val/save log lines, one row per event
+_CSV_COLUMNS = ("step", "epoch", "train_loss", "val_loss", "best_val",
+                "lr", "gnorm", "p90", "clip", "tok_s")
+
+
+def _csv_row(log_dir, event, **fields):
+    # Sparse append-only row; the header lands on first write. Callers are
+    # rank-0-only paths, so no file contention.
+    if not log_dir:
+        return
+    path = Path(log_dir) / "log.csv"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(",".join(_CSV_COLUMNS) + ",event\n", encoding="utf-8")
+    values = []
+    for col in _CSV_COLUMNS:
+        value = fields.get(col)
+        values.append("" if value is None
+                      else f"{value:.4f}" if isinstance(value, float)
+                      else str(value))
+    with path.open("a", encoding="utf-8") as f:
+        f.write(",".join(values) + f",{event}\n")
 class WeightEMA:
     # Polyak-averaged trainable weights, buffers untouched (timm/MAE-style EMA)
 
@@ -244,12 +268,15 @@ class ValWindows:
 class Trainer:
     def __init__(self, args, cfg, model, ids, device, tokenizer, ckpt,
                  start_step=0, rank=0, world=1, val_ids=None, state=None,
-                 label_ids=None, val_label_ids=None, prefix_ids=None):
+                 label_ids=None, val_label_ids=None, prefix_ids=None,
+                 log_dir=None):
         self.model = model
         self.cfg = cfg
         self.device = device
         self.tokenizer = tokenizer
         self.ckpt = Path(ckpt)
+        # per-run artifacts (config.json + log.csv); None in synthetic runs
+        self.log_dir = Path(log_dir) if log_dir else None
         self.rank = rank
         self.world = world
         self.epochs = args.epochs
@@ -479,7 +506,8 @@ class Trainer:
         if val is None:
             return False
         self.last_val = val
-        if val < self.best_val - 1e-4:
+        improved = val < self.best_val - 1e-4
+        if improved:
             self.best_val = val
             self.best_step = steps
             self.since_best = 0
@@ -491,12 +519,15 @@ class Trainer:
             print(f"  step {steps:,} epoch {epoch} | val {val:.4f} "
                   f"| best {self.best_val:.4f} | stale {self.since_best}"
                   f"/{self.patience}", flush=True)
-            if self.patience and self.since_best >= self.patience:
-                print(f"  early stop: no val improvement for {self.patience} "
-                      f"checks; best val {self.best_val:.4f} at step "
-                      f"{self.best_step:,}", flush=True)
-                self.stopped_early = True
-                return True
+        _csv_row(self.log_dir, "val_saved" if improved else "val",
+                 step=steps, epoch=epoch, train_loss=self.last_train_loss,
+                 val_loss=val, best_val=self.best_val)
+        if not improved and self.patience and self.since_best >= self.patience:
+            print(f"  early stop: no val improvement for {self.patience} "
+                  f"checks; best val {self.best_val:.4f} at step "
+                  f"{self.best_step:,}", flush=True)
+            self.stopped_early = True
+            return True
         return False
 
     def fit(self):
@@ -641,6 +672,10 @@ class Trainer:
             f"| {tok_s:,.0f} tok/s | params {trainable:,} | lr {cur_lr:.2e}{eta}",
             flush=True,
         )
+        _csv_row(self.log_dir, "step", step=steps, epoch=epoch,
+                 train_loss=window_avg, lr=cur_lr,
+                 gnorm=gnorms[-1] if gnorms else 0.0, p90=p90,
+                 clip=clip_rate, tok_s=tok_s)
 
     def _end_epoch(self, epoch, steps, avg, epoch_start):
         epoch_dt = time.perf_counter() - epoch_start
@@ -713,4 +748,9 @@ class Trainer:
              "ema": self._ema_state(state_dict) if self.ema else None},
             self.ckpt,
         )
+        _csv_row(self.log_dir, "save", step=int(steps),
+                 epoch=self.epochs_done(steps), train_loss=float(loss),
+                 val_loss=_finite_or_none(
+                     val_loss if val_loss is not None else self.best_val),
+                 best_val=_finite_or_none(self.best_val))
         return True

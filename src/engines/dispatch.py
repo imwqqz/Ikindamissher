@@ -1,6 +1,6 @@
 """The engine door: loads a brain, builds its prompts, generates replies.
 
-One entry point for both brains (engines/qwen, engines/legacy). Everything
+One entry point for both brains (engines/her, engines/qwen). Everything
 here is engine-agnostic plumbing - the client (client/repl.py) and the daemon
 (server/service.py) only touch load_assets / generate_reply /
 generate_proactive and never know which model answered.
@@ -29,7 +29,7 @@ from data import (
     persona_lines,
     speaker_names,
 )
-from engines.legacy.model import build_model
+from engines.her.model import build_model
 from tokenizer import BytePairEncoder, bpe_from_state
 
 
@@ -267,7 +267,7 @@ def load_assets(args, device):
 
 
 def _load_qwen(args, device):
-    """Qwen engine assets: HF model + her adapter + the legacy BPE."""
+    """Qwen engine assets: HF model + her adapter + the original BPE."""
     import engines.qwen.qwen_lm as qwen_lm
     adapter = Path(args.adapter) if args.adapter else qwen_lm.ADAPTER_DIR
     if not adapter.exists():
@@ -276,9 +276,9 @@ def _load_qwen(args, device):
         raise SystemExit(1)
     hf_tok, qmodel = qwen_lm.load_engine(adapter=adapter, device=device)
     print(f"qwen engine: adapter {adapter.name}")
-    legacy_tok = BytePairEncoder.load(Path(DEFAULT_BPE))
-    print("few-shot retrieval on the legacy tokenizer (bpe.json)")
-    return {"cfg": {}, "qwen": (hf_tok, qmodel)}, qmodel, legacy_tok
+    tok = BytePairEncoder.load(Path(DEFAULT_BPE))
+    print("few-shot retrieval on the original tokenizer (bpe.json)")
+    return {"cfg": {}, "qwen": (hf_tok, qmodel)}, qmodel, tok
 
 
 def resolve_max_reply(args):
@@ -350,7 +350,7 @@ def _qwen_messages(args, prompt, history, demo_index, tokenizer):
 
     A chat template has no scene-break blank line between roles, so demos must
     never enter the message list, or she answers to a demo instead of you. The
-    system block is the one place plain text (like the legacy prompt head) is
+    system block is the one place plain text (like the her prompt head) is
     safe.
     """
     description = _read_description(args)
@@ -430,7 +430,7 @@ def generate_proactive(args, state, model, tokenizer, openers, device):
             messages.append({"role": "system",
                              "content": "\n\n".join(lines)})
         # the empty user turn is a synthetic "she speaks first" cue; a reply
-        # that comes back empty falls back to a real opener like the legacy path
+        # that comes back empty falls back to a real opener like the her path
         messages.append({"role": "user", "content": ""})
         text = _qwen_reply(hf_tok, hf_model, messages, args)
         user_name, her_name = speaker_names()

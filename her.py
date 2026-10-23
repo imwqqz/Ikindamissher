@@ -10,14 +10,14 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 
 import torch
 
-from engines.legacy.checkpoint import load_checkpoint, load_tokenizer, resolve_model
+from engines.her.checkpoint import load_checkpoint, load_tokenizer, resolve_model
 from config import cli_flags, parse_args, request_cpu_fallback, resolve_block
 from data import (
     build_corpus, configure_speakers, conversation_ends, her_turn_ends,
     persona_lines, speaker_names, target_char_mask,
 )
-from engines.legacy.model import build_model, trainable_count, total_count
-from engines.legacy.training import Trainer
+from engines.her.model import build_model, trainable_count, total_count
+from engines.her.training import Trainer
 
 def load_corpus(args):
     data = Path(args.data)
@@ -131,15 +131,31 @@ def _teardown_process(args):
     if args.ddp:
         import torch.distributed as dist
         dist.destroy_process_group()
+def _write_run_config(args, cfg, run_dir):
+    # The exact resolved invocation for this run, next to its log.csv.
+    import json
+    snapshot = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+    snapshot["cfg"] = cfg
+    (run_dir / "config.json").write_text(
+        json.dumps(snapshot, indent=2, default=str) + "\n",
+        encoding="utf-8")
 def run_training(args, cfg, model, ids, device, tok, state, rank, world, local,
                  val_ids=None, label_ids=None, val_label_ids=None,
                  prefix_ids=None):
     # Optimizer loop + final checkpoint/summary, then teardown the process group.
+    log_dir = None
+    if rank == 0:
+        # per-run artifacts: the checkpoint keeps its path, the run dir is
+        # named after its stem (resume keeps appending to the same run dir)
+        ckpt = Path(args.ckpt)
+        log_dir = ckpt.parent / "runs" / ckpt.stem
+        log_dir.mkdir(parents=True, exist_ok=True)
+        _write_run_config(args, cfg, log_dir)
     trainer = Trainer(args, cfg, model, ids, device, tok, args.ckpt,
                       start_step=state["step"] if state else 0,
                       rank=rank, world=world, val_ids=val_ids, state=state,
                       label_ids=label_ids, val_label_ids=val_label_ids,
-                      prefix_ids=prefix_ids)
+                      prefix_ids=prefix_ids, log_dir=log_dir)
     _announce_start(args, trainer, rank)
     t0 = time.perf_counter()
     final_loss, steps_done = trainer.fit()
@@ -212,7 +228,7 @@ def _encode_corpus(args, corpus, val_corpus, her_name, tok):
     scored = (sum(1 for x in label_ids if x != -100) if mask_on else len(ids))
     return ids, label_ids, val_ids, val_label_ids, scored, mask_on
 def _persona_prefix_ids(args, her_name, tok):
-    # Persona prefix: the same fact sheet that chatbot.py puts at the head of an
+    # Persona prefix: the same fact sheet that the REPL puts at the head of an
     # inference prompt, so training and inference see one identical layout.
     if not getattr(args, "persona_prefix", False):
         return None

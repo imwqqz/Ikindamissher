@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 
 from config import build_cfg, cli_flags
-from engines.legacy.model import build_model
+from engines.her.model import build_model
 from tokenizer import BytePairEncoder, bpe_from_state
 
 def load_checkpoint(args, rank, world):
@@ -70,7 +70,7 @@ def _report_remaining_epochs(args, rank, stored_target, stored_spe,
           flush=True)
 
 
-def _report_legacy_epochs(args, rank, stored_done):
+def _report_old_epochs(args, rank, stored_done):
     if rank != 0:
         return
     print(f"resume: checkpoint predates per-epoch tracking; its epoch "
@@ -101,7 +101,7 @@ def reconcile_epochs(args, state, rank):
     if stored_done:
         # Legacy checkpoint: epochs recorded the request, not completed work.
         args.epochs = stored_done
-        _report_legacy_epochs(args, rank, stored_done)
+        _report_old_epochs(args, rank, stored_done)
 def _setting_given(args, argv, flag, key):
     """True when a setting was asked for, on the command line or in a config.
 
