@@ -77,8 +77,7 @@ def span_corrupt_pair(row, p=0.15, span_gap=3, encoder=None):
     return full, labels
 def collate_span(rows, encoder):
     """Pad corrupted rows so logits[:, :-1] aligns with labels; width comes
-    from the labels themselves, so a target tail is never truncated
-    (REPORT.md N15)."""
+    from the labels themselves, so a target tail is never truncated."""
     max_lab = max(r[1].numel() for r in rows)
     max_inp = max(max(r[0].numel() for r in rows), max_lab + 1)
     inp = torch.zeros(len(rows), max_inp, dtype=torch.long)
@@ -356,7 +355,7 @@ class Trainer:
         self.total_steps = self.start_step + self.epochs * self.batches_per_epoch
 
     def _decay_split(self):
-        # decay only on linear maps; norms, embeddings, biases excluded (REPORT.md N9)
+        # decay only on linear maps; norms, embeddings, biases excluded
         decay, no_decay = [], []
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -368,7 +367,7 @@ class Trainer:
         return decay, no_decay
 
     def _make_optimizer(self, args):
-        # betas, eps, decay: this project's measured values (REPORT.md N16)
+        # betas, eps, decay: this project's measured values
         decay, no_decay = self._decay_split()
         self.optimizer = torch.optim.AdamW(
             [{"params": decay, "weight_decay": 1e-2},

@@ -8,14 +8,9 @@
 - [ ] Resume-with-shortfall in `src/engines/her/checkpoint.py`: a partial epoch
   rounds up, so a resume can retrain up to one epoch of extra steps. Split
   `fit()` by steps when the wasted training time matters.
-- [ ] `tools/export_sft.py` token report is `chars // 4`, a guess. Use the real
-  tokenizer before trusting the number for budget decisions.
 
 ## Cleanup
 
-- [ ] Comments cite `docs/REPORT.md` (N1-N17), which was deleted with docs/.
-  Rewire or drop the citations in `src/engines/qwen/qwen_lm.py` (most),
-  `src/engines/her/model.py`, and `src/engines/her/training.py`.
 ## Coming up
 
 - [ ] S2 retrain: `uv run python src\engines\qwen\qwen_lm.py --epochs 6` →

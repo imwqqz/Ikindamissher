@@ -1,7 +1,7 @@
 """Qwen3 QLoRA: load, train, and serve "her" voice on top of Qwen3-1.7B.
 
 The from-scratch stack (model.py/training.py) stays untouched and keeps
-running via her.py. Design rationale: docs/REPORT.md section 6 (N1-N17).
+running via her.py. Design rationale: git history (docs/REPORT.md, removed).
 """
 import argparse
 import json
@@ -40,8 +40,7 @@ def get_tokenizer(base: str = BASE) -> AutoTokenizer:
 
 
 def apply_template(messages, tokenizer=None, add_generation_prompt=False):
-    """One place renders the chat template, thinking disabled everywhere
-    (REPORT.md N5)."""
+    """One place renders the chat template, thinking disabled everywhere."""
     tok = tokenizer or get_tokenizer()
     return tok.apply_chat_template(messages, tokenize=False,
                                    add_generation_prompt=add_generation_prompt,
@@ -53,7 +52,7 @@ _markers_cache = {}
 
 def think_markers(tokenizer=None):
     """(open, close) of the empty thinking block, probed at runtime so no
-    literal lands in source (REPORT.md N7)."""
+    literal lands in source."""
     if "m" not in _markers_cache:
         probe = apply_template(
             [{"role": "user", "content": "x"},
@@ -77,7 +76,7 @@ def encode_row(messages, tokenizer=None):
     everything else gets -100. Spans come from char offsets of one full
     render.
     shortcut: literal <|im_end|> inside content splits a span; content is
-    chat text, not tokens (REPORT.md N17).
+    chat text, not tokens.
     """
     tok = tokenizer or get_tokenizer()
     text = apply_template(messages, tok)
@@ -97,7 +96,7 @@ def encode_row(messages, tokenizer=None):
 
 
 def _selfcheck_examples(rows, tok, n=3):
-    # decode-as-ids proof: labels must be real token ids of the assistant turn (a mask/ids mix-up once trained to loss 0, REPORT.md N4)
+    # decode-as-ids proof: labels must be real token ids of the assistant turn (a mask/ids mix-up once trained to loss 0)
     for row in rows[:n]:
         ids, labels = encode_row(row, tok)
         scored = tok.decode([i for i, l in zip(ids, labels) if l != -100],
@@ -136,7 +135,7 @@ def load_engine(base: str = BASE, adapter=None, device="cuda"):
 def reply(tok, model, messages, max_new_tokens=80, temperature=0.7, top_p=0.9,
           repeat_penalty=1.0):
     """One assistant turn: template -> sample -> visible text (leaked think
-    blocks stripped, REPORT.md N5)."""
+    blocks stripped)."""
     prompt = apply_template(messages, tok, add_generation_prompt=True)
     ids = tok(prompt, return_tensors="pt").to(model.device)
     gen_kwargs = dict(max_new_tokens=max_new_tokens, do_sample=True,
@@ -177,7 +176,7 @@ def train(args):
     print(f"device: {device}")
     model = AutoModelForCausalLM.from_pretrained(
         args.base, quantization_config=build_bnb(), device_map=device)
-    # non-reentrant checkpointing once, before the PEFT wrap (REPORT.md N2)
+    # non-reentrant checkpointing once, before the PEFT wrap
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False})
     lora = LoraConfig(
@@ -207,7 +206,7 @@ def train(args):
     opt = torch.optim.AdamW(trainables, lr=args.lr)
 
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
-    # token-budget micro-batching: padded tokens, not row count, caps VRAM (REPORT.md N1)
+    # token-budget micro-batching: padded tokens, not row count, caps VRAM
     examples.sort(key=lambda e: e[0])
     batches = []
     i = 0
@@ -261,7 +260,7 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(trainables, 1.0)
             opt.step()
             opt.zero_grad()
-            # empty_cache keeps the reserved pool off the WDDM spill edge (REPORT.md N3)
+            # empty_cache keeps the reserved pool off the WDDM spill edge
             torch.cuda.empty_cache()
             step += 1
             if step % 25 == 0:
@@ -292,8 +291,7 @@ def build_parser():
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--token-budget", type=int, default=800,
                     help="max padded tokens per micro-batch; the fp32 CE "
-                         "upcast over the ~152k vocab is what eats VRAM "
-                         "(REPORT.md N1)")
+                         "upcast over the ~152k vocab is what eats VRAM")
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--lora-r", type=int, default=16)

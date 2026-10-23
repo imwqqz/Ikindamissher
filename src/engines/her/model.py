@@ -30,7 +30,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", torch.sin(emb).unsqueeze(0).unsqueeze(0))
 
     def apply(self, q, k, start: int, length: int):
-        # cast the fp32 cache down once or autocast promotes q*cos to fp32 (REPORT.md N10)
+        # cast the fp32 cache down once or autocast promotes q*cos to fp32
         cos = self.cos_cached[:, :, start:start + length].to(q.dtype)
         sin = self.sin_cached[:, :, start:start + length].to(q.dtype)
         return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
@@ -189,7 +189,7 @@ class CausalSelfAttention(nn.Module):
             self._k = torch.cat([self._k, k], dim=2)
             self._v = torch.cat([self._v, v], dim=2)
             k, v = self._k, self._v
-            # causal only when the query covers the whole key range; unconditional False once poisoned the cache (REPORT.md N11)
+            # causal only when the query covers the whole key range; unconditional False once poisoned the cache
             is_causal = q.shape[2] == k.shape[2]
         else:
             is_causal = True
@@ -238,7 +238,7 @@ class GPT(nn.Module):
         self.drop = nn.Dropout(cfg["dropout"])
         self.blocks = nn.ModuleList(Block(cfg, self.rotary) for _ in range(cfg["n_layers"]))
         self.norm = RMSNorm(cfg["d_model"])
-        # init std must offset the sqrt(d_model) forward scale, else step-0 loss ~128 (REPORT.md N8)
+        # init std must offset the sqrt(d_model) forward scale, else step-0 loss ~128
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=cfg["d_model"] ** -0.5)
         self._pos = 0
 

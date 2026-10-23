@@ -12,7 +12,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parents[1]
 for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -229,6 +229,22 @@ def _her_chars(convs):
                for m in c if m["role"] == "assistant")
 
 
+def _real_tokens(convs):
+    """Token counts via the qwen tokenizer the engine actually trains with."""
+    from transformers import AutoTokenizer
+    src = PROJECT_ROOT / "data" / "her_qwen_adapter"
+    tok = AutoTokenizer.from_pretrained(
+        str(src) if src.exists() else "Qwen/Qwen3-1.7B")
+    total = trainable = 0
+    for c in convs:
+        for m in c:
+            n = len(tok.encode(m["content"]))
+            total += n
+            if m["role"] == "assistant":
+                trainable += n
+    return total, trainable
+
+
 def _tally(convs):
     # Two her-shares: quoting either alone is misleading.
     train_chars = _her_chars(convs)
@@ -240,7 +256,7 @@ def _tally(convs):
 
 def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
             train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
-            parsed_total, persona, her_name, qa_convs):
+            parsed_total, persona, her_name, qa_convs, tokens):
     print(f"wrote {len(rows)} conversations to {out}  ({fmt} format)")
     print(f"  persona Q&A rows    {qa_convs}")
     print(f"  turns parsed        {len(turns):,}")
@@ -262,7 +278,13 @@ def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
     if kept_chars:
         print(f"  her share, trainable{train_chars / kept_chars:.1%} <- assistant loss "
               f"sees this")
-    print(f"  approx tokens       {kept_chars // 4:,} (guess; needs the real tokenizer)")
+    if tokens is not None:
+        tot, trainable = tokens
+        print(f"  tokens, qwen toknzr {tot:,} shown / {trainable:,} assistant "
+              f"(real counts, includes template wrap when training)")
+    else:
+        print(f"  approx tokens       {kept_chars // 4:,} (guess; tokenizer "
+              f"unavailable)")
     if persona:
         print(f"  system message      {len(persona):,} chars of persona on every row")
 
@@ -325,10 +347,15 @@ def main(argv=None):
     rows = _build_rows(convs, args.format, persona)
     _write_rows(rows, args.out)
 
+    try:
+        tokens = _real_tokens(convs)
+    except Exception:
+        tokens = None    # no adapter, no network: fall back to the chars//4 guess
+
     train_chars, kept_chars, turns_per, msg_chars = _tally(convs)
     _report(args, rows, args.out, args.format, stats, turns, orphans, too_long,
             train_chars, kept_chars, turns_per, msg_chars, parsed_chars,
-            parsed_total, persona, her_name, len(qa_convs))
+            parsed_total, persona, her_name, len(qa_convs), tokens)
 
 
 if __name__ == "__main__":

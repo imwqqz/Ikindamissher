@@ -98,7 +98,7 @@ def check_boundary():
 
 
 def check_loss_at_init():
-    # band, not equality: residual logit spread sits ~+2.2 nats above ln(V); catches the std=1 misinit (~128 vs ~10.5, REPORT.md N8)
+    # band, not equality: residual logit spread sits ~+2.2 nats above ln(V); catches the std=1 misinit (~128 vs ~10.5)
     torch.manual_seed(0)
     cfg = tiny_cfg()
     model = build_model(cfg)

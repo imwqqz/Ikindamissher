@@ -44,7 +44,7 @@ def load_session(path=SESSION_PATH):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        # a corrupt session moves aside instead of overwriting (REPORT.md)
+        # a corrupt session moves aside instead of overwriting
         bad = Path(path).with_suffix(".corrupt.json")
         try:
             os.replace(path, bad)
