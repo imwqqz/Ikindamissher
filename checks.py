@@ -312,6 +312,80 @@ def check_demo_retrieval():
     return not failed, f"{blocks} demos" if not failed else f"failed: {failed}"
 
 
+def check_qwen_template():
+    """Qwen3 template, thinking disabled: assistant rows carry exactly one
+    EMPTY thinking block, texts survive encode->decode, and a generation
+    prompt pre-closes the block (documented force-non-thinking mechanism)."""
+    try:
+        import qwen_lm
+    except ImportError as exc:
+        return False, f"qwen stack missing: {exc}"
+    tok = qwen_lm.get_tokenizer()
+    open_m, close_m = qwen_lm.think_markers(tok)
+    hallo = ({"role": "system", "content": "Sos una amiga cercana."},
+             {"role": "user", "content": "hola\ncomo andas"},
+             {"role": "assistant", "content": "aca ando\ny vos"})
+    text = qwen_lm.apply_template(hallo, tok)
+    checks = {
+        "one open/close per assistant row":
+            text.count(open_m) == 1 and text.count(close_m) == 1,
+        "empty thinking block":
+            text.count(open_m + "\n\n" + close_m) == 1,
+        "assistant text survives":
+            "aca ando" in tok.decode(tok(text, add_special_tokens=False)
+                                     .input_ids, skip_special_tokens=False),
+    }
+    gen = qwen_lm.apply_template(hallo[:2], tok, add_generation_prompt=True)
+    tail = gen.split("<|im_start|>")[-1]
+    checks["generation prompt pre-closes the block"] = \
+        0 <= tail.find(open_m) < tail.find(close_m)
+    failed = [k for k, ok in checks.items() if not ok]
+    return not failed, "template ok" if not failed else f"failed: {failed}"
+
+
+def check_qwen_mask():
+    """encode_row scores only assistant turns as real token ids; headers and
+    user/system text get -100. Decode-as-ids must equal the assistant turn
+    (this test exists because a mask/ids mix-up trained silently to loss 0)."""
+    try:
+        import qwen_lm
+    except ImportError as exc:
+        return False, f"qwen stack missing: {exc}"
+    tok = qwen_lm.get_tokenizer()
+    row = ({"role": "user", "content": "cuando vienes"},
+           {"role": "assistant", "content": "pasado mañana\ncon calma"},
+           {"role": "user", "content": "digo yo"})
+    ids, labels = qwen_lm.encode_row(row, tok)
+    scored = [l for l in labels if l != -100]
+    from_ids = tok.decode([i for i, l in zip(ids, labels) if l != -100],
+                          skip_special_tokens=False)
+    checks = {
+        "scored ids are real tokens":
+            len(scored) > 4 and all(isinstance(l, int) and 0 <= l < len(tok)
+                                    for l in scored),
+        "decode(ids) carries the reply": "pasado mañana" in from_ids,
+        "decode(labels) carries the reply":
+            "pasado mañana" in tok.decode(scored, skip_special_tokens=False),
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    return not failed, "mask ok" if not failed else f"failed: {failed}"
+
+
+def check_qwen_strip_think():
+    """strip_think: closed blocks removed with the visible text kept; an
+    unclosed block (truncation) shows nothing after the open marker."""
+    try:
+        import qwen_lm
+    except ImportError as exc:
+        return False, f"qwen stack missing: {exc}"
+    open_m, close_m = qwen_lm.think_markers()
+    cases = ((f"presa{open_m}razon{close_m}hola", "presahola"),
+             (f"{open_m}razon{close_m}", ""),
+             (f"{open_m}sin cerrar", ""))
+    for raw, want in cases:
+        if qwen_lm.strip_think(raw) != want:
+            return False, f"strip_think({raw!r}) != {want!r}"
+    return True, "strip ok"
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
@@ -326,7 +400,12 @@ CHECKS = [
     ("demo-retrieval", check_demo_retrieval),
     ("cli-flags", check_cli_flags),
     ("gnorm", check_grad_norm_telemetry),
+    ("qwen-template", check_qwen_template),
+    ("qwen-mask", check_qwen_mask),
+    ("qwen-strip", check_qwen_strip_think),
 ]
+
+
 
 
 def main(argv=None):
