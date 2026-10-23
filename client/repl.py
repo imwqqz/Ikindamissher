@@ -1,4 +1,3 @@
-"""Talk to her in a terminal. The engine behind it is engines/dispatch.py."""
 import argparse
 import random
 import sys
@@ -111,7 +110,7 @@ def _setup_device(force_cpu=False):
 
 
 def _configure_speakers(args):
-    # Turn labels are what the qwen adapter was trained with; never guess.
+    # labels must match what the adapter was trained with; never guess
     configure_speakers(args.user_speaker, args.her_speaker)
     user_name, her_name = speaker_names()
     if not user_name or not her_name:

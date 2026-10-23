@@ -16,22 +16,14 @@ LOG_PATH = LIVE_DIR / "live_chats.txt"
 move_legacy(PROJECT_ROOT / "data" / "live_chats.txt", LOG_PATH)
 
 _lock = threading.Lock()
-# shortcut: the lock is per-process; the REPL and the daemon could in theory
-# append at the same moment. Upgrade to a file lock if the two ever race.
+# shortcut: lock is per-process; use a file lock if REPL and daemon ever race
 
 
 def _one_line(text):
-    # The corpus is one turn per line; a multi-line reply would parse as a new
-    # (label-less) turn.
     return " ".join(line.strip() for line in text.splitlines() if line.strip())
 
 
 def append_turn(user_text=None, her_text=None, path=LOG_PATH, now=None):
-    """Append one exchange; a quiet gap starts a new conversation.
-
-    Callers pass plain text; this module owns the format. The gap is measured
-    from the file's mtime, so a daemon restart does not need extra state.
-    """
     user_name, her_name = speaker_names()
     lines = []
     if user_text:

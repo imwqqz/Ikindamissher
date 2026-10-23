@@ -6,20 +6,19 @@ from typing import List
 
 import torch
 
-# GPT-2 byte-level BPE pretokenizer (Radford et al., 2019,
-# https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf)
 BPE_PAT = re.compile(
     r"""'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z\u00C0-\u1FFF]+| ?\d+| ?[^\sA-Za-z0-9\u00C0-\u1FFF]+|\s+(?!\S)|\s+"""
 )
-# Byte-level BPE encoder, trained on the corpus. (T5, section 3.2 https://arxiv.org/abs/2005.14165).
+
+
 class BytePairEncoder:
 
     def __init__(self, n_sentinels=100):
         self.byte_encoder = {i: bytes([i]) for i in range(256)}
         self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
-        # token per id: 0..255 bytes, 256 = never-merged word boundary
+        # 0..255 bytes, 256 = word-boundary token
         self.tokens = [bytes([i]) for i in range(256)] + [b""]
-        self.merges: dict = {}                          # (i, j) -> k
+        self.merges: dict = {}  # (i, j) -> k
         self.n_merges = 0
         self.n_sentinels = n_sentinels
 
@@ -29,9 +28,9 @@ class BytePairEncoder:
         ids = []
         for b in byts:
             ids.extend(b)
-            ids.append(256)  # word-boundary id, kept as a real (empty) token
-        ids = ids[: -1] if len(ids) > 1 else ids  # drop trailing boundary marker
-        ids = torch.tensor(ids, dtype=torch.long)  # tensor-native merging (no per-merge list conversion)
+            ids.append(256)
+        ids = ids[: -1] if len(ids) > 1 else ids
+        ids = torch.tensor(ids, dtype=torch.long)
 
         target = vocab_size - 256 - 1 - self.n_sentinels
         self.n_merges = 0
@@ -60,22 +59,15 @@ class BytePairEncoder:
 
     @staticmethod
     def _best_pair(ids: torch.Tensor):
-        # stats[(a,b)] = sum_t 1[a_t==a and a_(t+1)==b], via key = a*BASE+b, sort, run-length.
-        # O(n log n); ties keep first-occurrence order.
         n = ids.numel() - 1
         if n <= 0:
             return (0, 0), 0
-        # pair key a*base + b is dense (no collision) and sort-stable for any
-        # base > max(b). 4096 keeps ids < 4096 byte-identical to the original;
-        # a larger --vocab-size grows the base instead of colliding.
+        # base > max id keeps a*base+b collision-free; stable sort keeps merges reproducible
         base = max(4096, int(ids.max()) + 1)
         pairs = ids[:-1] * base + ids[1:]
-        # Stable sort keeps merges reproducible across runs
-        # (BPE, section 3 https://arxiv.org/abs/1508.07909)
         pairs_sorted, order = torch.sort(pairs, stable=True)
         keys, counts = torch.unique_consecutive(pairs_sorted, return_counts=True)
-        # The word-boundary id is never emitted by encode(), so a merge through
-        # it could never be applied: keep it out of the ranking entirely.
+        # word-boundary id never merges
         counts = counts.clone()
         boundary = (keys // base == 256) | (keys % base == 256)
         counts[boundary] = 0
@@ -91,7 +83,6 @@ class BytePairEncoder:
 
     @staticmethod
     def _merge(ids, a, b, k):
-        # Greedy left-to-right scan; used on short per-wordpiece lists in encode()
         out, i = [], 0
         while i < len(ids):
             if i < len(ids) - 1 and ids[i] == a and ids[i + 1] == b:
@@ -104,7 +95,6 @@ class BytePairEncoder:
 
     @staticmethod
     def _merge_vec(ids: torch.Tensor, a, b, k) -> torch.Tensor:
-        # Greedy left-to-right, no overlapping merges: every other candidate start in a run.
         n = ids.numel()
         is_start = (ids[:-1] == a) & (ids[1:] == b)
         if not bool(is_start.any()):
@@ -120,7 +110,6 @@ class BytePairEncoder:
             accepted = starts[within % 2 == 0]
         else:
             accepted = starts
-        # Keep the accepted start, drop only the consumed successor.
         removed = torch.zeros(n, dtype=torch.bool)
         removed[accepted + 1] = True
         vals = ids.clone()
@@ -128,9 +117,6 @@ class BytePairEncoder:
         return vals[~removed]
 
     def _encode_piece(self, p: str) -> List[int]:
-        # Canonical BPE: repeatedly apply the merge with the lowest rank (the
-        # id assigned when it was learned). Choosing by frequency here instead
-        # applied merges in an order training never used.
         ids = list(p.encode("utf-8"))
         while len(ids) >= 2:
             best = None

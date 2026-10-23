@@ -21,7 +21,6 @@ COMBINED = PROJECT_ROOT / "data" / "sft_combined.json"
 
 
 def live_rows(text, user, her_name):
-    """Live log -> the same {"messages": [...]} rows export_sft writes."""
     turns = []
     for line in text.splitlines():
         name, sep, msg = line.partition(": ")
@@ -39,7 +38,7 @@ def read_rows(path):
 
 
 def dedupe(rows):
-    # Retraining without clearing the log must not multiply the same exchange.
+    # retraining on an uncleared log must not multiply exchanges
     seen, out = set(), []
     for row in rows:
         key = json.dumps(row, sort_keys=True, ensure_ascii=False)

@@ -15,7 +15,6 @@ def _request(url, body=None):
 
 
 def _drain(base, since):
-    """Print her proactive openers queued since the last check."""
     try:
         payload = _request(f"{base}/poll?since={since}")
     except (urllib.error.URLError, OSError):

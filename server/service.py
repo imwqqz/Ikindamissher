@@ -1,16 +1,3 @@
-"""24/7 HTTP daemon around the chatbot engine.
-
-Run: uv run python server\\service.py
-Endpoints (poll transport only):
-- POST /message  {"text": "..."}  -> {"reply": "..."}
-- GET  /poll?since=N             -> {"messages": [{id, text, ts}], "since": N}
-
-Durability: atomic session writes every turn, proactive messages in SQLite,
-one bad scheduler tick logs without stopping the daemon.
-
-Startup: refuses to start when the port already has a listener, so two daemons
-can never share a port (and data) by accident.
-"""
 import json
 import os
 import socket
@@ -51,7 +38,7 @@ def load_session(path=SESSION_PATH):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        # a corrupt session moves aside instead of overwriting
+        # corrupt session moves aside, never overwritten
         bad = Path(path).with_suffix(".corrupt.json")
         try:
             os.replace(path, bad)
@@ -70,7 +57,7 @@ def save_session(sess, path=SESSION_PATH):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(sess, ensure_ascii=False, indent=1),
                    encoding="utf-8")
-    os.replace(tmp, path)  # atomic on Windows (same volume)
+    os.replace(tmp, path)  # atomic write
 
 def _init_queue(path=QUEUE_PATH):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -108,7 +95,6 @@ def _queue_since(since, path=QUEUE_PATH):
 
 
 def handle_message(text, S):
-    """One user turn: reply, then persist the extended history atomically."""
     args = S["args"]
     user_name, her_name = speaker_names()
     with S["session_lock"]:
@@ -117,9 +103,8 @@ def handle_message(text, S):
             reply = engine.generate_reply(
                 args, S["state"], S["model"], S["tokenizer"], text, history,
                 S["demo_index"], S["device"], source="daemon")
-            if not isinstance(reply, str):  # never trust the engine blindly
+            if not isinstance(reply, str):
                 reply = ""
-            # remember the user's turn even on a silent reply
             history.append(f"{user_name}: "
                            f"{engine.clip_msg(text, 15, S['tokenizer'])}")
             if reply:
@@ -137,11 +122,10 @@ def _in_quiet_hours(hour, start, end):
         return False
     if start < end:
         return start <= hour < end
-    return hour >= start or hour < end  # window wraps midnight
+    return hour >= start or hour < end
 
 
 def _refresh_memory(S):
-    """Rebuild retrieval when live_chats.txt changed, so today's chats count."""
     live = Path(LOG_PATH)
     if not live.exists():
         return
@@ -171,7 +155,6 @@ def _tick(S):
             S["device"])
     if text:
         _queue_push(text, now)
-        # the opener joins the session history too, like the REPL records it
         with S["session_lock"]:
             _, her_name = speaker_names()
             history = list(load_session().get("history", []))
@@ -183,7 +166,7 @@ def _tick(S):
         print(f"[scheduler] queued proactive: {text!r}")
     else:
         print("[scheduler] proactive generation empty; cooling down")
-        S["last_proactive"] = now - args.proactive_every * 30  # retry in half
+        S["last_proactive"] = now - args.proactive_every * 30
 
 
 def _scheduler_loop(S, stop):
@@ -193,7 +176,7 @@ def _scheduler_loop(S, stop):
             _refresh_memory(S)
             _tick(S)
         except Exception:
-            traceback.print_exc()  # a bad tick must never stop the daemon
+            traceback.print_exc()  # a bad tick never stops the daemon
         finally:
             stop.wait(max(0.0, deadline - time.monotonic()))
 
@@ -208,8 +191,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _access(self, method, status, started, text=None):
-        # One line per request; polls stay quiet unless --verbose, or the
-        # client's few-second polling would bury the conversation.
         if method == "GET" and not self.server.verbose:
             return
         detail = f"  {text[:60]!r}" if text else ""
@@ -259,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
             self._access("POST", 500, started)
             return self._json(500, {"error": "generation failed"})
 
-    def log_message(self, fmt, *argv):  # quiet default access log
+    def log_message(self, fmt, *argv):
         if self.server.verbose:
             super().log_message(fmt, *argv)
 
@@ -282,7 +263,6 @@ def build_parser():
 
 
 def _listening(host, port, timeout=1.0):
-    """True when something already accepts connections on host:port."""
     probe = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     try:
         with socket.create_connection((probe, port), timeout=timeout):
@@ -296,8 +276,7 @@ def main(argv=None):
     args = resolve_config_args(parser, argv, cli.CHAT_CONFIG)
     args = engine.resolve_max_reply(args)
 
-    # Before the model load: a second daemon must fail in a second, not after
-    # 30 seconds of loading weights only to bind the same port.
+    # fail fast before the 30s model load
     if _listening(args.host, args.port):
         print(f"error: something is already listening on "
               f"http://{args.host}:{args.port}")
@@ -323,9 +302,9 @@ def main(argv=None):
         "device": device,
         "demo_index": demo_index,
         "openers": openers,
-        "engine_lock": threading.Lock(),   # one model, one generation at a time
+        "engine_lock": threading.Lock(),
         "session_lock": threading.Lock(),
-        "last_proactive": 0.0,             # tick 1 fires if hours allow
+        "last_proactive": 0.0,
         "live_mtime": 0.0,
         "interval": args.interval,
     }
@@ -336,7 +315,6 @@ def main(argv=None):
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as exc:
-        # the probe is advisory; this catches the race and bad ports
         stop.set()
         print(f"error: could not bind {args.host}:{args.port}: {exc}")
         print("stop the other server or pass --port <other>")

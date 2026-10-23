@@ -1,7 +1,3 @@
-"""Qwen3 QLoRA: load, train, and serve "her" voice on top of Qwen3-1.7B.
-
-Design rationale: git history (docs/REPORT.md, removed).
-"""
 import argparse
 import json
 import math
@@ -15,11 +11,10 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Windows console: same utf-8 handling as client/repl.py
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# read before import torch at allocator init; measured no-op on torch 2.14, belt-and-braces
+# must run before import torch
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
 
 import torch
@@ -40,7 +35,6 @@ def get_tokenizer(base: str = BASE) -> AutoTokenizer:
 
 def apply_template(messages, tokenizer=None, add_generation_prompt=False,
                    think=False):
-    """One place renders the chat template; thinking is off unless asked."""
     tok = tokenizer or get_tokenizer()
     return tok.apply_chat_template(messages, tokenize=False,
                                    add_generation_prompt=add_generation_prompt,
@@ -51,8 +45,6 @@ _markers_cache = {}
 
 
 def think_markers(tokenizer=None):
-    """(open, close) of the empty thinking block, probed at runtime so no
-    literal lands in source."""
     if "m" not in _markers_cache:
         probe = apply_template(
             [{"role": "user", "content": "x"},
@@ -70,14 +62,8 @@ IM_END = "<|im_end|>"
 
 
 def encode_row(messages, tokenizer=None):
-    """(input_ids, labels) for one SFT row, completion-only loss.
-
-    Assistant spans (empty thinking block + reply + <|im_end|>) are scored;
-    everything else gets -100. Spans come from char offsets of one full
-    render.
-    shortcut: literal <|im_end|> inside content splits a span; content is
-    chat text, not tokens.
-    """
+    # completion-only loss: assistant spans scored, rest -100
+    # shortcut: a literal <|im_end|> inside content splits a span
     tok = tokenizer or get_tokenizer()
     text = apply_template(messages, tok)
     enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
@@ -96,7 +82,6 @@ def encode_row(messages, tokenizer=None):
 
 
 def _selfcheck_examples(rows, tok, n=3):
-    # decode-as-ids proof: labels must be real token ids of the assistant turn (a mask/ids mix-up once trained to loss 0)
     for row in rows[:n]:
         ids, labels = encode_row(row, tok)
         scored = tok.decode([i for i, l in zip(ids, labels) if l != -100],
@@ -113,8 +98,6 @@ def _selfcheck_examples(rows, tok, n=3):
 
 
 def load_engine(base: str = BASE, adapter=None, device="cuda"):
-    """(tokenizer, model) ready to generate. NF4-quantized base; optional
-    LoRA adapter loaded from disk (the sidecar produced by train())."""
     tok = get_tokenizer(base)
     bnb = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -134,11 +117,6 @@ def load_engine(base: str = BASE, adapter=None, device="cuda"):
 
 def reply(tok, model, messages, max_new_tokens=80, temperature=0.7, top_p=0.9,
           repeat_penalty=1.0, think=False):
-    """One assistant turn -> (visible text, thought).
-
-    The thought is audit material (empty when thinking is off) and never
-    reaches the user-facing reply.
-    """
     prompt = apply_template(messages, tok, add_generation_prompt=True,
                             think=think)
     ids = tok(prompt, return_tensors="pt").to(model.device)
@@ -153,8 +131,7 @@ def reply(tok, model, messages, max_new_tokens=80, temperature=0.7, top_p=0.9,
 
 
 def extract_think(text, tokenizer=None):
-    """(visible, thought): a closed think block is audit only; an unclosed
-    block is a truncated leak, so nothing after the open marker is visible."""
+    # unclosed think block is a truncated leak: nothing after the open marker is visible
     open_m, close_m = think_markers(tokenizer)
     if open_m in text:
         head, _, tail = text.partition(open_m)
@@ -171,8 +148,6 @@ def strip_think(text, tokenizer=None):
 
 
 def strip_think(text, tokenizer=None):
-    """Remove any thinking block; a block that never closed is a truncated
-    leak, so nothing after the open marker is visible text."""
     open_m, close_m = think_markers(tokenizer)
     if open_m in text:
         head, _, tail = text.partition(open_m)
@@ -198,7 +173,6 @@ def train(args):
     print(f"device: {device}")
     model = AutoModelForCausalLM.from_pretrained(
         args.base, quantization_config=build_bnb(), device_map=device)
-    # non-reentrant checkpointing once, before the PEFT wrap
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False})
     lora = LoraConfig(
@@ -228,7 +202,6 @@ def train(args):
     opt = torch.optim.AdamW(trainables, lr=args.lr)
 
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
-    # token-budget micro-batching: padded tokens, not row count, caps VRAM
     examples.sort(key=lambda e: e[0])
     batches = []
     i = 0
@@ -282,7 +255,6 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(trainables, 1.0)
             opt.step()
             opt.zero_grad()
-            # empty_cache keeps the reserved pool off the WDDM spill edge
             torch.cuda.empty_cache()
             step += 1
             if step % 25 == 0:

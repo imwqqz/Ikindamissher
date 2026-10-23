@@ -3,11 +3,6 @@ from pathlib import Path
 
 
 def _find_project_root(start):
-    # The pre-restructure entry scripts resolved data/ and configs/ next to
-    # themselves, i.e. at the repo root. Installed console scripts run copies of
-    # these modules from site-packages, so anchor on the working tree instead:
-    # walk up from the cwd to the project's pyproject.toml, falling back to this
-    # module's own checkout only when the cwd is outside the project.
     for base in (start, *start.parents):
         if (base / "pyproject.toml").exists():
             return base
@@ -27,17 +22,11 @@ DEFAULT_BPE = PROJECT_ROOT / "data" / "input" / "bpe.json"
 
 CHAT_CONFIG = PROJECT_ROOT / "configs" / "chatbot.config.json"
 
-# Live state (chat log, session, proactive queue, audit) lives here, separate
-# from the training data.
 LIVE_DIR = PROJECT_ROOT / "data" / "live"
 
 
 def move_legacy(old, new):
-    """One-time relocation of a live-state file into LIVE_DIR.
-
-    A running daemon on the old code may hold the file; the move is retried on
-    the next start instead of taking the process down.
-    """
+    # file may be held by a running old daemon; retried next start
     import shutil
     old, new = Path(old), Path(new)
     if not old.exists() or new.exists():
@@ -48,13 +37,10 @@ def move_legacy(old, new):
     except OSError as exc:
         print(f"[live] could not move {old} -> {new}: {exc}")
 
-# keys that describe the invocation rather than the run, so they are not
-# written into a generated config file
 _META_KEYS = ("help", "config", "dump_config")
 
 
 def request_cpu_fallback():
-    """Ask before running without a GPU; non-interactive input declines."""
     try:
         answer = input("CUDA is not available. Continue on CPU? [y/N] ")
     except EOFError:
@@ -63,8 +49,6 @@ def request_cpu_fallback():
 
 
 def load_config(path):
-    # A config only supplies defaults; argparse stays the schema, so a flag on the
-    # command line always beats the file.
     import json
     path = Path(path)
     if not path.exists():
@@ -80,8 +64,6 @@ def load_config(path):
 
 
 def _coerce(action, value):
-    # The JSON author gets argparse's validation, so "epochs": "20" behaves
-    # like --epochs 20.
     if isinstance(getattr(action, "const", None), bool):
         if not isinstance(value, bool):
             raise SystemExit(f"config: {action.dest} must be true or false, "
@@ -105,8 +87,6 @@ def apply_config(ap, config):
     known = {a.dest: a for a in ap._actions if a.dest not in _META_KEYS}
     unknown = sorted(set(config) - set(known))
     if unknown:
-        # Refuse unknown keys: a misspelled option that is silently dropped leaves you
-        # training with settings you did not choose.
         import difflib
         hints = []
         for name in unknown:
@@ -129,8 +109,6 @@ def _config_path_from_argv(argv):
 
 
 def _bootstrap_config(ap, argv, default_path):
-    # Shared by the chat entry points: an explicit --config wins, else the
-    # script's own config file is auto-discovered, else built-in defaults.
     raw = list(argv) if argv is not None else sys.argv[1:]
     explicit = _config_path_from_argv(raw)
     path = explicit or (default_path if default_path and default_path.exists() else None)
@@ -143,9 +121,6 @@ def _bootstrap_config(ap, argv, default_path):
 
 
 def resolve_config_args(ap, argv=None, default_path=None):
-    """Config supplies defaults, explicit flags win. Exits on --dump-config."""
-    # Snapshot before apply_config overwrites the defaults: --dump-config
-    # reports them, so reading action.default afterwards would leak local paths.
     builtin_defaults = {a.dest: a.default for a in ap._actions}
     apply_config(ap, _bootstrap_config(ap, argv, default_path))
     args = ap.parse_args(argv)
@@ -172,8 +147,6 @@ def _to_relative_path(value, root):
 
 
 def dump_config(ap, path, defaults=None):
-    # Relative paths, so a committed example works on any machine instead of
-    # pinning the absolute layout of whoever generated it.
     import json
     root = PROJECT_ROOT
     body = {}

@@ -16,7 +16,6 @@ from config import (CHAT_CONFIG, DEFAULT_DATA, DEFAULT_DESC, DEFAULT_QA,
 from data import (WA_LINE, WA_NOISE, configure_speakers, detect_user,
                   persona_lines, persona_qa_turns, speaker_names)
 
-# match 'name: message' only by accident, via the colon inside the timestamp
 SYSTEM = re.compile(
     r"^(\d{1,2}/\d{1,2}/\d{2,4},[^-\n]*- )?"
     r"(messages and calls are end-to-end encrypted|"
@@ -26,7 +25,6 @@ SYSTEM = re.compile(
 
 
 def _new_turn(line, speakers, aliases, stats):
-    """(matched, turn) for one line. Filtered lines match but yield no turn."""
     match = WA_LINE.match(line)
     if not match:
         return False, None
@@ -55,11 +53,6 @@ def _continuation(line, turns, stats):
 
 
 def parse_turns(text, speakers, aliases):
-    """Return (turns, stats) where turns is [(speaker, message)].
-
-    A line with a timestamp starts a turn; without one it continues the turn
-    above it. A line that can continue nothing is a system notice.
-    """
     turns = []
     stats = Counter()
     for line in text.splitlines():
@@ -78,10 +71,10 @@ def parse_turns(text, speakers, aliases):
 def _fold_turn(current, convs, role, msg, orphans):
     if role == "user" or not current:
         if role == "assistant":
-            return [], orphans + 1    # her reply with no question before it
+            return [], orphans + 1
         if current:
             convs.append(current)
-            orphans += 1              # her side already closed; this is unpaired
+            orphans += 1
         current = []
     if current and current[-1]["role"] == role:
         current[-1]["content"] += "\n" + msg
@@ -91,10 +84,6 @@ def _fold_turn(current, convs, role, msg, orphans):
 
 
 def group_conversations(turns, user, her_name):
-    """Fold a flat turn list into conversations of user->assistant exchanges.
-
-    Same-speaker runs merge, since a chat template emits one block per role.
-    """
     convs = []
     current = []
     orphans = 0
@@ -110,7 +99,6 @@ def group_conversations(turns, user, her_name):
 
 
 def to_sharegpt(conversations):
-    """LLaMA-Factory's sharegpt loader expects from/value, not role/content."""
     name = {"user": "human", "assistant": "gpt"}
     return [
         {"conversations": [{"from": name[m["role"]], "value": m["content"]} for m in c]}
@@ -126,7 +114,6 @@ def percentile(values, quantile):
 
 
 def _load_config(args):
-    # Canonical labels come from the gitignored chatbot config.
     if not CHAT_CONFIG.exists():
         return {}
     return load_config(CHAT_CONFIG)
@@ -144,7 +131,6 @@ def _resolve_speakers(args, cfg):
 
 
 def _drop_long_conversations(convs, max_chars):
-    """Drop any message longer than max_chars; emptied conversations fall away."""
     if not max_chars:
         return convs, Counter()
     too_long = Counter()
@@ -170,11 +156,6 @@ def _persona_block(args, her_name):
 
 
 def _qa_rows(qa_path, user, her_name):
-    """Answer-shaped persona facts as user->her SFT rows.
-
-    Reuses data.py's q:/a: parser; a trailing user turn with no her reply
-    carries no completion and is dropped.
-    """
     if not (qa_path and Path(qa_path).exists()):
         return []
     lines = persona_qa_turns(Path(qa_path).read_text(encoding="utf-8"),
@@ -221,7 +202,6 @@ def _her_chars(convs):
 
 
 def _real_tokens(convs):
-    """Token counts via the qwen tokenizer the engine actually trains with."""
     from transformers import AutoTokenizer
     src = PROJECT_ROOT / "data" / "her_qwen_adapter"
     tok = AutoTokenizer.from_pretrained(
@@ -237,7 +217,6 @@ def _real_tokens(convs):
 
 
 def _tally(convs):
-    # Two her-shares: quoting either alone is misleading.
     train_chars = _her_chars(convs)
     kept_chars = sum(len(m["content"]) for c in convs for m in c)
     turns_per = [len(c) for c in convs]
@@ -331,7 +310,7 @@ def main(argv=None):
 
     convs, orphans = group_conversations(turns, user, her_name)
     convs, too_long = _drop_long_conversations(convs, args.max_chars)
-    # Path("") resolves to ".", which exists: an unset --qa must stay unset.
+    # Path("") resolves to "."; an unset --qa must stay unset
     qa_convs = _qa_rows(Path(args.qa) if args.qa else None,
                         user, her_name)
     convs = convs + qa_convs
@@ -342,7 +321,7 @@ def main(argv=None):
     try:
         tokens = _real_tokens(convs)
     except Exception:
-        tokens = None    # no adapter, no network: fall back to the chars//4 guess
+        tokens = None
 
     train_chars, kept_chars, turns_per, msg_chars = _tally(convs)
     _report(args, rows, args.out, args.format, stats, turns, orphans, too_long,

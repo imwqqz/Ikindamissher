@@ -17,14 +17,12 @@ SPEAKER_HER = "babe"
 
 
 def toy_encoder(vocab_size=420):
-    """A small BPE trained on the synthetic corpus (has real merges)."""
     encoder = BytePairEncoder()
     encoder.train(CORPUS, vocab_size)
     return encoder
 
 
 def canonical_piece(encoder, piece):
-    """Reference BPE: apply the lowest-rank merge each round."""
     ids = list(piece.encode("utf-8"))
     while len(ids) >= 2:
         best = None
@@ -82,7 +80,6 @@ def check_reply_shape():
 
 
 def check_demo_retrieval():
-    # one conversation must still yield two demos, the second from another, on separate lines
     import engines.dispatch as chatbot
     encoder = toy_encoder()
     data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
@@ -100,9 +97,6 @@ def check_demo_retrieval():
 
 
 def check_qwen_template():
-    """Qwen3 template, thinking disabled: assistant rows carry exactly one
-    EMPTY thinking block, texts survive encode->decode, and a generation
-    prompt pre-closes the block (documented force-non-thinking mechanism)."""
     try:
         import engines.qwen.qwen_lm as qwen_lm
     except ImportError as exc:
@@ -131,9 +125,6 @@ def check_qwen_template():
 
 
 def check_qwen_mask():
-    """encode_row scores only assistant turns as real token ids; headers and
-    user/system text get -100. Decode-as-ids must equal the assistant turn
-    (this test exists because a mask/ids mix-up trained silently to loss 0)."""
     try:
         import engines.qwen.qwen_lm as qwen_lm
     except ImportError as exc:
@@ -159,8 +150,6 @@ def check_qwen_mask():
 
 
 def check_qwen_strip_think():
-    """strip_think: closed blocks removed with the visible text kept; an
-    unclosed block (truncation) shows nothing after the open marker."""
     try:
         import engines.qwen.qwen_lm as qwen_lm
     except ImportError as exc:
@@ -174,8 +163,6 @@ def check_qwen_strip_think():
             return False, f"strip_think({raw!r}) != {want!r}"
     return True, "strip ok"
 def check_qa_rows():
-    """_qa_rows folds q:/a: lines into user->her rows and drops answer-less
-    tails (added with the --qa '' disable crash fix, export_sft)."""
     import export_sft
     data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
     with tempfile.TemporaryDirectory() as tmp:
@@ -241,8 +228,6 @@ def check_queue_roundtrip():
 
 
 def check_chatlog():
-    """Appends stay corpus-parseable: one line per turn, multi-line flattened,
-    and a quiet gap opens a new conversation with a blank line."""
     import chatlog
     data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
     gap = data.CONVERSATION_GAP_MINUTES * 60
@@ -261,7 +246,6 @@ def check_chatlog():
 
 
 def check_turnlog():
-    """One audited turn round-trips: candidates, chosen reply, why, thought."""
     import turnlog
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "telemetry.sqlite3"
@@ -287,8 +271,6 @@ def check_turnlog():
 
 
 def check_daemon_guard():
-    """The startup probe sees a listening socket, and a just-closed port reads
-    free again (so Ctrl+C + restart stays instant)."""
     import socket
     import server.service as service
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
@@ -335,7 +317,7 @@ def main(argv=None):
     for name, fn in selected:
         try:
             ok, detail = fn()
-        except Exception as exc:  # a raised check is a failure, not a crash
+        except Exception as exc:
             ok, detail = False, f"{type(exc).__name__}: {exc}"
         print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
         failures += 0 if ok else 1
