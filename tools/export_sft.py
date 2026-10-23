@@ -1,8 +1,7 @@
 """Export a WhatsApp chat to the JSONL that LLaMA-Factory / Unsloth / TRL read.
 
-Reuses her.py's parsing rules, regrouped into conversations; continuation
-lines kept, unanswered messages dropped (an SFT row needs both halves).
-
+Reuses her.py's parsing rules: continuation lines kept, unanswered messages
+dropped (an SFT row needs both halves). Flags: see --help.
 """
 
 import argparse
