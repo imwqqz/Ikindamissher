@@ -65,25 +65,36 @@ def save_session(sess, path=SESSION_PATH):
     os.replace(tmp, path)  # atomic on Windows (same volume)
 
 def _init_queue(path=QUEUE_PATH):
-    with sqlite3.connect(path) as con:
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS proactive ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "text TEXT NOT NULL, ts REAL NOT NULL)")
+    con = sqlite3.connect(path)
+    try:
+        with con:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS proactive ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "text TEXT NOT NULL, ts REAL NOT NULL)")
+    finally:
+        con.close()
 
 
 def _queue_push(text, ts, path=QUEUE_PATH):
-    with sqlite3.connect(path) as con:
-        cur = con.execute(
-            "INSERT INTO proactive(text, ts) VALUES(?, ?)", (text, ts))
-        return cur.lastrowid
+    con = sqlite3.connect(path)
+    try:
+        with con:
+            cur = con.execute(
+                "INSERT INTO proactive(text, ts) VALUES(?, ?)", (text, ts))
+            return cur.lastrowid
+    finally:
+        con.close()
 
 
 def _queue_since(since, path=QUEUE_PATH):
-    with sqlite3.connect(path) as con:
+    con = sqlite3.connect(path)
+    try:
         rows = con.execute(
             "SELECT id, text, ts FROM proactive WHERE id > ? "
             "ORDER BY id LIMIT ?", (since, _MAX_POLL)).fetchall()
+    finally:
+        con.close()
     return [{"id": r[0], "text": r[1], "ts": r[2]} for r in rows]
 
 
