@@ -273,6 +273,40 @@ def check_grad_norm_telemetry():
     return ok, f"{len(norms)} norms recorded"
 
 
+def check_val_events():
+    # log.csv twin: the first validation always saves (best_val starts at
+    # inf), an unchanged val logs a stale row, and exhausted patience takes
+    # the early-stop branch
+    torch.manual_seed(0)
+    cfg = tiny_cfg()
+    model = build_model(cfg)
+    ids = torch.randperm(cfg["vocab_size"]).tolist() * 2
+    val_ids = torch.randperm(cfg["vocab_size"]).tolist() * 3
+    with tempfile.TemporaryDirectory() as tmp:
+        log_dir = Path(tmp) / "runs" / "her_model"
+        trainer = Trainer(trainer_args(), cfg, model, ids, torch.device("cpu"),
+                          BytePairEncoder(), Path(tmp) / "her_model.pt",
+                          val_ids=val_ids, log_dir=log_dir)
+        # a real run always validates after training steps, so loss is finite
+        inputs, targets = next(iter(trainer.sampler))
+        trainer._record_loss(trainer._train_step(inputs, targets))
+        trainer._optimizer_step()
+        trainer._validate_on_rank0(10, 1)
+        trainer._validate_on_rank0(20, 1)
+        trainer.patience = 1
+        third = trainer._validate_on_rank0(30, 1)
+        events = [line.rsplit(",", 1)[1]
+                  for line in (log_dir / "log.csv")
+                  .read_text(encoding="utf-8").splitlines()[1:]]
+    checks = {
+        "early-stop": bool(third) and trainer.stopped_early
+                      and trainer.best_step == 10,
+        "rows": events == ["save", "val_saved", "val", "val"],
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    return not failed, "ok" if not failed else f"failed: {failed}"
+
+
 def check_cli_flags():
     # --d-model=512 must count as asked-for in both spellings, else a --size preset silently overwrites it
     from config import cli_flags, parse_args
@@ -407,6 +441,45 @@ def check_qa_rows():
     return not failed, "rows ok" if not failed else f"failed: {failed}"
 
 
+def check_session_roundtrip():
+    import server.service as service
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "s.json"
+        service.save_session({"history": [f"{SPEAKER_USER}: hola",
+                                          f"{SPEAKER_HER}: hola"]}, path)
+        back = service.load_session(path)
+        ok = back.get("history") == [f"{SPEAKER_USER}: hola", f"{SPEAKER_HER}: hola"]
+        return ok, "session round-trip ok"
+
+
+def check_session_corrupt():
+    import server.service as service
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "s.json"
+        path.write_text("{not valid json", encoding="utf-8")
+        back = service.load_session(path)
+        sidecar = path.with_suffix(".corrupt.json")
+        ok = back == {"history": []} and sidecar.exists()
+        return ok, "corrupt session quarantined ok"
+
+
+def check_queue_roundtrip():
+    import server.service as service
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "q.sqlite3"
+        service._init_queue(path)
+        i1 = service._queue_push("hola", 1000.0, path)
+        i2 = service._queue_push("chau", 2000.0, path)
+        rows = service._queue_since(0, path)
+        new = service._queue_since(i1, path)
+        checks = {
+            "both rows in order": [r["id"] for r in rows] == [i1, i2],
+            "since=only newer row": [r["text"] for r in new] == ["chau"],
+        }
+        failed = [k for k, ok in checks.items() if not ok]
+        return not failed, "queue ok" if not failed else f"failed: {failed}"
+
+
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
@@ -421,10 +494,14 @@ CHECKS = [
     ("demo-retrieval", check_demo_retrieval),
     ("cli-flags", check_cli_flags),
     ("gnorm", check_grad_norm_telemetry),
+    ("val-events", check_val_events),
     ("qwen-template", check_qwen_template),
     ("qwen-mask", check_qwen_mask),
     ("qwen-strip", check_qwen_strip_think),
     ("qa-rows", check_qa_rows),
+    ("session-roundtrip", check_session_roundtrip),
+    ("session-corrupt", check_session_corrupt),
+    ("queue-roundtrip", check_queue_roundtrip),
 ]
 
 

@@ -196,7 +196,7 @@ def _csv_row(log_dir, event, **fields):
     for col in _CSV_COLUMNS:
         value = fields.get(col)
         values.append("" if value is None
-                      else f"{value:.4f}" if isinstance(value, float)
+                      else f"{value:.6g}" if isinstance(value, float)
                       else str(value))
     with path.open("a", encoding="utf-8") as f:
         f.write(",".join(values) + f",{event}\n")
