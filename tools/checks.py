@@ -1,16 +1,4 @@
-"""Runnable self-checks for the her.py training stack.
-
-Synthetic data only: nothing here reads or prints anything from data/, so the
-checks are safe to run on any machine. Exit code is 0 only when every check
-passes, so this doubles as a pre-merge gate.
-
-Usage:
-    uv run python tools/checks.py
-    uv run python tools/checks.py --only canonical
-"""
-
 import argparse
-import math
 import sys
 import tempfile
 from pathlib import Path
@@ -18,13 +6,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import torch
-
 import data
-from engines.her.model import build_model
 from tokenizer import BytePairEncoder
-from engines.her.training import Trainer, lm_loss
-from config import parse_args
 
 CORPUS = ("hola como estas gracias buenos dias que tal nos vemos luego "
           "mañana hablamos un rato mas tarde ") * 120
@@ -37,23 +20,6 @@ def toy_encoder(vocab_size=420):
     encoder = BytePairEncoder()
     encoder.train(CORPUS, vocab_size)
     return encoder
-
-
-def tiny_cfg(vocab_size=300, d_model=64, n_layers=2):
-    return dict(vocab_size=vocab_size, d_model=d_model, n_heads=4,
-                n_layers=n_layers, d_ff=128, max_len=64, dropout=0.0,
-                target_only_loss=False, objective="lm", lora=False,
-                lora_r=8, lora_alpha=16, lora_dropout=0.0, quant="none",
-                gc=False, tokenizer_arch="bpe")
-
-
-def trainer_args():
-    args = parse_args([])
-    args.objective, args.precision_dtype = "lm", None
-    args.block, args.batch, args.epochs = 32, 4, 1
-    args.val_fraction, args.warmup_steps, args.grad_accum = 0.0, 2, 1
-    args.log_every, args.spike_factor = 1, 0.0
-    return args
 
 
 def canonical_piece(encoder, piece):
@@ -97,225 +63,18 @@ def check_boundary():
     return not touching, f"boundary merges={len(touching)}"
 
 
-def check_loss_at_init():
-    # band, not equality: residual logit spread sits ~+2.2 nats above ln(V); catches the std=1 misinit (~128 vs ~10.5)
-    torch.manual_seed(0)
-    cfg = tiny_cfg()
-    model = build_model(cfg)
-    ids = torch.randint(0, cfg["vocab_size"], (4, 64))
-    with torch.no_grad():
-        loss = float(lm_loss(model(ids), ids, 0.0))
-    expected = math.log(cfg["vocab_size"])
-    sane = expected - 0.5 <= loss <= expected + 4.0
-    return sane, f"loss={loss:.3f} band=[{expected - 0.5:.3f},{expected + 4.0:.3f}]"
-
-
-def check_overfit_batch():
-    torch.manual_seed(0)
-    cfg = tiny_cfg()
-    model = build_model(cfg)
-    model.train()
-    ids = torch.randint(0, cfg["vocab_size"], (1, 64))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    loss = None
-    for _ in range(300):
-        optimizer.zero_grad()
-        loss = lm_loss(model(ids), ids, 0.0)
-        loss.backward()
-        optimizer.step()
-    value = float(loss)
-    return value < 0.1, f"final loss={value:.4f} after 300 steps"
-
-
-def check_mask_sanity():
-    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
-    corpus = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: que tal\n"
-              f"{SPEAKER_HER}: bien\n{SPEAKER_USER}: ok\n")
-    mask = data.target_char_mask(corpus, SPEAKER_HER)
-    prefix = f"{SPEAKER_HER}: "
-    lines = corpus.split("\n")
-    expected = 0
-    previous_her = False
-    for index, line in enumerate(lines):
-        if line.startswith(prefix):
-            expected += len(line) - (0 if previous_her else len(prefix))
-            expected += 1 if index < len(lines) - 1 else 0
-        previous_her = line.startswith(prefix)
-    actual = sum(mask)
-    sane = actual == expected and 0 < actual < len(corpus)
-    return sane, f"scored={actual} expected={expected}"
-
-
-def check_turn_end_invariants():
-    encoder = toy_encoder()
-    if not hasattr(encoder, "turn_end_id") or not hasattr(data, "her_turn_ends"):
-        return True, "skipped (turn-end sentinel not implemented yet)"
-    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
-    corpus = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: que tal\n"
-              f"{SPEAKER_HER}: bien y vos\n{SPEAKER_USER}: todo bien\n"
-              f"{SPEAKER_HER}: me alegro\n")
-    turn_ends = data.her_turn_ends(corpus, SPEAKER_HER)
-    ids, mask = encoder.encode_masked(
-        corpus, data.target_char_mask(corpus, SPEAKER_HER), turn_ends)
-    sentinel = encoder.turn_end_id
-    positions = [i for i, token in enumerate(ids) if token == sentinel]
-    stripped = [token for token in ids if token != sentinel]
-    checks = {
-        "one-per-run": len(positions) == 2,
-        "scored": bool(positions) and all(mask[i] for i in positions),
-        "concat": stripped == encoder.encode(corpus),
-    }
-    torch.manual_seed(0)
-    cfg = tiny_cfg(vocab_size=encoder.vocab_size)
-    model = build_model(cfg)
-    inputs = torch.tensor([ids])
-    loss = lm_loss(model(inputs), inputs, 0.0)
-    loss.backward()
-    checks["gradient"] = bool(model.tok_emb.weight.grad[sentinel].abs().sum() > 0)
-    failed = [name for name, ok in checks.items() if not ok]
-    return not failed, "ok" if not failed else f"failed: {failed}"
-
-
-def check_turn_generation():
-    # end-to-end sentinel proof: overfit a two-message turn, generate; the reply keeps the intra-turn newline without bleeding into the user's turn
-    encoder = toy_encoder()
-    if not hasattr(encoder, "turn_end_id"):
-        return True, "skipped (turn-end sentinel not implemented yet)"
-    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
-    corpus = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: hola que tal\n"
-              f"{SPEAKER_HER}: como estas\n{SPEAKER_USER}: bien y vos\n"
-              f"{SPEAKER_HER}: todo bien\n")
-    import her
-    ids, labels = her._masked_labels(encoder, corpus, SPEAKER_HER)
-    torch.manual_seed(0)
-    cfg = tiny_cfg(vocab_size=encoder.vocab_size, d_model=64, n_layers=2)
-    cfg["max_len"] = 128
-    model = build_model(cfg)
-    inputs = torch.tensor([ids])
-    targets = torch.tensor([labels])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    model.train()
-    for _ in range(600):
-        optimizer.zero_grad()
-        loss = lm_loss(model(inputs), targets, 0.0)
-        loss.backward()
-        optimizer.step()
-    model.eval()
-    prompt = encoder.encode(f"{SPEAKER_USER}: hola\n{SPEAKER_HER}:")
-    gen = model.generate(torch.tensor([prompt]), max_new=40, temperature=1e-8,
-                         top_k=1, stop_ids=encoder.stop_ids())
-    reply = encoder.decode(gen)
-    checks = {
-        "multi-message": "\n" in reply,
-        "no-user-bleed": f"{SPEAKER_USER}:" not in reply,
-        "stopped-early": len(gen) < 40,
-        "prompt-no-bare-space": prompt[-1] not in set(encoder.encode(" ")),
-    }
-    failed = [name for name, ok in checks.items() if not ok]
-    return not failed, "ok" if not failed else f"failed: {failed}"
-
-
-def check_conversation_end():
-    encoder = toy_encoder()
-    if not hasattr(encoder, "conversation_end_id"):
-        return True, "skipped (conversation sentinel not implemented yet)"
-    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
-    corpus = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: que tal\n\n"
-              f"{SPEAKER_USER}: buenas\n{SPEAKER_HER}: hola\n")
-    scenes = data.conversation_ends(corpus)
-    turn_ends = data.her_turn_ends(corpus, SPEAKER_HER)
-    ids, mask = encoder.encode_masked(corpus,
-                                      data.target_char_mask(corpus, SPEAKER_HER),
-                                      turn_ends, scenes)
-    sentinel = encoder.conversation_end_id
-    positions = [i for i, token in enumerate(ids) if token == sentinel]
-    stripped = [t for t in ids if t not in (sentinel, encoder.turn_end_id)]
-    checks = {
-        "one-per-boundary": len(scenes) == 1 and len(positions) == 1,
-        "scored": bool(positions) and all(mask[i] for i in positions),
-        "concat": stripped == encoder.encode(corpus),
-        "distinct-ids": sentinel != encoder.turn_end_id,
-    }
-    failed = [name for name, ok in checks.items() if not ok]
-    return not failed, "ok" if not failed else f"failed: {failed}"
-
-
 def check_reply_shape():
-    import engines.dispatch as chatbot
+    import engines.qwen.chat as qwen_chat
     user, her = SPEAKER_USER, SPEAKER_HER
     raw = (f": hola que tal\n{her}: como estas\n{her}: nos vemos\n"
            f"{user}: y vos\n")
-    cleaned = chatbot._clean_reply(raw, user, her)
+    cleaned = qwen_chat.clean_reply(raw, user, her)
     checks = {
         "non-empty": bool(cleaned),
         "no-user-bleed": f"{user}:" not in cleaned,
         "no-inner-label": f"{her}:" not in cleaned,
         "multi-line-kept": "\n" in cleaned,
         "leading-colon": not cleaned.startswith(":"),
-    }
-    failed = [name for name, ok in checks.items() if not ok]
-    return not failed, "ok" if not failed else f"failed: {failed}"
-
-
-def check_grad_norm_telemetry():
-    torch.manual_seed(0)
-    cfg = tiny_cfg()
-    model = build_model(cfg)
-    ids = torch.randperm(cfg["vocab_size"]).tolist() * 2
-    with tempfile.TemporaryDirectory() as tmp:
-        # checkpoint in a fresh temp dir so the gate runs on any machine
-        ckpt = Path(tmp) / "checks_gnorm.pt"
-        trainer = Trainer(trainer_args(), cfg, model, ids, torch.device("cpu"),
-                          BytePairEncoder(), ckpt)
-        trainer.fit()
-        norms = list(trainer.grad_norms)
-    ok = bool(norms) and all(math.isfinite(g) for g in norms)
-    return ok, f"{len(norms)} norms recorded"
-
-
-def check_val_events():
-    # log.csv twin: the first validation always saves (best_val starts at
-    # inf), an unchanged val logs a stale row, and exhausted patience takes
-    # the early-stop branch
-    torch.manual_seed(0)
-    cfg = tiny_cfg()
-    model = build_model(cfg)
-    ids = torch.randperm(cfg["vocab_size"]).tolist() * 2
-    val_ids = torch.randperm(cfg["vocab_size"]).tolist() * 3
-    with tempfile.TemporaryDirectory() as tmp:
-        log_dir = Path(tmp) / "runs" / "her_model"
-        trainer = Trainer(trainer_args(), cfg, model, ids, torch.device("cpu"),
-                          BytePairEncoder(), Path(tmp) / "her_model.pt",
-                          val_ids=val_ids, log_dir=log_dir)
-        # a real run always validates after training steps, so loss is finite
-        inputs, targets = next(iter(trainer.sampler))
-        trainer._record_loss(trainer._train_step(inputs, targets))
-        trainer._optimizer_step()
-        trainer._validate_on_rank0(10, 1)
-        trainer._validate_on_rank0(20, 1)
-        trainer.patience = 1
-        third = trainer._validate_on_rank0(30, 1)
-        events = [line.rsplit(",", 1)[1]
-                  for line in (log_dir / "log.csv")
-                  .read_text(encoding="utf-8").splitlines()[1:]]
-    checks = {
-        "early-stop": bool(third) and trainer.stopped_early
-                      and trainer.best_step == 10,
-        "rows": events == ["save", "val_saved", "val", "val"],
-    }
-    failed = [k for k, ok in checks.items() if not ok]
-    return not failed, "ok" if not failed else f"failed: {failed}"
-
-
-def check_cli_flags():
-    # --d-model=512 must count as asked-for in both spellings, else a --size preset silently overwrites it
-    from config import cli_flags, parse_args
-    args = parse_args(["--size", "small", "--d-model=512"], config={})
-    seen = "--d-model" in cli_flags(["--d-model=512"])
-    checks = {
-        "equals-form": seen,
-        "space-form": "--d-model" in cli_flags(["--d-model", "512"]),
-        "arch-source": args.arch_src.get("d_model") == "cli",
     }
     failed = [name for name, ok in checks.items() if not ok]
     return not failed, "ok" if not failed else f"failed: {failed}"
@@ -484,17 +243,8 @@ CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
     ("boundary", check_boundary),
-    ("loss-init", check_loss_at_init),
-    ("overfit-batch", check_overfit_batch),
-    ("mask", check_mask_sanity),
-    ("turn-end", check_turn_end_invariants),
-    ("conversation-end", check_conversation_end),
-    ("turn-generation", check_turn_generation),
     ("reply-shape", check_reply_shape),
     ("demo-retrieval", check_demo_retrieval),
-    ("cli-flags", check_cli_flags),
-    ("gnorm", check_grad_norm_telemetry),
-    ("val-events", check_val_events),
     ("qwen-template", check_qwen_template),
     ("qwen-mask", check_qwen_mask),
     ("qwen-strip", check_qwen_strip_think),
@@ -506,7 +256,8 @@ CHECKS = [
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(
+        description="run the repo self-checks")
     parser.add_argument("--only", default=None,
                         help="run a single check by name")
     args = parser.parse_args(argv)
@@ -529,4 +280,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-

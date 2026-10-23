@@ -12,10 +12,9 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 import torch
 
 from config import (
-    DEFAULT_CKPT,
+    CHAT_CONFIG,
     DEFAULT_DATA,
     DEFAULT_DESC,
-    PROJECT_ROOT,
     request_cpu_fallback,
     resolve_config_args,
 )
@@ -31,15 +30,12 @@ from engines.dispatch import (
     resolve_max_reply,
 )
 
-CHAT_CONFIG = PROJECT_ROOT / "configs" / "chatbot.config.json"
-
 BOT_LABEL = "her"
 
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="repl: talk to her using the memory trained by her.py")
-    ap.add_argument("--ckpt", default=str(DEFAULT_CKPT))
+        description="repl: talk to her using the qwen adapter")
     ap.add_argument("--data", default=str(DEFAULT_DATA))
     ap.add_argument("--description", default=str(DEFAULT_DESC))
     ap.add_argument("--user", default=None,
@@ -49,25 +45,17 @@ def build_parser():
     ap.add_argument("--her-speaker", default=None,
                     help="canonical name for the persona; must match training, "
                          "and is kept out of the source on purpose")
-    ap.add_argument("--engine", choices=["her", "qwen"], default="her",
-                    help="her: the from-scratch her model; qwen: Qwen3 + "
-                         "the her QLoRA adapter")
     ap.add_argument("--adapter", default=None,
-                    help="adapter dir for --engine qwen (default: "
-                         "data/her_qwen_adapter)")
+                    help="adapter dir (default: data/her_qwen_adapter)")
     ap.add_argument("--shots", type=int, default=2,
                     help="real user/persona exchanges matched to your prompt")
     ap.add_argument("--demo-len", type=int, default=20,
                     help="max tokens per demo message")
     ap.add_argument("--max-reply", type=int, default=40)
     ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--repeat-penalty", type=float, default=1.15)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--raw-weights", action="store_true",
-                    help="ignore the checkpoint's EMA average and load the "
-                         "raw weights instead")
     ap.add_argument("--cpu", action="store_true",
                     help="run on CPU when CUDA is unavailable, skipping the "
                          "interactive prompt")
@@ -111,27 +99,16 @@ def _setup_device(force_cpu=False):
     return device
 
 
-def _pick_speakers(args, cfg):
-    return args.user_speaker or cfg.get("user_speaker"), \
-        args.her_speaker or cfg.get("her_speaker")
-
-
-def _configure_from_checkpoint(args, cfg):
-    # The checkpoint is the only record of how turns were labelled; never guess.
-    configure_speakers(*_pick_speakers(args, cfg))
+def _configure_speakers(args):
+    # Turn labels are what the qwen adapter was trained with; never guess.
+    configure_speakers(args.user_speaker, args.her_speaker)
     user_name, her_name = speaker_names()
     if not user_name or not her_name:
         raise SystemExit(
-            "this checkpoint predates speaker persistence and no names were "
-            'given. Pass the same values you trained with, e.g.\n'
+            "no speaker names configured. Set user_speaker and her_speaker in "
+            f"{CHAT_CONFIG.name}, or pass them:\n"
             '  uv run python client/repl.py --user-speaker "<name>" '
-            '--her-speaker "<name>"\n'
-            "Retraining stores them in the checkpoint, so this is only "
-            "needed for older files.")
-    if (cfg.get("her_speaker") and her_name != cfg["her_speaker"]) or \
-       (cfg.get("user_speaker") and user_name != cfg["user_speaker"]):
-        print(f"note: overriding persisted labels (configured as "
-              f"{cfg.get('user_speaker')!r}/{cfg.get('her_speaker')!r})")
+            '--her-speaker "<name>"')
     return user_name, her_name
 
 
@@ -165,10 +142,9 @@ def main(argv=None):
     device = _setup_device(args.cpu)
 
     state, model, tokenizer = load_assets(args, device)
-    cfg = state["cfg"]
-    user_name, her_name = _configure_from_checkpoint(args, cfg)
+    user_name, her_name = _configure_speakers(args)
 
-    corpus_text = load_corpus(args, cfg)
+    corpus_text = load_corpus(args)
     demo_index = build_demo_index(corpus_text, tokenizer) if corpus_text else None
 
     history = []

@@ -1,48 +1,23 @@
-* Attention Is All You Need                          https://arxiv.org/abs/1706.03762
-    scaled dot-product / multi-head attention (3.2), residual blocks (3.1),
-    FFN (3.3), scaling embeddings by sqrt(d_model) and weight tying (3.4),
-    Adam + warmup/inverse-sqrt LR (5.3), label smoothing + dropout (5.4)
-* Exploring the Limits of Transfer Learning with a
-  Unified Text-to-Text Transformer (T5)              https://arxiv.org/abs/2005.14165
-    text-to-text framing, bias-free pre-norm normalization (2.1),
-    pre-norm placement + GELU activation (3.1), span corruption (3.2),
-    training strategy / inverse-sqrt decay / dropout (3.4)
-* LoRA: Low-Rank Adaptation of Large Language Models https://arxiv.org/abs/2106.09685
-    low-rank update W = W0 + (alpha/r) * BA (4.1), applied to q/k/v/o (4.2),
-    practical benefits: fewer trainable params (4.3)
-* QLoRA: Efficient Finetuning of Quantized LLMs     https://arxiv.org/abs/2305.18290
-    4-bit NormalFloat (NF4) block-wise quantization (3.1),
-    double quantization of the constants (3.2),
-    frozen base + trainable adapters (3.4 / Algorithm 1)
-* RoFormer: Enhanced Transformer with Rotary Position Embedding
-                                                     https://arxiv.org/abs/2104.09864
-    rotary position embedding: pairs of dims rotate by base^(-2i/d),
-    relative-position invariance (the q/k rotary in model.py)
-* The Curious Case of Neural Text Degeneration        https://arxiv.org/abs/1904.09751
-    nucleus (top-p) sampling (3.1) and the repetition/presence penalty (5)
-* SGDR: Stochastic Gradient Descent with Warm Restarts https://arxiv.org/abs/1608.03983
-    cosine annealing (2.1), the --schedule cosine option
+* Byte-pair encoding                                 https://arxiv.org/abs/1508.07909
+    the retrieval tokenizer's merge loop (tokenizer.py)
 * Language Models are Unsupervised Multitask Learners
   (GPT-2)                                            https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
     the byte-level BPE pretokenizer regex (tokenizer.py's BPE_PAT)
-* Neural Machine Translation of Rare Words with
-  Subword Units (BPE)                                https://arxiv.org/abs/1508.07909
-    byte-pair encoding (3), the tokenizer's merge loop
+* LoRA: Low-Rank Adaptation of Large Language Models https://arxiv.org/abs/2106.09685
+    low-rank update W = W0 + (alpha/r) * BA (4.1), applied by peft
+    (qwen_lm.py's LoraConfig)
+* QLoRA: Efficient Finetuning of Quantized LLMs     https://arxiv.org/abs/2305.18290
+    4-bit NormalFloat (NF4) block-wise quantization (3.1), double quantization
+    of the constants (3.2), frozen base + trainable adapters (3.4 / Algorithm 1)
 * TRL SFTTrainer (train_on_prompt=false)             https://huggingface.co/docs/trl/sft_trainer
     completion-only loss: score the assistant's turns, not the prompt
-    (target_char_mask in data.py)
-* A Recipe for Training Neural Networks (Karpathy)   https://karpathy.github.io/2019/04/25/recipe/
-    verify loss @ init, overfit one batch, mask sanity, fix the seed, and the
-    "training fails silently" principle behind checks.py
-* Deep Learning Tuning Playbook (Google Research)    https://github.com/google-research/tuning_playbook
-    gradient-clipping threshold just above the p90 norm, unclipped grad-norm
-    logging, and the retrain/evaluation discipline behind Trainer's telemetry
+    (encode_row's label mask in qwen_lm.py)
 
 
 ```text
 $ uv run python client/repl.py
 device: cuda
-loaded checkpoint: data\her_model.pt (loss 0.0532, trained 12,995 steps)
+adapter loaded: data\her_qwen_adapter
 few-shot retrieval on data/input/wa_out.txt
 chatting with her - type 'exit' to quit
 her: holis
@@ -50,6 +25,7 @@ her: holis
 her: y eso te hace mal
 <you>: exit
 ```
+
 ## Code example
 
 Run everything from the repo root:
@@ -57,99 +33,63 @@ Run everything from the repo root:
 ```ps1
 # working directory: D:\dev\Git\Ikindamissher
 
-uv sync                      # one-time setup (see Installation below)
+uv sync                       # one-time setup (see Installation below)
 
-py her.py                    # train: resumes data/her_model.pt if present
-py her.py --fresh            # first run: build tokenizer, ignore stale ckpt
-uv run python client/repl.py  # chat REPL
+uv run python tools/train_tokenizer.py     # build data/input/bpe.json (once)
+uv run python tools/export_sft.py --out data/sft.json --persona
+uv run python src/engines/qwen/qwen_lm.py  # fine-tune Qwen3 + the her adapter
 
+uv run python client/repl.py   # chat REPL
 uv run python tools/checks.py  # self-checks on synthetic data; exit 0 required
-
-# train the two side-by-side models (protected paths + pre-run backup):
-.\scripts\run_models.ps1
-
-# Qwen engine (fine-tunes Qwen3 + the her QLoRA adapter):
-uv run python src/engines/qwen/qwen_lm.py   # train the adapter
-uv run python tools/eval_qwen.py            # her vs qwen side-by-side gate
 ```
-
-Each run also writes `data/runs/<checkpoint-name>/`: `config.json` (the exact
-resolved invocation) and `log.csv` (step, losses, lr, grad-norm per step/validation/save).
 
 ## Chat recipe
 
-Two models are trained side by side (`scripts/run_models.ps1`):
+The brain is Qwen3-1.7B with the `her` QLoRA adapter trained on the export
+(`src/engines/qwen/qwen_lm.py`; adapter in `data/her_qwen_adapter/`). Chat with
+retrieval on: `client/repl.py` matches similar user/persona exchanges from the
+export and puts them in the system text, chained within one conversation
+instead of unrelated pairs stitched together.
 
-- `data/her_model_memory.pt` �?full corpus, no validation, `--keep-last`.
-  Memorizes the transcript; this is the model to chat with
-  (`uv run python client/repl.py --ckpt data\her_model_memory.pt`).
-- `data/her_model_style.pt` �?10% held-out validation, `dropout 0.1`,
-  `--no-keep-last` (the best-val checkpoint is retained).
+Speaker labels come from `configs/chatbot.config.json` (`user_speaker`,
+`her_speaker`); they are kept out of the source on purpose. The retrieval
+tokenizer (`data/input/bpe.json`) is built by `tools/train_tokenizer.py`; it
+only affects demo matching, while generation uses Qwen's own tokenizer.
 
-Measured A/B (2026-10-08, ~77k tokens, 15.7M params): the validation-based
-"style" run bottomed at step 500 and rose monotonically afterwards, so its
-best checkpoint is under-trained and replies are incoherent. At this corpus
-size, generalization comes from few-shot retrieval, not early stopping: chat
-with the memory model, keep retrieval on, and tune `--temperature`/`--top-p`.
-Demos are chained within one conversation (the matched pair plus the turns that
-followed it), so the in-context examples read as a single exchange instead of
-unrelated pairs stitched together.
-
-Re-confirmed 2026-10-23 via the per-run `log.csv` (`data/runs/her_model_style/`,
-now written automatically): best val 4.7392 at step 500 -- exactly the warmup
-end -- then a monotonic rise every check to 6.89, while train loss fell 30x
-(2.98 -> 0.09). Not the LR schedule (cosine was still at 93% of peak when the
-rise began): a straight memorization crossover at ~450 params per scored token.
-Rerun the style probe only when the corpus grows substantially; until then
-`-Only memory` is the recipe.
-
-`--keep-last` is for memorization runs; a run with a validation split should
-use `--no-keep-last` (or drop the key from the config), else the final weights
-replace the best-val checkpoint. A conversation boundary (a long time gap in
-the export) is a scored `conversation_end` token, so windows learn where one
-conversation stops and the next starts.
+`sft.json` is produced by `tools/export_sft.py` (one JSONL row per
+conversation, completion-only labels applied in `qwen_lm.encode_row`). Long
+messages are dropped by `--max-chars`: a pasted essay is not conversation and
+teaches the model to write essays.
 
 ## Project structure
 
 ```
 Ikindamissher/
 ├── src/                       # library modules (imported from the source tree)
-�?  ├── tokenizer.py           # byte-level BPE + 100 reserved sentinel ids
-�?  ├── data.py                # WhatsApp export -> corpus; speaker labels,
-�?  �?                         #   persona, target_char_mask, build_corpus
-�?  ├── config.py              # argparse + JSON config + size presets
-�?  └── engines/
-�?      ├── dispatch.py        # engine door: load_assets, prompts, replies
-�?      ├── her/               # the from-scratch GPT engine
-�?      �?  ├── model.py       #   GPT, RoPE, pre-norm blocks, KV cache,
-�?      �?  �?                 #   NF4/LoRA
-�?      �?  ├── training.py    #   lm + span losses, windows, validation,
-�?      �?  �?                 #   Trainer (+ per-run config.json/log.csv)
-�?      �?  └── checkpoint.py  #   load/save tokenizer, resume, reconcile_epochs
-�?      └── qwen/
-�?          └── qwen_lm.py     # Qwen3 + her QLoRA adapter engine
-├── her.py                     # training entry point (--ema, --cpu, --grad-clip)
+│   ├── tokenizer.py           # byte-level BPE for demo retrieval
+│   ├── data.py                # WhatsApp export -> user/persona turns, persona
+│   ├── config.py              # JSON config files + argparse plumbing
+│   └── engines/
+│       ├── dispatch.py        # engine door: assets, prompts, replies
+│       └── qwen/
+│           ├── qwen_lm.py     # Qwen3 + her QLoRA: train, load, generate
+│           └── chat.py        # chat rows, message building, reply cleanup
 ├── client/repl.py             # chat REPL + few-shot retrieval
-�?                             #   (--proactive/--proactive-only, --raw-weights, --cpu)
-├── server/service.py          # 24/7 HTTP daemon (poll transport, proactive SQLite)
-├── tools/                     # checks.py self-checks, export_sft.py SFT export,
-�?                             #   eval_qwen.py her-vs-qwen gate
-├── configs/                   # *_config.example.json + your gitignored locals
-├── data/                      # gitignored: export, description, persona Q&A,
-�?                             #   BPE, weights, runs/<name>/ config.json+log.csv
-├── docs/                      # report, blog draft, publish article
-├── scripts/                   # run_models.ps1: guarded memory + style runbook
+├── server/service.py          # 24/7 HTTP daemon (poll transport, proactive)
+├── tools/                     # checks.py, train_tokenizer.py, export_sft.py
+├── configs/                   # chatbot.config.example.json + gitignored locals
+├── data/                      # gitignored: export, persona, BPE, adapter, sft
 ├── .python-version            # 3.14.5
 ├── pyproject.toml
 └── uv.lock
 ```
 
-Data flow: `parse_wa` (data.py) turns the export into a corpus,
-`target_char_mask` marks the persona's characters, windows are scored and fed
-to `GPT` (engines/her/model.py), which trains them into `data/her_model.pt`;
-`client/repl.py` (or `server/service.py`) reads that checkpoint back and
-generates replies -- through `engines/dispatch.py`, which picks the her or
-qwen engine.
+Data flow: `parse_wa` normalizes the export into `speaker: message` turns;
+`build_demo_index` + `few_shot_pairs` retrieve similar exchanges into the
+system text; `engines/qwen/chat.py` builds the message list and
+`qwen_lm.reply` samples a reply. Training runs the other way:
+`export_sft.py` writes `data/sft.json`, and `qwen_lm.train` fits the adapter
+with completion-only labels.
 
 <!-- TODO: choose a license -->
 Contributions, acknowledgments, this project is under [LICENCE](https://github.com/imwqqz/Ikindamissher/blob/master/LICENSE)

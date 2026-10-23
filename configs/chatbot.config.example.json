@@ -1,5 +1,4 @@
 {
-  "ckpt": "data/her_model.pt",
   "data": "data/input/wa_out.txt",
   "demo_len": 20,
   "description": "data/input/description.txt",
@@ -9,7 +8,6 @@
   "seed": 42,
   "shots": 2,
   "temperature": 0.7,
-  "top_k": 20,
   "top_p": 0.9,
   "user": null,
   "user_speaker": null

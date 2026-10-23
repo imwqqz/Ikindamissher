@@ -1,9 +1,9 @@
-"""The engine door: loads a brain, builds its prompts, generates replies.
+"""The engine door: loads the qwen brain, builds its prompts, generates replies.
 
-One entry point for both brains (engines/her, engines/qwen). Everything
-here is engine-agnostic plumbing - the client (client/repl.py) and the daemon
-(server/service.py) only touch load_assets / generate_reply /
-generate_proactive and never know which model answered.
+Everything here is engine-agnostic plumbing (retrieval, persona, corpus) plus
+the qwen call sites. The client (client/repl.py) and the daemon
+(server/service.py) only touch load_assets / generate_reply / generate_proactive
+and never know which model answered.
 """
 import math
 import re
@@ -17,11 +17,8 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import torch
-
 from config import DEFAULT_BPE
 from data import (
-    _split_turns,
     detect_user,
     first_turns,
     openers_near_hour,
@@ -29,8 +26,9 @@ from data import (
     persona_lines,
     speaker_names,
 )
-from engines.her.model import build_model
-from tokenizer import BytePairEncoder, bpe_from_state
+from tokenizer import BytePairEncoder
+
+import engines.qwen.chat as qwen_chat
 
 
 def clip_msg(msg, max_tokens, tokenizer):
@@ -200,74 +198,20 @@ def _select_demos(demo_index, args, prompt, tokenizer):
     return "", 0
 
 
-def _trim_prompt(ids, max_ctx, tokenizer):
-    if len(ids) <= max_ctx:
-        return ids
-    # Keep the tail but snap forward to a line break, so the prompt never
-    # starts mid-subword.
-    ids = ids[-max_ctx:]
-    nl = set(tokenizer.encode("\n"))
-    floor = max_ctx // 2
-    starts = [i + 1 for i, tok in enumerate(ids)
-              if tok in nl and len(ids) - (i + 1) >= floor]
-    if starts:
-        ids = ids[starts[0]:]
-    return ids
-
-
-def build_prompt(args, state, tokenizer, prompt, history, demo_index):
-    # Text-to-text prompt: persona + demos + history + her hint
-    # (T5, section 2.1 https://arxiv.org/abs/2005.14165)
-    user_name, her_name = speaker_names()
+def _system_block(args, prompt, demo_index, tokenizer):
+    """Persona description + retrieved demos, the qwen system text."""
     description = _read_description(args)
-    demos, n_shots = _select_demos(demo_index, args, prompt, tokenizer)
-
-    # Headroom must cover the reply, or RoPE overflows past max_len.
-    max_ctx = state["cfg"]["max_len"] - args.max_reply - 1
-    if max_ctx < 1:
-        raise SystemExit(
-            f"--max-reply {args.max_reply} leaves no room in a context of "
-            f"{state['cfg']['max_len']}; lower it")
-    # Persona and demos are context, not the live conversation: a blank line
-    # separates them from the history, which stays contiguous with the prompt.
-    prefix = "\n\n".join(p for p in (description, demos) if p)
-    tail = "\n".join([*history, f"{user_name}: {prompt}"])
-    full = f"{prefix}\n\n{tail}" if prefix else tail
-    # No trailing space after the label: a bare space encodes as a token that
-    # never appears in training (a space always merges into the next word), so
-    # the model would start from an out-of-distribution token.
-    ids = tokenizer.encode(full + f"\n{her_name}:")
-    return _trim_prompt(ids, max_ctx, tokenizer), n_shots
+    demos, _ = _select_demos(demo_index, args, prompt, tokenizer)
+    return "\n\n".join(p for p in (description, demos) if p)
 
 
 def load_assets(args, device):
-    # Load checkpoint, model, and tokenizer; exits if no checkpoint exists
-    if args.engine == "qwen":
-        return _load_qwen(args, device)
-    ckpt = Path(args.ckpt)
-    if not ckpt.exists():
-        print(f"checkpoint not found at {ckpt}")
-        print("train the memory first with: python her.py")
-        raise SystemExit(1)
-
-    state = torch.load(ckpt, map_location=device, weights_only=False)
-    cfg = state["cfg"]
-    model = build_model(cfg).to(device).eval()
-    if state.get("ema") and not args.raw_weights:
-        model.load_state_dict(state["ema"])
-        print("weights: using the checkpoint's EMA average")
-    else:
-        model.load_state_dict(state["model"])
-    tokenizer = bpe_from_state(state["tokenizer"])
-    note = f", trained {state['step']:,} steps" if state.get("step") else ""
-    print(f"loaded checkpoint: {ckpt} (loss {state['loss']:.4f}{note})")
-    print(f"objective: {cfg['objective']} | lora: {cfg['lora']} | "
-          f"quant: {cfg.get('quant', 'none')}")
-    return state, model, tokenizer
+    # Load the HF model + her adapter; exits if the adapter is missing
+    return _load_qwen(args, device)
 
 
 def _load_qwen(args, device):
-    """Qwen engine assets: HF model + her adapter + the original BPE."""
+    """Qwen engine assets: HF model + her adapter + the retrieval BPE."""
     import engines.qwen.qwen_lm as qwen_lm
     adapter = Path(args.adapter) if args.adapter else qwen_lm.ADAPTER_DIR
     if not adapter.exists():
@@ -278,20 +222,19 @@ def _load_qwen(args, device):
     print(f"qwen engine: adapter {adapter.name}")
     tok = BytePairEncoder.load(Path(DEFAULT_BPE))
     print("few-shot retrieval on the original tokenizer (bpe.json)")
-    return {"cfg": {}, "qwen": (hf_tok, qmodel)}, qmodel, tok
+    return {"qwen": (hf_tok, qmodel)}, qmodel, tok
 
 
 def resolve_max_reply(args):
-    # One bump per engine lives here so client/server/eval share it.
-    if args.engine == "qwen" and args.max_reply == 40:
-        args.max_reply = 80   # the qwen tokenizer packs fewer chars per token
+    # qwen's tokenizer packs fewer chars per token than the retrieval BPE, so
+    # its default budget is twice the one the chat config was written with.
+    if args.max_reply == 40:
+        args.max_reply = 80
     return args
 
 
-def load_corpus(args, cfg):
+def load_corpus(args):
     # Normalize the export into canonical user/persona turns for demo retrieval.
-    # The tail held out for validation during training is dropped here too, so a
-    # demo can never quote text the model was not asked to learn from.
     user_name, _ = speaker_names()
     if not Path(args.data).exists():
         return ""
@@ -299,100 +242,19 @@ def load_corpus(args, cfg):
     user = args.user or detect_user(raw)
     aliases = {user.lower(): user_name} if user.lower() != user_name else None
     corpus_text = parse_wa(raw, aliases=aliases)
-    val_fraction = float(cfg.get("val_fraction", 0.0) or 0.0)
-    if val_fraction > 0:
-        corpus_text, held_out = _split_turns(corpus_text, val_fraction)
-        if args.shots > 0 and held_out:
-            print("demos: holding out the validation tail from retrieval")
     if args.shots > 0:
         print(f"few-shot retrieval on {args.data} (user: {user})")
     return corpus_text
 
 
-def _clean_reply(text, user_name, her_name):
-    """Drop learned speaker labels and stop at the first user turn.
-
-    With the scored turn-end sentinel, her reply is a whole multi-message turn
-    and legitimately contains "her: " continuation labels; the REPL prints its
-    own prefix, so the inner labels are stripped for display.
-    """
-    labels = (f"{her_name}:", f"{user_name}:")
-    lines = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith(f"{user_name}:"):
-            break
-        for label in labels:
-            if line.startswith(label):
-                line = line[len(label):].strip()
-                break
-        line = line.lstrip(":").strip()
-        if line:
-            lines.append(line)
-    return "\n".join(lines).strip()
-
-
-def _history_to_messages(history, user_name, her_name):
-    """History lines ("user: x" / "her: y") -> chat template messages."""
-    msgs = []
-    for line in history:
-        if line.startswith(f"{user_name}: "):
-            msgs.append({"role": "user",
-                         "content": line[len(f"{user_name}: "):]})
-        elif line.startswith(f"{her_name}: "):
-            msgs.append({"role": "assistant",
-                         "content": line[len(f"{her_name}: "):]})
-    return msgs
-
-
-def _qwen_messages(args, prompt, history, demo_index, tokenizer):
-    """Qwen engine prompt: persona + demos LIVE INSIDE the system text.
-
-    A chat template has no scene-break blank line between roles, so demos must
-    never enter the message list, or she answers to a demo instead of you. The
-    system block is the one place plain text (like the her prompt head) is
-    safe.
-    """
-    description = _read_description(args)
-    demos, _ = _select_demos(demo_index, args, prompt, tokenizer)
-    system = "\n\n".join(p for p in (description, demos) if p)
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    user_name, her_name = speaker_names()
-    messages.extend(_history_to_messages(history, user_name, her_name))
-    messages.append({"role": "user", "content": prompt})
-    return messages
-
-
-def _qwen_reply(hf_tok, hf_model, messages, args):
-    import engines.qwen.qwen_lm as qwen_lm
-    return qwen_lm.reply(
-        hf_tok, hf_model, messages,
-        max_new_tokens=args.max_reply, temperature=args.temperature,
-        top_p=args.top_p, repeat_penalty=args.repeat_penalty)
-
-
 def generate_reply(args, state, model, tokenizer, prompt, history, demo_index,
                    device):
-    if args.engine == "qwen":
-        hf_tok, hf_model = state["qwen"]
-        messages = _qwen_messages(args, prompt, history, demo_index, tokenizer)
-        text = _qwen_reply(hf_tok, hf_model, messages, args)
-        user_name, her_name = speaker_names()
-        return _clean_reply(text, user_name, her_name)
+    hf_tok, hf_model = state["qwen"]
+    system = _system_block(args, prompt, demo_index, tokenizer)
+    messages = qwen_chat.build_messages(system, prompt, history)
+    text = qwen_chat.generate(hf_tok, hf_model, messages, args)
     user_name, her_name = speaker_names()
-    ids, _ = build_prompt(args, state, tokenizer, prompt, history, demo_index)
-    gen = model.generate(
-        torch.tensor([ids], device=device),
-        max_new=args.max_reply,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        repeat_penalty=args.repeat_penalty,
-        stop_ids=tokenizer.stop_ids(),
-    )
-    return _clean_reply(tokenizer.decode(gen), user_name, her_name)
+    return qwen_chat.clean_reply(text, user_name, her_name)
 
 
 def load_openers(args):
@@ -415,47 +277,19 @@ def _opener_demos(candidates, args, tokenizer):
 
 def generate_proactive(args, state, model, tokenizer, openers, device):
     """One unprompted message, biased toward how she opens chats at this hour."""
+    hf_tok, hf_model = state["qwen"]
     _, her_name = speaker_names()
     off_hour = args.proactive_hour if args.proactive_hour is not None \
         else time.localtime().tm_hour
     candidates = openers_near_hour(openers, off_hour, args.proactive_window)
-    if args.engine == "qwen":
-        hf_tok, hf_model = state["qwen"]
-        # opener demos live inside the system text, same rule as the REPL
-        demos = _opener_demos(candidates, args, tokenizer)
-        head = _read_description(args)
-        lines = ([head] if head else []) + [f"{her_name}: {d}" for d in demos]
-        messages = []
-        if lines:
-            messages.append({"role": "system",
-                             "content": "\n\n".join(lines)})
-        # the empty user turn is a synthetic "she speaks first" cue; a reply
-        # that comes back empty falls back to a real opener like the her path
-        messages.append({"role": "user", "content": ""})
-        text = _qwen_reply(hf_tok, hf_model, messages, args)
-        user_name, her_name = speaker_names()
-        reply = _clean_reply(text, user_name, her_name)
-        if reply:
-            return reply
-        return candidates[0]["text"] if candidates else ""
+    # opener demos live inside the system text, same rule as the REPL
     demos = _opener_demos(candidates, args, tokenizer)
     head = _read_description(args)
     lines = ([head] if head else []) + [f"{her_name}: {d}" for d in demos]
-    max_ctx = max(1, state["cfg"]["max_len"] - args.max_reply - 1)
-    ids = _trim_prompt(tokenizer.encode("\n".join(lines) + f"\n{her_name}:"),
-                       max_ctx, tokenizer)
-    gen = model.generate(
-        torch.tensor([ids], device=device),
-        max_new=args.max_reply,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        repeat_penalty=args.repeat_penalty,
-        stop_ids=tokenizer.stop_ids(),
-    )
+    # the empty user turn is a synthetic "she speaks first" cue; a reply that
+    # comes back empty falls back to a real opener
+    messages = qwen_chat.build_messages("\n\n".join(lines), "", [])
+    text = qwen_chat.generate(hf_tok, hf_model, messages, args)
     user_name, her_name = speaker_names()
-    reply = _clean_reply(tokenizer.decode(gen), user_name, her_name)
-    if reply:
-        return reply
-    # Sampling can return nothing (immediate stop); a real opener is faithful.
-    return candidates[0]["text"] if candidates else ""
+    reply = qwen_chat.clean_reply(text, user_name, her_name)
+    return reply or (candidates[0]["text"] if candidates else "")

@@ -1,7 +1,6 @@
 """Qwen3 QLoRA: load, train, and serve "her" voice on top of Qwen3-1.7B.
 
-The from-scratch stack (model.py/training.py) stays untouched and keeps
-running via her.py. Design rationale: git history (docs/REPORT.md, removed).
+Design rationale: git history (docs/REPORT.md, removed).
 """
 import argparse
 import json
@@ -16,7 +15,7 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Windows console: same utf-8 handling as her.py/client-repl.py
+# Windows console: same utf-8 handling as client/repl.py
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 

@@ -1,6 +1,6 @@
 """24/7 HTTP daemon around the chatbot engine.
 
-Run: uv run python server\\service.py --engine qwen (or --engine her)
+Run: uv run python server\\service.py
 Endpoints (poll transport only):
 - POST /message  {"text": "..."}  -> {"reply": "..."}
 - GET  /poll?since=N             -> {"messages": [{id, text, ts}], "since": N}
@@ -241,10 +241,9 @@ def main(argv=None):
 
     device = cli._setup_device(args.cpu)
     state, model, tokenizer = engine.load_assets(args, device)
-    cfg = state["cfg"]
-    cli._configure_from_checkpoint(args, cfg)
+    cli._configure_speakers(args)
 
-    corpus_text = engine.load_corpus(args, cfg)
+    corpus_text = engine.load_corpus(args)
     demo_index = engine.build_demo_index(corpus_text, tokenizer) \
         if corpus_text else None
     openers = engine.load_openers(args)

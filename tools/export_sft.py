@@ -1,9 +1,3 @@
-"""Export a WhatsApp chat to the JSONL that LLaMA-Factory / Unsloth / TRL read.
-
-Reuses her.py's parsing rules: continuation lines kept, unanswered messages
-dropped (an SFT row needs both halves). Flags: see --help.
-"""
-
 import argparse
 import json
 import re
@@ -260,7 +254,7 @@ def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
     print(f"wrote {len(rows)} conversations to {out}  ({fmt} format)")
     print(f"  persona Q&A rows    {qa_convs}")
     print(f"  turns parsed        {len(turns):,}")
-    print(f"  continuation kept   {stats['continuation']} lines (her.py drops these)")
+    print(f"  continuation kept   {stats['continuation']} lines (not flattened away)")
     print(f"  system notice       {stats['system_notice']}")
     print(f"  media/deleted       {stats['media_or_deleted']:,}")
     print(f"  unknown speaker     {stats['unknown_speaker']}")
@@ -290,7 +284,8 @@ def _report(args, rows, out, fmt, stats, turns, orphans, too_long,
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(
+        description="export a WhatsApp chat to SFT JSONL")
     ap.add_argument("--data", type=Path, default=DEFAULT_DATA)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument(
