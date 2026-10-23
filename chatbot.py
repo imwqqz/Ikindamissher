@@ -15,6 +15,7 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
 import torch
 
 from config import (
+    DEFAULT_BPE,
     DEFAULT_CKPT,
     DEFAULT_DATA,
     DEFAULT_DESC,
@@ -33,7 +34,7 @@ from data import (
     speaker_names,
 )
 from model import build_model
-from tokenizer import bpe_from_state
+from tokenizer import BytePairEncoder, bpe_from_state
 
 CHAT_CONFIG = PROJECT_ROOT / "configs" / "chatbot.config.json"
 
@@ -249,6 +250,8 @@ def build_prompt(args, state, tokenizer, prompt, history, demo_index):
 
 def load_assets(args, device):
     # Load checkpoint, model, and tokenizer; exits if no checkpoint exists
+    if args.engine == "qwen":
+        return _load_qwen(args, device)
     ckpt = Path(args.ckpt)
     if not ckpt.exists():
         print(f"checkpoint not found at {ckpt}")
@@ -269,6 +272,23 @@ def load_assets(args, device):
     print(f"objective: {cfg['objective']} | lora: {cfg['lora']} | "
           f"quant: {cfg.get('quant', 'none')}")
     return state, model, tokenizer
+
+
+def _load_qwen(args, device):
+    """Qwen engine assets: HF model (+ her adapter) + the legacy BPE for
+    retrieval/clip. No .pt checkpoint is needed; speakers come from the
+    chatbot config, not from a checkpoint."""
+    import qwen_lm
+    adapter = Path(args.adapter) if args.adapter else qwen_lm.ADAPTER_DIR
+    hf_tok, qmodel = qwen_lm.load_engine(
+        adapter=adapter if adapter.exists() else None, device=device)
+    if not adapter.exists():
+        print(f"[Warning] adapter not found at {adapter}; base model only")
+    else:
+        print(f"qwen engine: adapter {adapter.name}")
+    legacy_tok = BytePairEncoder.load(Path(DEFAULT_BPE))
+    print("few-shot retrieval on the legacy tokenizer (bpe.json)")
+    return {"cfg": {}, "qwen": (hf_tok, qmodel)}, qmodel, legacy_tok
 
 
 def load_corpus(args, cfg):
@@ -315,7 +335,55 @@ def _clean_reply(text, user_name, her_name):
     return "\n".join(lines).strip()
 
 
-def generate_reply(args, state, model, tokenizer, prompt, history, demo_index, device):
+def _history_to_messages(history, user_name, her_name):
+    """REPL history lines ("user: x" / "her: y") -> chat template messages."""
+    msgs = []
+    for line in history:
+        if line.startswith(f"{user_name}: "):
+            msgs.append({"role": "user",
+                         "content": line[len(f"{user_name}: "):]})
+        elif line.startswith(f"{her_name}: "):
+            msgs.append({"role": "assistant",
+                         "content": line[len(f"{her_name}: "):]})
+    return msgs
+
+
+def _qwen_messages(args, prompt, history, demo_index, tokenizer):
+    """Qwen engine prompt: persona + demos LIVE INSIDE the system text.
+
+    A chat template has no scene-break blank line between roles, so demos must
+    never enter the message list, or she answers to a demo instead of you. The
+    system block is the one place plain text (like the legacy prompt head) is
+    safe.
+    """
+    description = _read_description(args)
+    demos, _ = _select_demos(demo_index, args, prompt, tokenizer)
+    system = "\n\n".join(p for p in (description, demos) if p)
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    user_name, her_name = speaker_names()
+    messages.extend(_history_to_messages(history, user_name, her_name))
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def _qwen_reply(hf_tok, hf_model, messages, args):
+    import qwen_lm
+    return qwen_lm.reply(
+        hf_tok, hf_model, messages,
+        max_new_tokens=args.max_reply, temperature=args.temperature,
+        top_p=args.top_p, repeat_penalty=args.repeat_penalty)
+
+
+def generate_reply(args, state, model, tokenizer, prompt, history, demo_index,
+                   device):
+    if args.engine == "qwen":
+        hf_tok, hf_model = state["qwen"]
+        messages = _qwen_messages(args, prompt, history, demo_index, tokenizer)
+        text = _qwen_reply(hf_tok, hf_model, messages, args)
+        user_name, her_name = speaker_names()
+        return _clean_reply(text, user_name, her_name)
     user_name, her_name = speaker_names()
     ids, _ = build_prompt(args, state, tokenizer, prompt, history, demo_index)
     gen = model.generate(
@@ -354,6 +422,25 @@ def generate_proactive(args, state, model, tokenizer, openers, device):
     off_hour = args.proactive_hour if args.proactive_hour is not None \
         else time.localtime().tm_hour
     candidates = openers_near_hour(openers, off_hour, args.proactive_window)
+    if args.engine == "qwen":
+        hf_tok, hf_model = state["qwen"]
+        # opener demos live inside the system text, same rule as the REPL
+        demos = _opener_demos(candidates, args, tokenizer)
+        head = _read_description(args)
+        lines = ([head] if head else []) + [f"{her_name}: {d}" for d in demos]
+        messages = []
+        if lines:
+            messages.append({"role": "system",
+                             "content": "\n\n".join(lines)})
+        # the empty user turn is a synthetic "she speaks first" cue; a reply
+        # that comes back empty falls back to a real opener like the legacy path
+        messages.append({"role": "user", "content": ""})
+        text = _qwen_reply(hf_tok, hf_model, messages, args)
+        user_name, her_name = speaker_names()
+        reply = _clean_reply(text, user_name, her_name)
+        if reply:
+            return reply
+        return candidates[0]["text"] if candidates else ""
     demos = _opener_demos(candidates, args, tokenizer)
     head = _read_description(args)
     lines = ([head] if head else []) + [f"{her_name}: {d}" for d in demos]
@@ -390,6 +477,12 @@ def build_parser():
     ap.add_argument("--her-speaker", default=None,
                     help="canonical name for the persona; must match training, "
                          "and is kept out of the source on purpose")
+    ap.add_argument("--engine", choices=["legacy", "qwen"], default="legacy",
+                    help="legacy: the from-scratch her model; qwen: Qwen3 + "
+                         "the her QLoRA adapter")
+    ap.add_argument("--adapter", default=None,
+                    help="adapter dir for --engine qwen (default: "
+                         "data/her_qwen_adapter)")
     ap.add_argument("--shots", type=int, default=2,
                     help="real user/persona exchanges matched to your prompt")
     ap.add_argument("--demo-len", type=int, default=20,
@@ -492,6 +585,9 @@ def main(argv=None):
     _init_stdout()
 
     args = resolve_config_args(build_parser(), argv, CHAT_CONFIG)
+
+    if args.engine == "qwen" and args.max_reply == 40:
+        args.max_reply = 80   # the qwen tokenizer packs fewer chars per token
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
