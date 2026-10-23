@@ -5,8 +5,8 @@ checks are safe to run on any machine. Exit code is 0 only when every check
 passes, so this doubles as a pre-merge gate.
 
 Usage:
-    uv run python checks.py
-    uv run python checks.py --only canonical
+    uv run python tools/checks.py
+    uv run python tools/checks.py --only canonical
 """
 
 import argparse
