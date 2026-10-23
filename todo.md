@@ -12,5 +12,6 @@
 
 - [ ] S2 retrain: `uv run python src\engines\qwen\qwen_lm.py --epochs 6` →
   `uv run python tools\checks.py` (exit 0) + a REPL eyeball.
-- [ ] Live-chat memory: append every turn to a corpus file, feed it to demo
-  retrieval, and retrain the adapter on demand (`tools/train_from_chats.py`).
+- [ ] Console UX: optional `/new`, `/save`, streaming output (its own branch).
+- [ ] Voice: human-like TTS (XTTS local vs ElevenLabs) + STT.
+- [ ] Avatar: three.js + VRM page served by the daemon.

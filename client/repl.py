@@ -19,6 +19,7 @@ from config import (
     resolve_config_args,
 )
 from data import configure_speakers, speaker_names
+from chatlog import append_turn
 from engines.dispatch import (
     build_demo_index,
     clip_msg,
@@ -129,6 +130,7 @@ def _chat_loop(args, state, model, tokenizer, history, demo_index, device,
             history.append(f"{user_name}: {clip_msg(prompt, 15, tokenizer)}")
             history.append(f"{her_name}: {clip_msg(reply, 15, tokenizer)}")
             history = history[-16:]
+            append_turn(prompt, reply)
 
 
 def main(argv=None):
@@ -155,6 +157,7 @@ def main(argv=None):
         if opener:
             print(f"{BOT_LABEL}: {opener}")
             history.append(f"{her_name}: {clip_msg(opener, 15, tokenizer)}")
+            append_turn(None, opener)
         if args.proactive_only:
             return
     _chat_loop(args, state, model, tokenizer, history, demo_index, device,

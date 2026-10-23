@@ -29,6 +29,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import engines.dispatch as engine
 import client.repl as cli
+from chatlog import append_turn
 from config import resolve_config_args
 from data import speaker_names
 
@@ -118,6 +119,8 @@ def handle_message(text, S):
                                f"{engine.clip_msg(reply, 15, S['tokenizer'])}")
             history = history[-16:]
             save_session({"history": history, "updated": time.time()})
+    if reply:
+        append_turn(text, reply)
     return reply
 
 
@@ -153,6 +156,7 @@ def _tick(S):
                            f"{engine.clip_msg(text, 15, S['tokenizer'])}")
             save_session({"history": history[-16:], "updated": now})
         S["last_proactive"] = now
+        append_turn(None, text)
         print(f"[scheduler] queued proactive: {text!r}")
     else:
         print("[scheduler] proactive generation empty; cooling down")

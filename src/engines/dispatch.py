@@ -28,6 +28,7 @@ from data import (
 )
 from tokenizer import BytePairEncoder
 
+from chatlog import LOG_PATH
 import engines.qwen.chat as qwen_chat
 
 
@@ -234,16 +235,25 @@ def resolve_max_reply(args):
 
 
 def load_corpus(args):
-    # Normalize the export into canonical user/persona turns for demo retrieval.
+    # Normalize the export + live chat log into canonical turns for retrieval.
     user_name, _ = speaker_names()
-    if not Path(args.data).exists():
-        return ""
-    raw = Path(args.data).read_text(encoding="utf-8")
-    user = args.user or detect_user(raw)
-    aliases = {user.lower(): user_name} if user.lower() != user_name else None
-    corpus_text = parse_wa(raw, aliases=aliases)
-    if args.shots > 0:
-        print(f"few-shot retrieval on {args.data} (user: {user})")
+    corpus_text = ""
+    export = Path(args.data)
+    if export.exists():
+        raw = export.read_text(encoding="utf-8")
+        user = args.user or detect_user(raw)
+        aliases = {user.lower(): user_name} if user.lower() != user_name else None
+        corpus_text = parse_wa(raw, aliases=aliases)
+        if args.shots > 0:
+            print(f"few-shot retrieval on {export} (user: {user})")
+    live = Path(LOG_PATH)
+    if live.exists() and live.stat().st_size:
+        live_text = live.read_text(encoding="utf-8").strip("\n")
+        if live_text:
+            head = corpus_text.rstrip("\n") + "\n\n" if corpus_text else ""
+            corpus_text = head + live_text + "\n"
+            if args.shots > 0:
+                print(f"live memory: {live}")
     return corpus_text
 
 

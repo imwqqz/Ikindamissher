@@ -38,6 +38,7 @@ uv sync                       # one-time setup (see Installation below)
 uv run python tools/train_tokenizer.py     # build data/input/bpe.json (once)
 uv run python tools/export_sft.py --out data/sft.json --persona
 uv run python src/engines/qwen/qwen_lm.py  # fine-tune Qwen3 + the her adapter
+uv run python tools/train_from_chats.py    # fold live chats in (manual, later)
 
 uv run python client/repl.py   # chat REPL
 uv run python tools/checks.py  # self-checks on synthetic data; exit 0 required
@@ -61,6 +62,14 @@ conversation, completion-only labels applied in `qwen_lm.encode_row`). Long
 messages are dropped by `--max-chars`: a pasted essay is not conversation and
 teaches the model to write essays.
 
+**Live memory.** Every console/daemon exchange is appended to
+`data/live_chats.txt` in the same corpus format (a silent hour starts a new
+conversation). `load_corpus` reads that file too, so retrieval remembers past
+chats with no training. To teach the weights, run
+`uv run python tools/train_from_chats.py --epochs 1`: it backs up the adapter,
+writes `data/sft_combined.json` (export rows + live rows, deduplicated), runs a
+short QLoRA train, and prints the restart reminder.
+
 ## Project structure
 
 ```
@@ -68,6 +77,7 @@ Ikindamissher/
 ├── src/                       # library modules (imported from the source tree)
 │   ├── tokenizer.py           # byte-level BPE for demo retrieval
 │   ├── data.py                # WhatsApp export -> user/persona turns, persona
+│   ├── chatlog.py             # live turns -> data/live_chats.txt (corpus format)
 │   ├── config.py              # JSON config files + argparse plumbing
 │   └── engines/
 │       ├── dispatch.py        # engine door: assets, prompts, replies
@@ -76,7 +86,8 @@ Ikindamissher/
 │           └── chat.py        # chat rows, message building, reply cleanup
 ├── client/repl.py             # chat REPL + few-shot retrieval
 ├── server/service.py          # 24/7 HTTP daemon (poll transport, proactive)
-├── tools/                     # checks.py, train_tokenizer.py, export_sft.py
+├── tools/                     # checks.py, train_tokenizer.py, export_sft.py,
+│                              #   train_from_chats.py
 ├── configs/                   # chatbot.config.example.json + gitignored locals
 ├── data/                      # gitignored: export, persona, BPE, adapter, sft
 ├── .python-version            # 3.14.5
@@ -91,5 +102,4 @@ system text; `engines/qwen/chat.py` builds the message list and
 `export_sft.py` writes `data/sft.json`, and `qwen_lm.train` fits the adapter
 with completion-only labels.
 
-<!-- TODO: choose a license -->
 Contributions, acknowledgments, this project is under [LICENCE](https://github.com/imwqqz/Ikindamissher/blob/master/LICENSE)

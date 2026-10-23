@@ -11,7 +11,8 @@ for _p in (str(_ROOT / "src"), str(_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from config import DEFAULT_DATA, DEFAULT_DESC, DEFAULT_QA, PROJECT_ROOT
+from config import (CHAT_CONFIG, DEFAULT_DATA, DEFAULT_DESC, DEFAULT_QA,
+                    PROJECT_ROOT, load_config)
 from data import (WA_LINE, WA_NOISE, configure_speakers, detect_user,
                   persona_lines, persona_qa_turns, speaker_names)
 
@@ -125,14 +126,10 @@ def percentile(values, quantile):
 
 
 def _load_config(args):
-    # Canonical labels come from the gitignored her.config.json.
-    cfg = {}
-    for candidate in (PROJECT_ROOT / "configs" / "her.config.json",
-                      PROJECT_ROOT / "her.config.json"):
-        if candidate.exists():
-            cfg = json.loads(candidate.read_text(encoding="utf-8"))
-            break
-    return cfg
+    # Canonical labels come from the gitignored chatbot config.
+    if not CHAT_CONFIG.exists():
+        return {}
+    return load_config(CHAT_CONFIG)
 
 
 def _resolve_speakers(args, cfg):

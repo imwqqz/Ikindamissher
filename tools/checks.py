@@ -1,6 +1,7 @@
 import argparse
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -239,6 +240,26 @@ def check_queue_roundtrip():
         return not failed, "queue ok" if not failed else f"failed: {failed}"
 
 
+def check_chatlog():
+    """Appends stay corpus-parseable: one line per turn, multi-line flattened,
+    and a quiet gap opens a new conversation with a blank line."""
+    import chatlog
+    data.configure_speakers(SPEAKER_USER, SPEAKER_HER)
+    gap = data.CONVERSATION_GAP_MINUTES * 60
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "live.txt"
+        chatlog.append_turn("hola", "hey", path=path)
+        chatlog.append_turn(None, "solo", path=path)
+        chatlog.append_turn("otra\nmulti", "vale\nbien", path=path,
+                            now=time.time() + 2 * gap)
+        text = path.read_text(encoding="utf-8")
+    expected = (f"{SPEAKER_USER}: hola\n{SPEAKER_HER}: hey\n"
+                f"{SPEAKER_HER}: solo\n"
+                f"\n{SPEAKER_USER}: otra multi\n{SPEAKER_HER}: vale bien\n")
+    return text == expected, ("log ok" if text == expected
+                              else f"unexpected log: {text!r}")
+
+
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
@@ -252,6 +273,7 @@ CHECKS = [
     ("session-roundtrip", check_session_roundtrip),
     ("session-corrupt", check_session_corrupt),
     ("queue-roundtrip", check_queue_roundtrip),
+    ("chatlog", check_chatlog),
 ]
 
 
