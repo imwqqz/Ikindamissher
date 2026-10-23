@@ -13,8 +13,9 @@
 - [ ] S2 retrain: `uv run python src\engines\qwen\qwen_lm.py --epochs 6` →
   `uv run python tools\checks.py` (exit 0) + a REPL eyeball.
 - [ ] Console UX: optional `/new`, `/save`, streaming output (its own branch).
-- [ ] Voice: human-like TTS (XTTS local vs ElevenLabs) + STT.
-- [ ] Avatar: three.js + VRM page served by the daemon.
+- [ ] Avatar: three.js + VRM page served by the daemon, audio from /speak.
+- [ ] Optional: cloned voice (coqui XTTS sidecar) if her real timbre matters
+  more than a single-environment setup; Piper is realistic but not her.
 - [ ] WhatsApp bridge (own branch): unofficial automation risks a ban; the
   official path is the WhatsApp Business API. The daemon's HTTP API is the
   integration point, so no daemon surgery should be needed.

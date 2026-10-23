@@ -283,6 +283,49 @@ def check_daemon_guard():
     return ok, f"busy={busy} free_after_close={not free}"
 
 
+def check_voice_contract():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import client.voice as voice_client
+
+    class Stub(BaseHTTPRequestHandler):
+        def _send(self, body, kind="application/json"):
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(json.dumps({"ok": True}).encode())
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if self.path.startswith("/speak"):
+                self._send(b"RIFFtest", "audio/wav")
+            else:
+                self._send(json.dumps({"text": "hola"}).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        checks = {
+            "health": voice_client.health(base).get("ok") is True,
+            "listen": voice_client.listen(base) == "hola",
+            "speak": voice_client.fetch_speech(base, "hola") == b"RIFFtest",
+        }
+    finally:
+        server.shutdown()
+    failed = [name for name, ok in checks.items() if not ok]
+    return not failed, "voice ok" if not failed else f"failed: {failed}"
+
+
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
@@ -299,6 +342,7 @@ CHECKS = [
     ("chatlog", check_chatlog),
     ("turnlog", check_turnlog),
     ("daemon-guard", check_daemon_guard),
+    ("voice", check_voice_contract),
 ]
 
 

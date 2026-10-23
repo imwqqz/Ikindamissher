@@ -1,8 +1,25 @@
-# Ikindamissher
+A QLoRA fine-tune of Qwen3-1.7B on a WhatsApp export: she chats in a REPL,
+through a 24/7 daemon, or out loud with a local voice, retrieving similar
+conversations from the corpus as few-shot context, learning from every live
+chat, and auditing every reply.
 
-A QLoRA fine-tune of Qwen3-1.7B on a WhatsApp export: she chats in a REPL or
-through a 24/7 daemon, retrieving similar conversations from the corpus as
-few-shot context, learning from every live chat, and auditing every reply.
+## References
+
+* Byte-pair encoding                                 https://arxiv.org/abs/1508.07909
+    the retrieval tokenizer's merge loop (tokenizer.py)
+* Language Models are Unsupervised Multitask Learners
+  (GPT-2)                                            https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+    the byte-level BPE pretokenizer regex (tokenizer.py's BPE_PAT)
+* LoRA: Low-Rank Adaptation of Large Language Models https://arxiv.org/abs/2106.09685
+    low-rank update W = W0 + (alpha/r) * BA (4.1), applied by peft
+    (qwen_lm.py's LoraConfig)
+* QLoRA: Efficient Finetuning of Quantized LLMs     https://arxiv.org/abs/2305.18290
+    4-bit NormalFloat (NF4) block-wise quantization (3.1), double quantization
+    of the constants (3.2), frozen base + trainable adapters (3.4 / Algorithm 1)
+* TRL SFTTrainer (train_on_prompt=false)             https://huggingface.co/docs/trl/sft_trainer
+    completion-only loss: score the assistant's turns, not the prompt
+    (encode_row's label mask in qwen_lm.py)
+
 
 ## Demo
 
@@ -37,6 +54,26 @@ uv run python tools/checks.py  # self-checks on synthetic data; exit 0 required
 uv run python server\service.py
 uv run python client\chat.py
 uv run python tools\read_log.py --tail 10 --full
+
+# or talk with your voice (Piper TTS on CPU + Whisper STT):
+uv run python -m piper.download_voices es_AR-daniela-high --download-dir data/voice/piper
+uv run python voice\server.py      # local voice service on :8779
+uv run python client\voice.py
+```
+
+## Voice
+
+`voice/server.py` is a local service on `:8779`. `POST /speak` renders text to
+wav with a Piper ONNX voice (CPU, no VRAM, ~0.3s per sentence); `POST /listen`
+records until silence and transcribes with Whisper. `client/voice.py` wires it
+to the daemon: you talk, she answers out loud. Piper voices are prebuilt —
+realistic, but not a clone of her.
+
+Download a Spanish voice once (the service picks the first `.onnx` in
+`data/voice/piper/`):
+
+```ps1
+uv run python -m piper.download_voices es_AR-daniela-high --download-dir data/voice/piper
 ```
 
 ## Project structure
@@ -45,7 +82,12 @@ uv run python tools\read_log.py --tail 10 --full
 ikindamissher/
 ├── client/
 │   ├── chat.py             # REPL over the daemon's HTTP API (no model loaded)
-│   └── repl.py             # chat REPL that loads the model
+│   ├── repl.py             # chat REPL that loads the model
+│   └── voice.py            # voice chat: talk -> daemon -> speaks
+├── voice/                  # local voice service
+│   ├── engine.py           #   Piper ONNX voice (CPU)
+│   ├── server.py           #   :8779 /health, /speak, /listen
+│   └── spike.py            #   pre-flight: load + one sentence
 ├── server/
 │   └── service.py          # 24/7 HTTP daemon: persistent session, proactive
 │                           #   queue in SQLite, quiet-hours scheduler
@@ -64,8 +106,9 @@ ikindamissher/
 │                           #   train_from_chats.py, read_log.py
 ├── configs/                # chatbot.config.example.json + gitignored locals
 ├── data/                   # gitignored: export, persona, BPE, adapter, sft
-│   └── live/               #   live_chats.txt, chat_session.json,
-│                           #   proactive.sqlite3, telemetry.sqlite3
+│   ├── live/               #   live_chats.txt, chat_session.json,
+│   │                       #   proactive.sqlite3, telemetry.sqlite3
+│   └── voice/piper/        #   Piper .onnx voices
 ├── .python-version
 ├── pyproject.toml
 └── uv.lock
@@ -77,23 +120,6 @@ system text; `engines/qwen/chat.py` builds the message list and
 `qwen_lm.reply` samples a reply. Training runs the other way:
 `export_sft.py` writes `data/sft.json`, and `qwen_lm.train` fits the adapter
 with completion-only labels.
-
-## References
-
-* Byte-pair encoding                                 https://arxiv.org/abs/1508.07909
-    the retrieval tokenizer's merge loop (tokenizer.py)
-* Language Models are Unsupervised Multitask Learners
-  (GPT-2)                                            https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
-    the byte-level BPE pretokenizer regex (tokenizer.py's BPE_PAT)
-* LoRA: Low-Rank Adaptation of Large Language Models https://arxiv.org/abs/2106.09685
-    low-rank update W = W0 + (alpha/r) * BA (4.1), applied by peft
-    (qwen_lm.py's LoraConfig)
-* QLoRA: Efficient Finetuning of Quantized LLMs     https://arxiv.org/abs/2305.18290
-    4-bit NormalFloat (NF4) block-wise quantization (3.1), double quantization
-    of the constants (3.2), frozen base + trainable adapters (3.4 / Algorithm 1)
-* TRL SFTTrainer (train_on_prompt=false)             https://huggingface.co/docs/trl/sft_trainer
-    completion-only loss: score the assistant's turns, not the prompt
-    (encode_row's label mask in qwen_lm.py)
 
 ## License
 
