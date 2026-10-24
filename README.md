@@ -40,7 +40,7 @@ her: y eso te hace mal
 ```ps1
 # working directory: D:\dev\Git\Ikindamissher
 
-uv sync                       # one-time setup (see Installation below)
+uv sync                       # one-time setup
 
 uv run python tools/train_tokenizer.py     # build data/input/bpe.json (once)
 uv run python tools/export_sft.py --out data/sft.json --persona
