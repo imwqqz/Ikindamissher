@@ -52,10 +52,11 @@ uv run python tools/checks.py  # self-checks on synthetic data; exit 0 required
 
 # or chat through the 24/7 daemon (the client loads no model):
 uv run python server\service.py
+uv run python server\service.py --fresh   # archive data/live, forget the chat
 uv run python client\chat.py
 uv run python tools\read_log.py --tail 10 --full
 
-# or talk with your voice (Piper TTS on CPU + Whisper STT):
+# or talk with your voice (edge TTS, Piper fallback + Whisper STT):
 uv run python -m piper.download_voices es_AR-daniela-high --download-dir data/voice/piper
 uv run python voice\server.py      # local voice service on :8779
 uv run python client\voice.py
@@ -64,13 +65,23 @@ uv run python client\voice.py
 ## Voice
 
 `voice/server.py` is a local service on `:8779`. `POST /speak` renders text to
-wav with a Piper ONNX voice (CPU, no VRAM, ~0.3s per sentence); `POST /listen`
-records until silence and transcribes with Whisper. `client/voice.py` wires it
-to the daemon: you talk, she answers out loud. Piper voices are prebuilt —
-realistic, but not a clone of her.
+wav, one sentence at a time, with an edge neural voice (default
+`es-UY-ValentinaNeural`; edge sends the text to Microsoft, so it is not
+private) and falls back to the Piper ONNX voice when the network is down.
+`POST /listen` records until silence or `POST /listen/stop` and transcribes
+with Whisper; `GET /health` reports `state`, `rms` and `since` while it
+records. `client/voice.py` wires it to the daemon: Enter to talk, Enter again
+to stop, and she answers out loud.
 
-Download a Spanish voice once (the service picks the first `.onnx` in
-`data/voice/piper/`):
+A/B the Spanish voices, then pass your pick to the service:
+
+```ps1
+uv run python tools/voice_ab.py          # data/voice/ab/*.wav
+uv run python voice\server.py --tts-voice es-AR-ElenaNeural --tts-rate -4% --tts-pitch -15Hz
+```
+
+Piper stays as the offline fallback; download a Spanish voice once (the
+service picks the first `.onnx` in `data/voice/piper/`):
 
 ```ps1
 uv run python -m piper.download_voices es_AR-daniela-high --download-dir data/voice/piper
@@ -85,7 +96,7 @@ ikindamissher/
 │   ├── repl.py             # chat REPL that loads the model
 │   └── voice.py            # voice chat: talk -> daemon -> speaks
 ├── voice/                  # local voice service
-│   ├── engine.py           #   Piper ONNX voice (CPU)
+│   ├── engine.py           #   edge TTS + Piper fallback (text -> wav)
 │   ├── server.py           #   :8779 /health, /speak, /listen
 │   └── spike.py            #   pre-flight: load + one sentence
 ├── server/
