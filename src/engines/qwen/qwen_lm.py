@@ -147,17 +147,6 @@ def strip_think(text, tokenizer=None):
     return extract_think(text, tokenizer)[0]
 
 
-def strip_think(text, tokenizer=None):
-    open_m, close_m = think_markers(tokenizer)
-    if open_m in text:
-        head, _, tail = text.partition(open_m)
-        if close_m in tail:
-            _, _, rest = tail.partition(close_m)
-            return (head + rest).strip()
-        return head.strip().rstrip(" ...") if head.strip() else ""
-    return text.strip()
-
-
 def build_bnb():
     return BitsAndBytesConfig(
         load_in_4bit=True,
