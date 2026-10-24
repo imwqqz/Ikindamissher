@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import sys
@@ -30,6 +31,56 @@ move_legacy(PROJECT_ROOT / "data" / "chat_session.json", SESSION_PATH)
 move_legacy(PROJECT_ROOT / "data" / "proactive.sqlite3", QUEUE_PATH)
 
 _MAX_POLL = 50
+
+# everything --fresh moves aside; the adapter, model cache and data/input stay
+FRESH_FILES = ("chat_session.json", "live_chats.txt", "proactive.sqlite3",
+               "telemetry.sqlite3")
+
+
+def _archive_live(names=FRESH_FILES, live_dir=None, dest_root=None):
+    # live_dir resolved at call time: a default of LIVE_DIR would freeze the
+    # real path and make this unsafe to call from a test
+    live_dir = Path(live_dir or LIVE_DIR)
+    present = [live_dir / n for n in names if (live_dir / n).exists()]
+    if not present:
+        return None
+    dest = Path(dest_root or live_dir / "archive") / time.strftime(
+        "%Y%m%d-%H%M%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    for path in present:
+        shutil.move(str(path), str(dest / path.name))
+    return dest
+
+
+def _fresh_start():
+    present = [LIVE_DIR / n for n in FRESH_FILES if (LIVE_DIR / n).exists()]
+    if not present:
+        print("fresh start: nothing to archive")
+        return True
+    print("--fresh will archive the live state:")
+    for path in present:
+        print(f"  {path.relative_to(PROJECT_ROOT)}  "
+              f"({path.stat().st_size} bytes)")
+    if not sys.stdin.isatty():
+        # never wipe a daemon's memory unattended
+        print("refusing --fresh without a terminal; run the daemon "
+              "interactively")
+        return False
+    try:
+        answer = input("type 'fresh' to confirm: ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer != "fresh":
+        print("aborted, nothing changed")
+        return False
+    try:
+        dest = _archive_live(FRESH_FILES, LIVE_DIR)
+    except OSError as exc:
+        print(f"aborted: could not archive ({exc}); "
+              "is another daemon running?")
+        return False
+    print(f"fresh start: archived to {dest}")
+    return True
 
 
 def load_session(path=SESSION_PATH):
@@ -259,6 +310,9 @@ def build_parser():
     ap.add_argument("--quiet-end", type=int, default=9, metavar="H",
                     help="no proactive messages until this hour (exclusive)")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--fresh", action="store_true",
+                    help="archive data/live (session, chats, queue, telemetry) "
+                         "and start with an empty memory; asks first")
     return ap
 
 
@@ -282,6 +336,9 @@ def main(argv=None):
               f"http://{args.host}:{args.port}")
         print("stop that server first (Ctrl+C in its terminal), or pass "
               "--port <other>")
+        return 1
+
+    if args.fresh and not _fresh_start():
         return 1
 
     device = cli._setup_device(args.cpu)
