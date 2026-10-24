@@ -197,9 +197,12 @@ def _choose(candidates, reference, tokenizer, weights):
         scored = [(text, 0.0) for text in candidates]
     if not any(text for text, _ in scored):
         return "", "all candidates empty", scored
-    chosen, score = max(scored, key=lambda item: (bool(item[0]), item[1]))
+    # all-zero scores are common (no demo overlap): take the shortest line,
+    # not the first one, so she does not monologue out loud
+    chosen, score = max(
+        scored, key=lambda item: (bool(item[0]), item[1], -len(item[0])))
     why = (f"overlap {score:.3f} vs her retrieved turns" if reference
-           else "first non-empty sample (no reference turns)")
+           else "shortest of the tied samples (no reference turns)")
     return chosen, why, scored
 
 
