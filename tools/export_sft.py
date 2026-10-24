@@ -161,6 +161,8 @@ def _qa_rows(qa_path, user, her_name):
     lines = persona_qa_turns(Path(qa_path).read_text(encoding="utf-8"),
                              alias=her_name)
     rows, current = [], []
+    dropped_questions = 0
+    stray_answers = 0
     for line in lines:
         name, _, msg = line.partition(": ")
         role = "user" if name.lower() == user else "assistant"
@@ -168,11 +170,21 @@ def _qa_rows(qa_path, user, her_name):
             if len(current) >= 2:
                 rows.append([{"role": r, "content": c}
                              for r, c in current])
+            elif len(current) == 1:
+                dropped_questions += 1
             current = [("user", msg)]
         else:
-            current.append(("assistant", msg))
+            if not current:
+                stray_answers += 1
+            else:
+                current.append(("assistant", msg))
     if len(current) >= 2:
         rows.append([{"role": r, "content": c} for r, c in current])
+    elif len(current) == 1:
+        dropped_questions += 1
+    if dropped_questions or stray_answers:
+        print(f"[qa] dropped {dropped_questions} unpaired question(s), "
+              f"{stray_answers} stray answer(s)")
     return rows
 
 
