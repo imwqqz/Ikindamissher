@@ -299,7 +299,7 @@ def check_voice_contract():
             self.wfile.write(body)
 
         def do_GET(self):
-            self._send(json.dumps({"ok": True}).encode())
+            self._send(json.dumps({"ok": True, "state": "idle"}).encode())
 
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length") or 0))
@@ -326,11 +326,130 @@ def check_voice_contract():
     return not failed, "voice ok" if not failed else f"failed: {failed}"
 
 
+def check_voice_hallucination():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "voice"))
+    import engine as voice_engine
+
+    bad = ["www.mooji.org " * 20,
+           "a todos. Gracias a todos. Gracias a todos. Gracias a todos."]
+    good = ["te quiero mucho bld", "no.", "hola amor, como estas?"]
+    ok = all(voice_engine.looks_hallucinated(t) for t in bad) and \
+        not any(voice_engine.looks_hallucinated(t) for t in good)
+    return ok, "degenerate transcripts filtered"
+
+
+def check_fresh_archive():
+    import server.service as service
+
+    with tempfile.TemporaryDirectory() as tmp:
+        live = Path(tmp) / "live"
+        live.mkdir()
+        (live / "chat_session.json").write_text("{}", encoding="utf-8")
+        (live / "live_chats.txt").write_text("x", encoding="utf-8")
+        dest = service._archive_live(("chat_session.json", "live_chats.txt"),
+                                     live_dir=live,
+                                     dest_root=live / "archive")
+        moved = dest is not None and (dest / "chat_session.json").exists() \
+            and (dest / "live_chats.txt").exists()
+        gone = not (live / "chat_session.json").exists() \
+            and not (live / "live_chats.txt").exists()
+        empty = service._archive_live(("chat_session.json",), live_dir=live,
+                                      dest_root=live / "archive") is None
+    ok = moved and gone and empty
+    return ok, "live state archived, nothing deleted"
+
+
+def check_voice_text_turn():
+    import builtins
+    import contextlib
+    import io
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import client.voice as voice_client
+
+    seen = {"text": None, "listen": 0, "speak": 0, "last_tts": "edge"}
+
+    class Stub(BaseHTTPRequestHandler):
+        def _send(self, body, kind="application/json"):
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(json.dumps({"ok": True,
+                                   "last_tts": seen["last_tts"]}).encode())
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            if self.path.startswith("/speak"):
+                seen["speak"] += 1
+                self._send(b"RIFFtest", "audio/wav")
+            elif self.path.startswith("/listen"):
+                seen["listen"] += 1
+                self._send(json.dumps({"text": ""}).encode())
+            else:
+                seen["text"] = body.get("text")
+                self._send(json.dumps({"reply": "hola vos"}).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    answers = iter(["hola", "exit"])
+    old_input, old_play = builtins.input, voice_client.play
+    builtins.input = lambda *_: next(answers)
+    voice_client.play = lambda data: None
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = voice_client.main(["--daemon", base, "--sidecar", base])
+        seen["last_tts"] = "piper"  # the warning path must not break a turn
+        second = iter(["chau", "exit"])
+        builtins.input = lambda *_: next(second)
+        with contextlib.redirect_stdout(buf):
+            rc = rc or voice_client.main(["--daemon", base, "--sidecar", base])
+    finally:
+        builtins.input, voice_client.play = old_input, old_play
+        server.shutdown()
+    out = buf.getvalue()
+    ok = (rc == 0 and seen["text"] == "chau" and seen["listen"] == 0
+          and seen["speak"] == 2 and "her: hola vos" in out
+          and "piper fallback" in out)
+    return ok, (f"typed turn={seen['text']!r} listen={seen['listen']} "
+                f"speak={seen['speak']} fallback_warned="
+                f"{'piper fallback' in out}")
+
+
+def check_reply_tiebreak():
+    from engines import dispatch
+
+    # the real turn 2: three samples, no demo overlap -> all score 0.0
+    candidates = [
+        "te quiero muchito\npero no puedo jugar hoy\nq paso??\n"
+        "no se si t importa pero es importante que estes bien\nmuy mal",
+        "te quiero muchito 😔😔😔",
+        "te quiero muchito\npero no puedo hablar con vos pq estoy en "
+        "el hospital",
+    ]
+    chosen, _, _ = dispatch._choose(candidates, "", None, {})
+    empty_skipped, _, _ = dispatch._choose(["", "", "hola"], "", None, {})
+    ok = chosen == "te quiero muchito 😔😔😔" and empty_skipped == "hola"
+    return ok, f"tie picked {len(chosen)} chars, empty skipped={empty_skipped}"
+
+
 CHECKS = [
     ("roundtrip", check_roundtrip),
     ("canonical", check_canonical),
     ("boundary", check_boundary),
     ("reply-shape", check_reply_shape),
+    ("reply-tiebreak", check_reply_tiebreak),
     ("demo-retrieval", check_demo_retrieval),
     ("qwen-template", check_qwen_template),
     ("qwen-mask", check_qwen_mask),
@@ -343,6 +462,9 @@ CHECKS = [
     ("turnlog", check_turnlog),
     ("daemon-guard", check_daemon_guard),
     ("voice", check_voice_contract),
+    ("voice-text-turn", check_voice_text_turn),
+    ("voice-hallucination", check_voice_hallucination),
+    ("fresh-archive", check_fresh_archive),
 ]
 
 
